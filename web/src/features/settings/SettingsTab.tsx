@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../../api/client";
-import type { ApiKey, ApiKeyCreated, Settings } from "../../api/types";
-import { Spinner } from "../../ui/common";
+import type { ApiKey, ApiKeyCreated, CacheId, CacheStats, Settings } from "../../api/types";
+import { useAuth } from "../../state/auth";
+import { useCatalog } from "../../state/catalog";
+import { PageHead, Skeleton } from "../../ui/common";
 import { useDialogs } from "../../ui/Dialogs";
+import { copyText } from "../../ui/clipboard";
+import { Select } from "../../ui/Select";
 import { errorText, useToast } from "../../ui/Toasts";
 
 /* Настройки сервиса и ключи доступа внешних систем. Только для
@@ -40,6 +44,17 @@ const GROUPS: { title: string; items: Item[] }[] = [
           + "проверка — немного дольше.",
       },
       {
+        key: "smartCheck", title: "Оценка по SMART",
+        detail: "К ответу проверки добавляются пять кругов — конкретность, измеримость, достижимость, значимость "
+          + "и срок — с оценкой и пояснением модели. Это справка автору цели: на вердикт по приказам она не влияет, "
+          + "но требует ещё одного запроса к модели на каждую цель.",
+      },
+      {
+        key: "smartCheckBulk", title: "Оценка SMART в пакетной проверке",
+        detail: "Оценивать по SMART и цели пакетной проверки. Выключите, чтобы большие пакеты шли быстрее: "
+          + "вердикт по приказам от этого не меняется. Действует, только если включена «Оценка по SMART».",
+      },
+      {
         key: "checkCache", title: "Кэш ответов",
         detail: "Повторная проверка той же цели того же подразделения берёт готовый ответ, а не обращается к модели. "
           + "Выключайте на время отладки, когда нужен свежий ответ модели на каждую проверку.",
@@ -47,6 +62,12 @@ const GROUPS: { title: string; items: Item[] }[] = [
       {
         key: "checkCacheTtlSeconds", title: "Срок жизни кэша", min: 0, max: 604800, unit: "секунд",
         detail: "Сколько секунд помнить готовый ответ. Правка каталога сбрасывает кэш независимо от срока.",
+      },
+      {
+        key: "jobDescriptionsCacheTtlSeconds", title: "Кэш должностных инструкций", min: 0, max: 86400, unit: "секунд",
+        detail: "Сколько секунд проверка помнит инструкции подразделения и правила на них, чтобы не читать их "
+          + "из графа на каждую цель пакета. Загрузка и правка инструкций в интерфейсе сбрасывают кэш сразу; "
+          + "правка базы в обход сервиса станет видна проверкам через этот срок. 0 — читать при каждой проверке.",
       },
     ],
   },
@@ -61,6 +82,26 @@ const GROUPS: { title: string; items: Item[] }[] = [
       {
         key: "checkRatePerMinute", title: "Лимит проверок", min: 0, max: 100000, unit: "целей в минуту",
         detail: "Сколько целей в минуту может проверить один пользователь или один ключ доступа. 0 — без ограничения.",
+      },
+      {
+        key: "goalMaxChars", title: "Длина цели", min: 100, max: 8000, unit: "символов",
+        detail: "Самая длинная формулировка цели, которую примут проверка, пакет и советчик; длиннее — отказ "
+          + "с объяснением. Действует сразу и для внешних систем. Текст цели целиком уходит в модель: выше 4000 "
+          + "символов цель вместе с должностными инструкциями может не поместиться в окно модели, и такая "
+          + "проверка уйдёт на ручную.",
+      },
+      {
+        key: "llmMaxConcurrency", title: "Предел запросов к модели", min: 1, max: 256, unit: "одновременно",
+        detail: "Сколько запросов к модели идёт одновременно на весь сервис; остальные ждут в очереди, не расходуя "
+          + "таймаут. Число зависит от видеокарты: подбирайте по «Мониторингу» — поднимайте, пока очередь к модели "
+          + "растёт, а время проверки не увеличивается. Действует сразу: работающие запросы не прерываются, "
+          + "новые идут по новому пределу.",
+      },
+      {
+        key: "llmInteractiveReserve", title: "Резерв для ручных проверок", min: 0, max: 255, unit: "слотов",
+        detail: "Сколько слотов из предела пакетная проверка занять не может: массовый прогон не останавливает "
+          + "проверки по одной цели. Не больше предела минус один — лишнее обрезается. Сколько слотов занято "
+          + "и сколько ждёт, видно в «Мониторинге».",
       },
     ],
   },
@@ -95,23 +136,56 @@ const GROUPS: { title: string; items: Item[] }[] = [
   },
 ];
 
+/** Кэши проверки, которые очищаются по отдельности; scoped — можно очистить для одного подразделения. */
+const CACHES: { id: CacheId; title: string; detail: string; scoped?: boolean; confirm?: boolean }[] = [
+  {
+    id: "results", title: "Ответы проверок", scoped: true,
+    detail: "Готовые ответы на уже проверенные цели. Очистите, когда нужен свежий ответ модели на те же "
+      + "формулировки — например, после правки базы в обход сервиса.",
+  },
+  {
+    id: "jobDescriptions", title: "Должностные инструкции", scoped: true,
+    detail: "Инструкции подразделений и правила на них, прочитанные из графа для проверки. "
+      + "Очистите, если инструкции поменяли в обход интерфейса, а ждать срока кэша не хочется.",
+  },
+  {
+    id: "smart", title: "Оценки по SMART", confirm: true,
+    detail: "Оценки формулировок в памяти и в графе. После очистки модель оценит каждую цель заново — "
+      + "это ещё один запрос к модели на каждую проверку.",
+  },
+  {
+    id: "lookups", title: "Справочники каталога",
+    detail: "Настройки и примеры для промпта, которые проверка держит под рукой до минуты. "
+      + "Очистка заставляет перечитать их из графа сразу.",
+  },
+];
+
+/** Срок жизни кэша словами: «не устаревает», «выключен» или секунды. */
+const ttlText = (ttl: number | null) => (ttl === null ? "не устаревает" : ttl === 0 ? "выключен" : `срок ${ttl} с`);
+
 /** Числовая настройка: сохраняется по Enter или при уходе из поля. */
 function NumberSetting({ item, value, disabled, onSave }: {
-  item: Extract<Item, { min: number }>; value: number; disabled: boolean; onSave: (value: number) => void;
+  item: Extract<Item, { min: number }>; value: number; disabled: boolean;
+  /** Сохранить; ответ — значение, которое теперь на сервере (null — сохранить не удалось). */
+  onSave: (value: number) => Promise<number | null>;
 }) {
   const [draft, setDraft] = useState(String(value));
   useEffect(() => setDraft(String(value)), [value]);
   const parsed = /^\d+$/.test(draft.trim()) ? Number(draft) : NaN;
   const valid = parsed >= item.min && parsed <= item.max;
 
-  function commit() {
-    if (!valid) setDraft(String(value));
-    else if (parsed !== value) onSave(parsed);
+  async function commit() {
+    if (!valid) { setDraft(String(value)); return; }
+    if (parsed === value) return;
+    // Поле показывает то, что на сервере: сервер мог обрезать значение (и оно совпало
+    // с прежним — тогда value не меняется), а при ошибке остаётся прежнее.
+    const saved = await onSave(parsed);
+    setDraft(String(saved ?? value));
   }
 
   return (
     <input type="number" inputMode="numeric" min={item.min} max={item.max} value={draft} disabled={disabled}
-      aria-label={item.title} aria-invalid={!valid} onChange={(e) => setDraft(e.target.value)} onBlur={commit}
+      aria-label={item.title} aria-invalid={!valid} onChange={(e) => setDraft(e.target.value)} onBlur={() => void commit()}
       onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
   );
 }
@@ -121,35 +195,76 @@ const when = (iso: string | null) => (iso ? new Date(iso).toLocaleString("ru-RU"
 type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; settings: Settings; keys: ApiKey[] };
+  | { kind: "ready"; settings: Settings; keys: ApiKey[]; caches: CacheStats[] };
 
 export function SettingsTab() {
   const { openForm, confirm } = useDialogs();
   const toast = useToast();
+  const { departments } = useCatalog();
+  const { updateLimits } = useAuth();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [saving, setSaving] = useState<keyof Settings | null>(null);
   /** Только что созданный ключ: показывается один раз, пока его не скрыли. */
   const [fresh, setFresh] = useState<ApiKeyCreated | null>(null);
+  /** Подразделение, для которого очищаются ответы и инструкции; "" — целиком. */
+  const [cacheDepartment, setCacheDepartment] = useState("");
+  const [clearing, setClearing] = useState<CacheId | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [settings, { keys }] = await Promise.all([api.settings(), api.apiKeys()]);
-      setState({ kind: "ready", settings, keys });
+      const [settings, { keys }, { caches }] = await Promise.all([api.settings(), api.apiKeys(), api.caches()]);
+      setState({ kind: "ready", settings, keys, caches });
     } catch (err) {
       setState({ kind: "error", message: errorText(err) });
     }
   }, []);
 
+  const departmentOptions = departments.filter((d) => d.departmentId && d.status === "active")
+    .map((d) => ({ value: d.departmentId!, label: d.name || d.departmentId! }));
+  const cacheDepartmentName = departmentOptions.find((o) => o.value === cacheDepartment)?.label;
+
+  async function clearCache(item: (typeof CACHES)[number]) {
+    const scopedTo = item.scoped && cacheDepartment ? cacheDepartment : undefined;
+    if (item.confirm) {
+      const ok = await confirm({
+        title: `Очистить «${item.title}»?`, danger: true, confirmLabel: "Очистить",
+        message: <p>Оценки удалятся и из памяти, и из графа. Модель оценит каждую цель заново при следующей
+          проверке — по одному дополнительному запросу на цель.</p>,
+      });
+      if (!ok) return;
+    }
+    setClearing(item.id);
+    try {
+      const done = await api.clearCache(item.id, scopedTo);
+      const where = scopedTo ? ` для «${cacheDepartmentName ?? scopedTo}»` : "";
+      const stored = done.stored === null ? "" : `, оценок в графе: ${done.stored}`;
+      toast(`Кэш «${item.title}» очищен${where}: записей ${done.entries}${stored}`, "ok");
+      const { caches } = await api.caches();
+      setState((s) => (s.kind === "ready" ? { ...s, caches } : s));
+    } catch (err) {
+      toast(errorText(err), "err");
+    } finally {
+      setClearing(null);
+    }
+  }
+
   useEffect(() => { void load(); }, [load]);
 
-  async function save(key: keyof Settings, value: boolean | number) {
+  /** Сохранить настройку; ответ — значение на сервере после сохранения, null — ошибка. */
+  async function save<K extends keyof Settings>(key: K, value: Settings[K]): Promise<Settings[K] | null> {
     setSaving(key);
     try {
       const settings = await api.saveSettings({ [key]: value });
       setState((s) => (s.kind === "ready" ? { ...s, settings } : s));
-      toast("Настройка сохранена", "ok");
+      // Предел длины цели интерфейс проверяет сам — применяем новый, не дожидаясь повторного входа.
+      if (key === "goalMaxChars") updateLimits({ goalMaxChars: settings.goalMaxChars });
+      if (settings[key] !== value) toast(`Сервер сохранил значение ${String(settings[key])} вместо ${String(value)}: `
+        + "оно вне допустимых пределов", "err");
+      else toast("Настройка сохранена", "ok");
+      return settings[key];
     } catch (err) {
       toast(errorText(err), "err");
+      return null;
     } finally {
       setSaving(null);
     }
@@ -184,24 +299,17 @@ export function SettingsTab() {
     }
   }
 
+  // Clipboard API закрыт на http и во встроенных браузерах — copyText подстрахуется.
   async function copy(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      toast("Ключ скопирован", "ok");
-    } catch {
-      toast("Не удалось скопировать — выделите ключ и скопируйте вручную", "err");
-    }
+    if (await copyText(text)) toast("Ключ скопирован", "ok");
+    else toast("Не удалось скопировать — выделите ключ и скопируйте вручную", "err");
   }
 
   return (
     <section id="tab-settings">
-      <div className="page-head">
-        <div>
-          <h1>Настройки</h1>
-          <div className="sub">Как проверяются цели, сколько хранится история и кто может проверять. Изменения действуют сразу.</div>
-        </div>
-      </div>
-      {state.kind === "loading" && <div className="card pad"><Spinner /> Загрузка…</div>}
+      <PageHead title="Настройки"
+        sub="Как проверяются цели, сколько хранится история и кто может проверять. Изменения действуют сразу." />
+      {state.kind === "loading" && <Skeleton rows={4} />}
       {state.kind === "error" && <div className="card pad"><span className="badge warn">{state.message}</span></div>}
       {state.kind === "ready" && (
         <>
@@ -214,7 +322,7 @@ export function SettingsTab() {
                     <div className="control">
                       {"min" in item ? (
                         <NumberSetting item={item} value={state.settings[item.key]} disabled={saving === item.key}
-                          onSave={(value) => void save(item.key, value)} />
+                          onSave={(value) => save(item.key, value)} />
                       ) : (
                         <button role="switch" className="switch" aria-checked={state.settings[item.key]}
                           aria-label={item.title} disabled={saving === item.key}
@@ -231,7 +339,44 @@ export function SettingsTab() {
             </div>
           ))}
 
-          <div className="row" style={{ justifyContent: "space-between" }}>
+          <div className="row wrap" style={{ justifyContent: "space-between" }}>
+            <h2 className="block-title">Кэш проверки <span className="dim">очистка по отдельности</span></h2>
+            <Select id="cacheDepartment" ariaLabel="Подразделение для очистки" className="pill" style={{ width: 300 }}
+              value={cacheDepartment} onChange={setCacheDepartment}
+              options={[{ value: "", label: "Очистить для всех подразделений" },
+                ...departmentOptions.map((o) => ({ value: o.value, label: `Только для: ${o.label}` }))]} />
+          </div>
+          <div className="card settings" id="caches">
+            {CACHES.map((item) => {
+              const stats = state.caches.find((c) => c.id === item.id);
+              const scoped = item.scoped && !!cacheDepartment;
+              return (
+                <div key={item.id} className="setting" data-cache={item.id}>
+                  <div className="control">
+                    <button className="btn sm ghost danger" disabled={clearing !== null}
+                      aria-label={`Очистить: ${item.title}`} onClick={() => void clearCache(item)}>
+                      {clearing === item.id ? "Очищаем…" : scoped ? "Очистить для подразделения" : "Очистить"}
+                    </button>
+                  </div>
+                  <div className="text">
+                    <div className="mid row" style={{ gap: 8 }}>
+                      {item.title}
+                      <span className="badge count">записей: {stats ? stats.entries : "—"}</span>
+                      {stats && <span className="dim">{ttlText(stats.ttl_seconds)}
+                        {stats.hits + stats.misses > 0 ? `, попаданий ${stats.hits}, промахов ${stats.misses}` : ""}</span>}
+                    </div>
+                    <div className="muted">
+                      {item.detail}
+                      {item.scoped && cacheDepartment && ` Сейчас очистится только для «${cacheDepartmentName ?? cacheDepartment}».`}
+                      {!item.scoped && cacheDepartment && " Этот кэш по подразделениям не делится — очищается целиком."}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="row" data-tour="keys" style={{ justifyContent: "space-between" }}>
             <h2 className="block-title">Ключи доступа <span className="dim">для внешних систем: только проверка целей</span></h2>
             <button className="btn primary" onClick={add}>+ Ключ</button>
           </div>

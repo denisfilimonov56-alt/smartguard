@@ -6,13 +6,12 @@
 //  текущие проверки и интерфейс. Пользователи интерфейса (:User)
 //  и их роли сохраняются.
 //
-//  Перед запуском сделайте дамп:
-//    docker compose exec neo4j \
-//      neo4j-admin database dump neo4j --to-stdout > backup.dump
+//  Запуск — только после проверенной резервной копии (docs/data.md,
+//  «Резервная копия»; Community снимает дамп лишь с остановленной базы):
+//    docker compose run --rm -e SEED_FILE=/init/reset_and_load.cypher seeder
 //
-//  Запуск:
-//    docker compose run --rm \
-//      -e SEED_FILE=/init/reset_and_load.cypher seeder
+//  data.cypher при этом не применяется (только этот файл), иначе выгрузка
+//  перекрыла бы сброс.
 //
 //  Что получается на выходе:
 //    * у каждого узла заполнен бизнес-ключ
@@ -25,8 +24,12 @@
 //    * у каждого правила есть примеры того вида, который оно
 //      показывает в ответе проверки
 //
-//  После запуска зафиксируйте состояние в репозитории:
-//    docker compose exec api python export_graph.py --output /init/seed.cypher
+//  Очистка и загрузка выполняются одной транзакцией вместе с
+//  увеличением версии каталога: API не увидит пустой каталог посреди
+//  сброса и после него сбросит кэш ответов.
+//
+//  После запуска зафиксируйте состояние в репозитории (на хосте):
+//    docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher
 // ============================================================
 
 // ---------- Ограничения и индексы ----------
@@ -48,6 +51,12 @@ FOR (e:ViolationExample) REQUIRE e.exampleId IS UNIQUE;
 CREATE CONSTRAINT department_id IF NOT EXISTS
 FOR (d:Department) REQUIRE d.departmentId IS UNIQUE;
 
+CREATE CONSTRAINT job_description_id IF NOT EXISTS
+FOR (j:JobDescription) REQUIRE j.jobDescriptionId IS UNIQUE;
+
+CREATE CONSTRAINT catalog_version_id IF NOT EXISTS
+FOR (v:CatalogVersion) REQUIRE v.id IS UNIQUE;
+
 // Реестр пользователей интерфейса (api/users.py). В выгрузку не попадает.
 CREATE CONSTRAINT user_login IF NOT EXISTS
 FOR (u:User) REQUIRE u.login IS UNIQUE;
@@ -66,8 +75,8 @@ FOR (r:Rule) ON EACH [r.description];
 // ---------- ОЧИСТКА ----------
 // Удаляются все узлы каталога. Узлы :User не трогаются: иначе сброс
 // каталога лишал бы доступа всех, кому роль назначена в интерфейсе.
-// Для очень большой базы удаляйте партиями: оберните оператор в
-//   CALL { ... } IN TRANSACTIONS OF 10000 ROWS;
+// Сидер выполняет сброс одной транзакцией; CALL { ... } IN TRANSACTIONS
+// в ней недопустим — для очень большой базы удаляйте партиями отдельно.
 MATCH (n) WHERE n:Order OR n:Clause OR n:Rule
              OR n:CheckTarget OR n:ViolationExample OR n:Department
              OR n:JobDescription

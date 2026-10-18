@@ -39,8 +39,19 @@ interface ZipEntry {
   name: string;
   method: number;
   compressedSize: number;
+  size: number;
   offset: number;
 }
+
+/** Больше этого одна часть книги не распаковывается: лист целей столько не весит,
+    а архив на 10 МБ может развернуться в сотни мегабайт XML. */
+const MAX_PART_BYTES = 64 * 1024 * 1024;
+/** Пределы листа Excel: строк и столбцов больше не бывает, а адрес r="99999999" иначе подвесил бы разбор. */
+const EXCEL_MAX_ROWS = 1_048_576;
+const EXCEL_MAX_COLS = 16_384;
+/** Больше ячеек одно объединение не разворачивает. */
+const MAX_MERGE_CELLS = 100_000;
+const ZIP64 = "Слишком большой файл (ZIP64 не поддерживается): оставьте в книге только лист с целями";
 
 function readEntries(bytes: Uint8Array): ZipEntry[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -52,7 +63,7 @@ function readEntries(bytes: Uint8Array): ZipEntry[] {
   if (end < 0) throw new XlsxError("Файл не является книгой Excel (.xlsx)");
   const count = view.getUint16(end + 10, true);
   const directory = view.getUint32(end + 16, true);
-  if (count === 0xffff || directory === 0xffffffff) throw new XlsxError("Слишком большой файл (ZIP64)");
+  if (count === 0xffff || directory === 0xffffffff) throw new XlsxError(ZIP64);
 
   const decoder = new TextDecoder();
   const entries: ZipEntry[] = [];
@@ -63,12 +74,17 @@ function readEntries(bytes: Uint8Array): ZipEntry[] {
     const nameLength = view.getUint16(p + 28, true);
     const extraLength = view.getUint16(p + 30, true);
     const commentLength = view.getUint16(p + 32, true);
-    entries.push({
+    const entry = {
       name: decoder.decode(bytes.subarray(p + 46, p + 46 + nameLength)),
       method: view.getUint16(p + 10, true),
       compressedSize: view.getUint32(p + 20, true),
+      size: view.getUint32(p + 24, true),
       offset: view.getUint32(p + 42, true),
-    });
+    };
+    // Настоящие размеры и смещение тогда лежат в дополнительном поле ZIP64.
+    if (entry.compressedSize === 0xffffffff || entry.size === 0xffffffff || entry.offset === 0xffffffff)
+      throw new XlsxError(ZIP64);
+    entries.push(entry);
     p += 46 + nameLength + extraLength + commentLength;
   }
   return entries;
@@ -80,12 +96,36 @@ async function extract(bytes: Uint8Array, entry: ZipEntry): Promise<Uint8Array> 
     throw new XlsxError("Архив книги повреждён");
   const start = entry.offset + 30 + view.getUint16(entry.offset + 26, true) + view.getUint16(entry.offset + 28, true);
   const data = bytes.subarray(start, start + entry.compressedSize);
+  const tooBig = () => new XlsxError("Книга слишком большая: оставьте в ней только лист с целями");
+  if (entry.size > MAX_PART_BYTES || data.length > MAX_PART_BYTES) throw tooBig();
   if (entry.method === 0) return data;
   if (entry.method !== 8) throw new XlsxError(`Неподдерживаемый способ сжатия в архиве: ${entry.method}`);
   if (typeof DecompressionStream === "undefined")
     throw new XlsxError("Этот браузер не умеет распаковывать .xlsx — обновите его");
-  const stream = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  // Распаковка по кускам: размер в заголовке архива можно подделать, поэтому предел
+  // проверяется на каждом куске, и «бомба» обрывается, не успев развернуться в памяти.
+  const reader = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream("deflate-raw")).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_PART_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    if (err instanceof XlsxError) throw err;
+    throw new XlsxError("Архив книги повреждён");
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.length; }
+  return out;
 }
 
 /* ------------------------------- чтение ---------------------------------- */
@@ -128,22 +168,38 @@ function cellText(cell: Element, shared: string[]): string {
   const value = byName(cell, "v")[0]?.textContent ?? "";
   if (type === "s") return shared[Number(value)] ?? "";
   if (type === "str" || type === "e") return value;
-  if (type === "b") return value === "1" ? "ИСТИНА" : "ЛОЖЬ";
+  // Логическое значение (TRUE, ИСТИНА, флажок) — 1 / 0: так его понимает и столбец «Студент».
+  if (type === "b") return value === "1" || value.toLowerCase() === "true" ? "1" : "0";
   // Число: без хвостовых нулей и экспоненты там, где они не нужны (1001 остаётся 1001).
   const n = Number(value);
   return value !== "" && Number.isFinite(n) ? String(n) : value;
 }
 
-function parseSheet(doc: Document, shared: string[]): string[][] {
+/** Ячейки диапазона A2:C10 — номера строк и столбцов с нуля; null, если адрес не разобрать. */
+function parseRange(ref: string): { r1: number; c1: number; r2: number; c2: number } | null {
+  const m = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/i.exec(ref.trim().replace(/\$/g, ""));
+  if (!m) return null;
+  const r1 = Number(m[2]) - 1, c1 = columnIndex(m[1]);
+  const r2 = m[4] ? Number(m[4]) - 1 : r1, c2 = m[3] ? columnIndex(m[3]) : c1;
+  if (r1 < 0 || c1 < 0 || r2 < r1 || c2 < c1) return null;
+  return { r1, c1, r2, c2 };
+}
+
+/** Строки листа. maxRows — сколько строк с данными допустимо: дальше разбор останавливается с понятной ошибкой. */
+function parseSheet(doc: Document, shared: string[], name: string, maxRows: number): string[][] {
+  const limit = Math.min(maxRows, EXCEL_MAX_ROWS);
   const rows: string[][] = [];
   let rowIndex = 0;
   for (const row of byName(doc, "row")) {
-    rowIndex = Number(row.getAttribute("r")) > 0 ? Number(row.getAttribute("r")) - 1 : rowIndex;
+    const r = Number(row.getAttribute("r"));
+    rowIndex = Number.isInteger(r) && r > 0 ? r - 1 : rowIndex;
+    if (rowIndex >= EXCEL_MAX_ROWS) throw new XlsxError(`Лист «${name}» повреждён: номер строки ${rowIndex + 1} больше, чем бывает в Excel`);
     const cells: string[] = [];
     let col = 0;
     for (const cell of byName(row, "c")) {
       const ref = cell.getAttribute("r");
       col = ref && columnIndex(ref) >= 0 ? columnIndex(ref) : col;
+      if (col >= EXCEL_MAX_COLS) throw new XlsxError(`Лист «${name}» повреждён: столбец ${columnName(col)} дальше, чем бывает в Excel`);
       const text = cellText(cell, shared);
       if (text) {
         while (cells.length < col) cells.push("");
@@ -152,16 +208,53 @@ function parseSheet(doc: Document, shared: string[]): string[][] {
       col += 1;
     }
     if (cells.length) {
+      if (rowIndex >= limit)
+        throw new XlsxError(`На листе «${name}» данные идут дальше строки ${limit}: за раз загружается не более `
+          + `${limit} строк. Оставьте на листе только цели или разбейте файл`);
       while (rows.length < rowIndex) rows.push([]);
       rows[rowIndex] = cells;
     }
     rowIndex += 1;
   }
+
+  // Объединённые ячейки: значение хранится только в левой верхней, остальные пусты.
+  // Подразделение, объединённое на группу целей, разносится по строкам группы.
+  // Вправо объединение разворачивается не дальше последнего столбца с данными:
+  // «B2:XFD2» иначе дописал бы в строку 16 тысяч ячеек.
+  let dataWidth = 0;
+  for (const cells of rows) if (cells && cells.length > dataWidth) dataWidth = cells.length;
+  for (const merge of byName(doc, "mergeCell")) {
+    const range = parseRange(merge.getAttribute("ref") ?? "");
+    if (!range) continue;
+    const value = rows[range.r1]?.[range.c1];
+    if (!value) continue;
+    const last = Math.min(range.r2, rows.length - 1);
+    const right = Math.min(range.c2, dataWidth - 1);
+    if ((last - range.r1 + 1) * (right - range.c1 + 1) > MAX_MERGE_CELLS) continue;
+    for (let r = range.r1; r <= last; r++) {
+      const cells = rows[r];
+      // Строки без данных не оживают: объединение «с запасом» вниз не создаёт пустых целей.
+      if (!cells?.some((c) => c)) continue;
+      for (let c = range.c1; c <= right; c++) {
+        if (r === range.r1 && c === range.c1) continue;
+        while (cells.length < c) cells.push("");
+        if (!cells[c]) cells[c] = value;
+      }
+    }
+  }
   return rows;
 }
 
-/** Листы книги по порядку. Принимает содержимое файла .xlsx. */
-export async function readWorkbook(data: ArrayBuffer | Uint8Array): Promise<Sheet[]> {
+/** Лист книги: имя известно сразу, строки разбираются по запросу. */
+export interface WorkbookSheet {
+  name: string;
+  /** Разобрать лист; maxRows — предел строк с данными (по умолчанию весь лист Excel). */
+  read: (maxRows?: number) => Promise<Sheet>;
+}
+
+/** Листы книги по порядку. Принимает содержимое файла .xlsx; листы не разбираются,
+    пока их не прочитают: в книге может быть огромный лист рядом с листом целей. */
+export async function openWorkbook(data: ArrayBuffer | Uint8Array): Promise<WorkbookSheet[]> {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
   const entries = new Map(readEntries(bytes).map((e) => [e.name.replace(/^\//, ""), e]));
   const part = async (name: string) => {
@@ -183,22 +276,33 @@ export async function readWorkbook(data: ArrayBuffer | Uint8Array): Promise<Shee
     }
   }
 
-  const sharedBytes = await part("xl/sharedStrings.xml");
-  const shared = sharedBytes ? byName(parseXml(sharedBytes, "строки книги"), "si").map(richText) : [];
+  // Общие строки нужны любому листу, но разбираются один раз и только при первом чтении.
+  let shared: Promise<string[]> | null = null;
+  const sharedStrings = () => shared ??= part("xl/sharedStrings.xml")
+    .then((b) => (b ? byName(parseXml(b, "строки книги"), "si").map(richText) : []));
 
-  const sheets: Sheet[] = [];
+  const sheets: WorkbookSheet[] = [];
   for (const [i, sheet] of byName(workbook, "sheet").entries()) {
     const id = sheet.getAttributeNS(RELS_NS, "id") ?? sheet.getAttribute("r:id") ?? "";
     const path = targets.get(id) ?? `xl/worksheets/sheet${i + 1}.xml`;
-    const sheetBytes = await part(path);
-    if (!sheetBytes) continue; // лист с диаграммой или ссылка наружу
+    if (!entries.has(path)) continue; // лист с диаграммой или ссылка наружу
+    const name = sheet.getAttribute("name") || `Лист ${i + 1}`;
     sheets.push({
-      name: sheet.getAttribute("name") || `Лист ${i + 1}`,
-      rows: parseSheet(parseXml(sheetBytes, `лист «${sheet.getAttribute("name")}»`), shared),
+      name,
+      read: async (maxRows = EXCEL_MAX_ROWS) => {
+        const sheetBytes = await part(path);
+        if (!sheetBytes) throw new XlsxError(`Лист «${name}» не найден в книге`);
+        return { name, rows: parseSheet(parseXml(sheetBytes, `лист «${name}»`), await sharedStrings(), name, maxRows) };
+      },
     });
   }
   if (!sheets.length) throw new XlsxError("В книге нет ни одного листа с данными");
   return sheets;
+}
+
+/** Все листы книги сразу — для небольших книг и тестов. */
+export async function readWorkbook(data: ArrayBuffer | Uint8Array, maxRows?: number): Promise<Sheet[]> {
+  return Promise.all((await openWorkbook(data)).map((s) => s.read(maxRows)));
 }
 
 /* -------------------------------- запись --------------------------------- */

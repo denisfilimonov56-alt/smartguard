@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
 import type { CheckResult, GraphEdge, GraphNode, NodeKind } from "../../api/types";
 import { useCatalog } from "../../state/catalog";
-import { Spinner } from "../../ui/common";
+import { Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
 import { errorText } from "../../ui/Toasts";
 import { layoutGraph } from "./layout";
 
@@ -154,19 +154,24 @@ export function GraphTab() {
     () => (traced && state.kind === "ready" ? buildTrace(traced, state.nodes, state.edges) : null),
     [traced, state]);
 
+  // Раскладка — один раз на весь граф (со всеми типами и архивом): кнопки типов и флажок
+  // «Архив» только скрывают узлы, а не пересчитывают O(n²) раскладку на основном потоке.
+  const layout = useMemo(() => (state.kind !== "ready" ? null : layoutGraph(
+    [...state.nodes.map((n) => n.id), ...(trace ? [GOAL] : [])],
+    [...state.edges.map((e): [string, string] => [e.source, e.target]),
+      ...(trace?.goalEdges ?? []).map((e): [string, string] => [GOAL, e.target])])), [state, trace]);
+
   const graph = useMemo(() => {
-    if (state.kind !== "ready") return null;
+    if (state.kind !== "ready" || !layout) return null;
     // Узлы на пути проверки видны всегда, даже если их тип выключен.
     const nodes = state.nodes.filter((n) => trace?.nodes.has(n.id)
       || (!off.has(n.label) && (archived || n.status !== "archived")));
     const shown = new Set(nodes.map((n) => n.id));
     const edges = state.edges.filter((e) => shown.has(e.source) && shown.has(e.target));
     const goalEdges = (trace?.goalEdges ?? []).filter((e) => shown.has(e.target));
-    const positions = layoutGraph(
-      [...nodes.map((n) => n.id), ...(trace ? [GOAL] : [])],
-      [...edges.map((e): [string, string] => [e.source, e.target]),
-        ...goalEdges.map((e): [string, string] => [GOAL, e.target])]);
-    const points = [...positions.values()];
+    const positions = layout;
+    // Рамка — по видимым узлам: скрытые не оставляют пустых полей по краям.
+    const points = [...nodes.map((n) => layout.get(n.id)!), ...(trace ? [layout.get(GOAL)!] : [])];
     const pad = 80;
     const minX = Math.min(...points.map((p) => p.x), 0) - pad;
     const minY = Math.min(...points.map((p) => p.y), 0) - pad;
@@ -174,7 +179,7 @@ export function GraphTab() {
     const width = Math.max(...points.map((p) => p.x), 0) + pad + 90 - minX;
     const height = Math.max(...points.map((p) => p.y), 0) + pad - minY;
     return { nodes, edges, goalEdges, positions, viewBox: { minX, minY, width, height }, byId: new Map(nodes.map((n) => [n.id, n])) };
-  }, [state, off, archived, trace]);
+  }, [state, layout, off, archived, trace]);
 
   // Новая трассировка — показать граф целиком. Обновление данных масштаб не трогает.
   useEffect(() => { setView({ x: 0, y: 0, scale: 1 }); }, [traced]);
@@ -214,20 +219,82 @@ export function GraphTab() {
   const links = selectedNode && graph
     ? graph.edges.filter((e) => e.source === selectedNode.id || e.target === selectedNode.id) : [];
 
+  // Узлы и связи не зависят от сдвига и масштаба: перетаскивание графа меняет только
+  // transform группы, а не перерисовывает сотни узлов на каждое движение мыши.
+  const focus = hover?.id ?? selected;
+  const layer = useMemo(() => graph && (
+    <>
+      {graph.edges.map((e, i) => {
+        const a = graph.positions.get(e.source)!;
+        const b = graph.positions.get(e.target)!;
+        const role = trace?.edges.get(edgeKey(e.source, e.target));
+        const lit = neighbours && (e.source === focus || e.target === focus);
+        if (!role)
+          return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            className={`edge ${lit ? "lit" : neighbours || trace ? "faded" : ""}`} />;
+        // Линия пути рисуется от конца, ближнего к цели, — так путь «растёт» от неё.
+        const sa = trace!.steps.get(e.source) ?? 0;
+        const sb = trace!.steps.get(e.target) ?? 0;
+        const [from, to] = sa <= sb ? [a, b] : [b, a];
+        return <line key={i} x1={from.x} y1={from.y} x2={to.x} y2={to.y} pathLength={1}
+          className={`edge trace ${role}`} style={{ animationDelay: `${Math.min(sa, sb) * STEP_SECONDS}s` }} />;
+      })}
+      {trace && graph.goalEdges.map((e) => {
+        const a = graph.positions.get(GOAL)!;
+        const b = graph.positions.get(e.target)!;
+        return <line key={"goal" + e.target} x1={a.x} y1={a.y} x2={b.x} y2={b.y} pathLength={1}
+          className={`edge trace ${e.role} ${e.missing ? "missing" : ""}`} />;
+      })}
+      {graph.nodes.map((n) => {
+        const p = graph.positions.get(n.id)!;
+        const kind = KIND[n.label];
+        const lit = neighbours?.has(n.id);
+        const role = trace?.nodes.get(n.id);
+        const label = graph.nodes.length <= LABELS_ALWAYS || lit || role || n.label === "Order" || n.label === "Department";
+        return (
+          <g key={n.id} transform={`translate(${p.x} ${p.y})`} data-node={n.id}
+            className={`node ${n.status === "archived" ? "archived" : ""} ${role ? `traced ${role}` : (neighbours && !lit) || (trace && !lit) ? "faded" : ""} ${selected === n.id ? "selected" : ""}`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => setSelected(n.id)}
+            onMouseEnter={(e) => {
+              const rect = box.current!.getBoundingClientRect();
+              setHover({ id: n.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
+            }}
+            onMouseLeave={() => setHover(null)}>
+            <circle r={kind.r + 6} className="hit" />
+            {role && role !== "path" && <circle r={kind.r + 5} className="halo" style={arrive(n.id)} />}
+            <circle r={kind.r} fill={kind.color} className="dot" style={role ? arrive(n.id) : undefined} />
+            {role && ROLE_MARK[role] && (
+              <g transform={`translate(${kind.r} ${-kind.r})`} className="mark" style={arrive(n.id)}>
+                <circle r={6.5} /><text textAnchor="middle" y={3.5}>{ROLE_MARK[role]}</text>
+              </g>
+            )}
+            {label && <text x={kind.r + (role ? 12 : 5)} y={4}>{short(n.title)}</text>}
+          </g>
+        );
+      })}
+      {trace && (() => {
+        const p = graph.positions.get(GOAL)!;
+        return (
+          <g transform={`translate(${p.x} ${p.y})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => setSelected(null)}>
+            <rect x={-30} y={-13} width={60} height={26} rx={13} />
+            <text textAnchor="middle" y={4}>Цель</text>
+          </g>
+        );
+      })()}
+    </>
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ), [graph, trace, neighbours, focus, selected]);
+
   return (
     <section id="tab-graph">
-      <div className="page-head">
-        <div>
-          <h1>Граф</h1>
-          <div className="sub">Каталог целиком: что из чего следует и где действует. Нажмите на узел, чтобы увидеть его связи.</div>
-        </div>
-        <div className="row">
-          {traced && <button className="btn" onClick={() => setTrace(null)}>Сбросить трассировку</button>}
-          <button className="btn" disabled={busy} onClick={() => void load()}>
-            {busy ? <><Spinner /> Обновляем…</> : "Обновить"}
-          </button>
-        </div>
-      </div>
+      <PageHead title="Граф" sub="Каталог целиком: что из чего следует и где действует. Нажмите на узел, чтобы увидеть его связи.">
+        {traced && <button className="btn" onClick={() => setTrace(null)}>Сбросить трассировку</button>}
+        <button className="btn" disabled={busy} onClick={() => void load()}>
+          {busy ? <><Spinner /> Обновляем…</> : "Обновить"}
+        </button>
+      </PageHead>
       <div className="toolbar">
         {KINDS.map((k) => (
           <button key={k.kind} className={`chip chip-btn legend ${off.has(k.kind) ? "off" : ""}`}
@@ -241,9 +308,9 @@ export function GraphTab() {
         </label>
       </div>
 
-      {state.kind === "loading" && <div className="card pad"><Spinner /> Загрузка…</div>}
+      {state.kind === "loading" && <Skeleton rows={5} />}
       {state.kind === "error" && <div className="card pad"><span className="badge warn">{state.message}</span></div>}
-      {graph && !graph.nodes.length && <div className="empty">Показывать нечего: каталог пуст или все типы узлов скрыты.</div>}
+      {graph && !graph.nodes.length && <Empty icon="search" title="Показывать нечего">Каталог пуст или все типы узлов скрыты кнопками над графом.</Empty>}
       {graph && graph.nodes.length > 0 && (
         <div className="graph-page">
           <div className="card graph-box" ref={box}
@@ -266,65 +333,7 @@ export function GraphTab() {
             <svg role="img" aria-label={`Граф каталога: узлов ${graph.nodes.length}, связей ${graph.edges.length}`}
               viewBox={`${graph.viewBox.minX} ${graph.viewBox.minY} ${graph.viewBox.width} ${graph.viewBox.height}`}>
               <g key={replay} transform={`translate(${view.x} ${view.y}) scale(${view.scale})`} className={trace ? "tracing" : ""}>
-                {graph.edges.map((e, i) => {
-                  const a = graph.positions.get(e.source)!;
-                  const b = graph.positions.get(e.target)!;
-                  const role = trace?.edges.get(edgeKey(e.source, e.target));
-                  const lit = neighbours && (e.source === (hover?.id ?? selected) || e.target === (hover?.id ?? selected));
-                  if (!role)
-                    return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                      className={`edge ${lit ? "lit" : neighbours || trace ? "faded" : ""}`} />;
-                  // Линия пути рисуется от конца, ближнего к цели, — так путь «растёт» от неё.
-                  const sa = trace!.steps.get(e.source) ?? 0;
-                  const sb = trace!.steps.get(e.target) ?? 0;
-                  const [from, to] = sa <= sb ? [a, b] : [b, a];
-                  return <line key={i} x1={from.x} y1={from.y} x2={to.x} y2={to.y} pathLength={1}
-                    className={`edge trace ${role}`} style={{ animationDelay: `${Math.min(sa, sb) * STEP_SECONDS}s` }} />;
-                })}
-                {trace && graph.goalEdges.map((e) => {
-                  const a = graph.positions.get(GOAL)!;
-                  const b = graph.positions.get(e.target)!;
-                  return <line key={"goal" + e.target} x1={a.x} y1={a.y} x2={b.x} y2={b.y} pathLength={1}
-                    className={`edge trace ${e.role} ${e.missing ? "missing" : ""}`} />;
-                })}
-                {graph.nodes.map((n) => {
-                  const p = graph.positions.get(n.id)!;
-                  const kind = KIND[n.label];
-                  const lit = neighbours?.has(n.id);
-                  const role = trace?.nodes.get(n.id);
-                  const label = graph.nodes.length <= LABELS_ALWAYS || lit || role || n.label === "Order" || n.label === "Department";
-                  return (
-                    <g key={n.id} transform={`translate(${p.x} ${p.y})`} data-node={n.id}
-                      className={`node ${n.status === "archived" ? "archived" : ""} ${role ? `traced ${role}` : (neighbours && !lit) || (trace && !lit) ? "faded" : ""} ${selected === n.id ? "selected" : ""}`}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={() => setSelected(n.id)}
-                      onMouseEnter={(e) => {
-                        const rect = box.current!.getBoundingClientRect();
-                        setHover({ id: n.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
-                      }}
-                      onMouseLeave={() => setHover(null)}>
-                      <circle r={kind.r + 6} className="hit" />
-                      {role && role !== "path" && <circle r={kind.r + 5} className="halo" style={arrive(n.id)} />}
-                      <circle r={kind.r} fill={kind.color} className="dot" style={role ? arrive(n.id) : undefined} />
-                      {role && ROLE_MARK[role] && (
-                        <g transform={`translate(${kind.r} ${-kind.r})`} className="mark" style={arrive(n.id)}>
-                          <circle r={6.5} /><text textAnchor="middle" y={3.5}>{ROLE_MARK[role]}</text>
-                        </g>
-                      )}
-                      {label && <text x={kind.r + (role ? 12 : 5)} y={4}>{short(n.title)}</text>}
-                    </g>
-                  );
-                })}
-                {trace && (() => {
-                  const p = graph.positions.get(GOAL)!;
-                  return (
-                    <g transform={`translate(${p.x} ${p.y})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
-                      onClick={() => setSelected(null)}>
-                      <rect x={-30} y={-13} width={60} height={26} rx={13} />
-                      <text textAnchor="middle" y={4}>Цель</text>
-                    </g>
-                  );
-                })()}
+                {layer}
               </g>
             </svg>
             <div className="graph-zoom">

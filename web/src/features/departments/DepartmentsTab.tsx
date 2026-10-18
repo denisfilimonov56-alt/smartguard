@@ -1,6 +1,7 @@
+import type { JobDescriptionRef } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { archivedClass, ArchivedBadge, Chip, IdBadge } from "../../ui/common";
+import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge, PageHead } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
 import { useActions } from "../actions";
 
@@ -10,6 +11,12 @@ import { useActions } from "../actions";
    Здесь же загружаются должностные инструкции: с ними сравнивается цель,
    когда правило стоит на атрибуте, определяемом по инструкциям. */
 
+/** Что сказать о списке обязанностей инструкции рядом с её названием. */
+const dutiesNote = (j: JobDescriptionRef) =>
+  j.dutiesStatus === "pending" ? " · обязанности выписываются…"
+    : j.dutiesStatus === "error" ? " · обязанности не выписаны"
+    : !j.duties ? " · нет списка обязанностей" : j.dutiesReviewed ? "" : " · проверьте обязанности";
+
 export function DepartmentsTab() {
   const { departments, showArchivedDepartments, reload } = useCatalog();
   const actions = useActions();
@@ -17,13 +24,10 @@ export function DepartmentsTab() {
 
   return (
     <section id="tab-departments">
-      <div className="page-head">
-        <div>
-          <h1>Подразделения</h1>
-          <div className="sub">Идентификатор передаёт кадровая система в запросе проверки. Где какое правило действует — в разделе «Правила». С должностными инструкциями сравнивается цель подразделения.</div>
-        </div>
+      <PageHead title="Подразделения"
+        sub="Идентификатор передаёт кадровая система в запросе проверки. Где какое правило действует — в разделе «Правила». С должностными инструкциями сравнивается цель подразделения.">
         {canEdit && <button className="btn primary" onClick={actions.addDepartment}>+ Подразделение</button>}
-      </div>
+      </PageHead>
       <div className="toolbar">
         <label className="check">
           <input type="checkbox" checked={showArchivedDepartments}
@@ -55,8 +59,7 @@ export function DepartmentsTab() {
                   {d.jobDescriptions.map((j) => (
                     <span key={j.nodeId} className={archivedClass(j.status)} data-node={j.nodeId}>
                       <MenuButton items={() => actions.jobDescriptionMenu(j)}
-                        label={(j.title || "без названия")
-                          + (!j.duties ? " · нет списка обязанностей" : j.dutiesReviewed ? "" : " · проверьте обязанности")} />
+                        label={(j.title || "без названия") + dutiesNote(j)} />
                     </span>
                   ))}
                   {canEdit
@@ -68,7 +71,10 @@ export function DepartmentsTab() {
             ))}
           </tbody>
         </table></div>
-      ) : <div className="empty">Подразделений нет. Пока их нет, все правила действуют для всех.</div>}
+      ) : <Empty icon="list" title="Подразделений пока нет"
+        action={canEdit && <button className="btn primary" onClick={actions.addDepartment}>+ Подразделение</button>}>
+        Пока их нет, все правила действуют для всех.
+      </Empty>}
     </section>
   );
 }

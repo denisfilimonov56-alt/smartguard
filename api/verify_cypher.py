@@ -27,9 +27,13 @@ import sys
 from pathlib import Path
 from typing import Any, Iterator
 
-MODULES = ("graph", "catalog", "diagnostics", "users", "history")
+# Модули с запросами находятся сами: всё, что ходит в Neo4j. Ручной список
+# отставал — новые модули (настройки, ключи, история) выпадали из проверки.
+DB_MARKER = re.compile(r"get_driver\(|\b_run\(|session\.run\(|tx\.run\(")
+SKIP_MODULES = {"verify_cypher"}
 
-CYPHER_MARKER = re.compile(r"\b(MATCH|MERGE|CREATE\s+(CONSTRAINT|INDEX|FULLTEXT)|UNWIND)\b")
+CYPHER_MARKER = re.compile(
+    r"\b(MATCH|MERGE|CREATE\s+(CONSTRAINT|INDEX|FULLTEXT)|UNWIND)\b|\bCREATE\s*\(")
 
 CLAUSE = re.compile(
     r"\b(OPTIONAL\s+MATCH|DETACH\s+DELETE|ORDER\s+BY|MATCH|MERGE|CREATE|WITH|RETURN|UNWIND"
@@ -50,11 +54,22 @@ USAGE = re.compile(
     re.IGNORECASE,
 )
 
+# Клаузы, где голое имя переменной — обращение к ней (а не новое объявление,
+# как в шаблоне MATCH).
+BARE_USAGE_CLAUSES = {"WITH", "RETURN", "DELETE", "DETACH DELETE", "SET", "REMOVE", "WHERE"}
+STRINGS = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
+# Имя переменной: не свойство (.x), не параметр ($x), не метка/тип (:X),
+# не функция (x(...)), не ключ литерала-словаря ({x: ...}).
+BARE_NAME = re.compile(r"(?<![.$:\w])([a-zA-Z_]\w*)\b(?!\s*\()(?!\s*:\s)(?!\s*:\$)")
+
 KEYWORDS = {
     "and", "or", "not", "in", "is", "null", "true", "false", "as", "distinct",
     "case", "when", "then", "else", "end", "count", "size", "coalesce", "collect",
     "date", "datetime", "trim", "tolower", "toupper", "replace", "head", "last",
     "exists", "all", "any", "none", "single", "asc", "desc", "on", "match", "with",
+    "xor", "starts", "ends", "contains", "where", "return", "order", "by", "limit", "skip",
+    "set", "delete", "detach", "remove", "merge", "create", "optional", "unwind", "call",
+    "yield", "union", "foreach", "nan", "infinity",
 }
 
 
@@ -83,6 +98,7 @@ def projected_names(text: str) -> set[str]:
         item = item.strip()
         if item == "*":
             return {"*"}
+        item = re.sub(r"^DISTINCT\s+", "", item, flags=re.IGNORECASE)
         alias = re.search(r"\bAS\s+([a-zA-Z_]\w*)\s*$", item, re.IGNORECASE)
         if alias:
             names.add(alias.group(1))
@@ -91,9 +107,40 @@ def projected_names(text: str) -> set[str]:
     return names
 
 
+def bare_names(body: str) -> set[str]:
+    """Голые обращения к переменным: `RETURN n`, `DELETE rel`, `WHERE x:Label`."""
+    text = STRINGS.sub(" ", body)
+    # Псевдонимы после AS — новые имена, а не обращения.
+    text = re.sub(r"\bAS\s+[a-zA-Z_]\w*", " ", text, flags=re.IGNORECASE)
+    return {m for m in BARE_NAME.findall(text) if m.lower() not in KEYWORDS}
+
+
+def _bracket_depth(query: str) -> list[int]:
+    """Глубина круглых и квадратных скобок в каждой позиции (без строк)."""
+    depths, depth, quote = [], 0, None
+    for ch in query:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        depths.append(depth)
+    return depths
+
+
 def clauses(query: str) -> Iterator[tuple[str, str]]:
-    """Разбивает запрос на пары (ключевое слово, тело)."""
-    matches = list(CLAUSE.finditer(query))
+    """Разбивает запрос на пары (ключевое слово, тело).
+
+    WHERE внутри списковых выражений и вызовов функций ([x IN xs WHERE ...])
+    клаузой не считается. Подзапросы в фигурных скобках (EXISTS { MATCH ... })
+    по-прежнему разбираются как клаузы.
+    """
+    depths = _bracket_depth(query)
+    matches = [m for m in CLAUSE.finditer(query) if depths[m.start()] == 0]
     for i, m in enumerate(matches):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(query)
         yield re.sub(r"\s+", " ", m.group(0).upper()), query[m.end():end]
@@ -114,6 +161,8 @@ def check_scopes(query: str) -> list[str]:
 
     for keyword, body in clauses(query):
         used = {g for match in USAGE.findall(body) for g in match if g}
+        if keyword in BARE_USAGE_CLAUSES:
+            used |= bare_names(body)
         for name in sorted(used):
             if name in KEYWORDS or name in locals_seen:
                 continue
@@ -151,13 +200,22 @@ def check_scopes(query: str) -> list[str]:
 # --------------------------------------------------------------------------
 
 
+def query_modules() -> list[str]:
+    """Модули API, которые обращаются к Neo4j."""
+    here = Path(__file__).resolve().parent
+    return sorted(
+        path.stem for path in here.glob("*.py")
+        if path.stem not in SKIP_MODULES and DB_MARKER.search(path.read_text(encoding="utf-8"))
+    )
+
+
 def collect_queries() -> list[tuple[str, str]]:
     """Все Cypher-строки проекта: константы модулей + литералы внутри функций."""
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
     here = Path(__file__).resolve().parent
 
-    for name in MODULES:
+    for name in query_modules():
         module = __import__(name)
         for attribute in dir(module):
             value = getattr(module, attribute)
@@ -207,7 +265,9 @@ def run_explain() -> int:
         "description": "x", "instruction": "x", "number": "x", "title": "x", "date": None,
         "is_violation": True, "targets": [], "labels": [], "props": {},
         "order_id": "x", "order_node_id": "0", "clause_node_id": "0", "rule_node_id": "0",
-        "clause_id": "x",
+        "clause_id": "x", "department_id": None, "is_student": None, "students_only": False,
+        "values": [], "names": [], "ids": [], "keep": "0", "twins": [], "error": None,
+        "duties": None, "changed": False, "department_node_id": "0", "reviewed": False,
     }
     failures = 0
     queries = collect_queries()

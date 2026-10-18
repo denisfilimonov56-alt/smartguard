@@ -4,15 +4,20 @@ import {
 
 import { api } from "../api/client";
 import type {
-  BatchCheck, CheckResult, CheckTarget, Department, Diagnostics, FlatClause, NodeKind, Order,
+  CheckResult, CheckTarget, Department, Diagnostics, FlatClause, NodeKind, Order,
 } from "../api/types";
 import { errorText, useToast } from "../ui/Toasts";
+import { CheckFormProvider } from "./checkForm";
+import { hasDraft } from "./drafts";
 import { findOrderOf, findRuleRef } from "./tree";
 
 export type Section = "check" | "rules" | "orders" | "departments" | "targets" | "graph" | "health"
   | "monitoring" | "users" | "settings";
 export const SECTION_IDS: Section[] = ["check", "rules", "orders", "departments", "targets", "graph", "health",
   "monitoring", "users", "settings"];
+/** Пауза после правок, через которую перечитываются счётчики замечаний. */
+const HEALTH_DEBOUNCE_MS = 3000;
+
 export type ApiState = "connecting" | "online" | "offline";
 
 interface Data {
@@ -36,32 +41,6 @@ const sectionOf = (pathname: string): Section | null => {
   return SECTION_IDS.find((s) => s === id) ?? null;
 };
 
-/** Строка пакетной проверки: цель, её подразделение и идентификатор из внешней системы. */
-export interface BatchRow {
-  key: string;
-  id: string;
-  goal: string;
-  /** Пусто — берётся подразделение, выбранное на странице. */
-  departmentId: string;
-  /** Номер строки листа Excel, из которой цель загружена. */
-  line?: number;
-}
-
-/** Форма «Проверки цели»: живёт здесь, чтобы пережить уход на другую страницу. */
-export interface CheckForm {
-  /** Одна цель или несколько сразу. */
-  mode: "single" | "batch";
-  goal: string;
-  /** Подразделение одной цели; в пакете — для строк, где оно не указано. */
-  departmentId: string;
-  result: CheckResult | null;
-  rows: BatchRow[];
-  /** Последняя пакетная проверка: строки, по которым она шла, и ответ API. */
-  batch: { rows: BatchRow[]; result: BatchCheck } | null;
-}
-
-export const EMPTY_CHECK_FORM: CheckForm = { mode: "single", goal: "", departmentId: "", result: null, rows: [], batch: null };
-
 /** С чего начать мастер нового правила. */
 export interface WizardPreset {
   orderNodeId?: string;
@@ -73,13 +52,14 @@ interface CatalogState extends Data, Flags {
   health: Diagnostics["counts"] | null;
   section: Section;
   setSection: (section: Section) => void;
-  checkForm: CheckForm;
-  setCheckForm: (patch: Partial<CheckForm> | ((prev: CheckForm) => Partial<CheckForm>)) => void;
   /** Перечитать данные; флаги архива можно поменять тем же вызовом. */
   reload: (flags?: Partial<Flags>) => Promise<Data | null>;
   /** Выполнить изменение, показать сообщение и перечитать данные. */
   mutate: (fn: () => Promise<unknown>, success?: string) => Promise<void>;
+  /** Перечитать счётчики замечаний сейчас. */
   refreshHealth: () => Promise<void>;
+  /** Счётчики уже известны (раздел «Замечания» загрузил отчёт): без повторного запроса. */
+  setHealth: (counts: Diagnostics["counts"] | null) => void;
   /** Приказ, открытый в разделе «Приказы». */
   selectedOrder: string | null;
   selectOrder: (nodeId: string) => void;
@@ -114,40 +94,61 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
   const [apiState, setApiState] = useState<ApiState>("connecting");
   const [health, setHealth] = useState<Diagnostics["counts"] | null>(null);
   const [section, setSectionState] = useState<Section>(() => sectionOf(location.pathname) ?? "check");
-  const [checkForm, setCheckFormState] = useState<CheckForm>(EMPTY_CHECK_FORM);
   const [selectedOrder, setSelectedOrder] = useState<string | null>(null);
   const [panelRule, setPanelRule] = useState<string | null>(null);
   const [wizard, setWizard] = useState<WizardPreset | null>(null);
   const [trace, setTrace] = useState<CheckResult | null>(null);
   const [flashTarget, setFlashTarget] = useState<{ id: string; seq: number } | null>(null);
 
+  // Диагностика графа — около двадцати запросов Cypher: после правок она
+  // перечитывается не на каждую, а одна на серию правок подряд.
+  const healthTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshHealth = useCallback(async () => {
+    if (healthTimer.current) { clearTimeout(healthTimer.current); healthTimer.current = null; }
     try { setHealth((await api.diagnostics()).counts); } catch { /* значок необязателен */ }
   }, []);
+  const scheduleHealth = useCallback(() => {
+    if (healthTimer.current) clearTimeout(healthTimer.current);
+    healthTimer.current = setTimeout(() => void refreshHealth(), HEALTH_DEBOUNCE_MS);
+  }, [refreshHealth]);
+  useEffect(() => () => { if (healthTimer.current) clearTimeout(healthTimer.current); }, []);
 
+  // Ответ на устаревший запрос не затирает данные более нового; флаги архива
+  // при сбое возвращаются к тем, с которыми данные на экране загружены.
+  const reloadSeq = useRef(0);
+  const loadedFlags = useRef(flags);
+  const healthLoaded = useRef(false);
   const reload = useCallback(async (override?: Partial<Flags>) => {
     const next = { ...flagsRef.current, ...override };
     flagsRef.current = next;
     setFlags(next);
+    const seq = ++reloadSeq.current;
     let loaded: Data | null = null;
     try {
       const [tree, targets, clauses, departments] = await Promise.all([
         api.tree(next.showArchived), api.checkTargets(next.showArchivedTargets), api.clauses(),
         api.departments(next.showArchivedDepartments),
       ]);
+      if (seq !== reloadSeq.current) return null;
       loaded = {
         orders: tree.orders, targets: targets.targets, clauses: clauses.clauses,
         departments: departments.departments,
       };
+      loadedFlags.current = next;
       setData(loaded);
       setApiState("online");
     } catch (err) {
+      if (seq !== reloadSeq.current) return null;
+      flagsRef.current = loadedFlags.current;
+      setFlags(loadedFlags.current);
       setApiState("offline");
       toast("Не удалось получить данные: " + errorText(err), "err");
     }
-    void refreshHealth();
+    // Первая загрузка — значок сразу; дальше — после паузы в правках.
+    if (healthLoaded.current) scheduleHealth();
+    else { healthLoaded.current = true; void refreshHealth(); }
     return loaded;
-  }, [toast, refreshHealth]);
+  }, [toast, refreshHealth, scheduleHealth]);
 
   const mutate = useCallback(async (fn: () => Promise<unknown>, success?: string) => {
     await fn();
@@ -178,9 +179,6 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("popstate", onPop);
   }, [showSection]);
 
-  const setCheckForm = useCallback((patch: Partial<CheckForm> | ((prev: CheckForm) => Partial<CheckForm>)) =>
-    setCheckFormState((prev) => ({ ...prev, ...(typeof patch === "function" ? patch(prev) : patch) })), []);
-
   const goToNode = useCallback(async (nodeId: string, kind?: NodeKind) => {
     const flash = () => setFlashTarget({ id: nodeId, seq: Date.now() });
 
@@ -205,6 +203,12 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
     flash();
   }, [data, reload, setSection]);
 
+  // Черновик мастера правила, сохранённый перед повторным входом, забирает сам
+  // мастер — поэтому после входа он открывается сразу.
+  useEffect(() => {
+    if (hasDraft("wizard")) { setSection("rules"); setWizard({}); }
+  }, [setSection]);
+
   // Подсветка — после того как React отрисовал нужный раздел.
   useEffect(() => {
     if (!flashTarget) return;
@@ -219,16 +223,17 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
   }, [flashTarget, toast]);
 
   const value = useMemo<CatalogState>(() => ({
-    ...data, ...flags, apiState, health, section, setSection, checkForm, setCheckForm,
-    reload, mutate, refreshHealth,
+    ...data, ...flags, apiState, health, section, setSection,
+    reload, mutate, refreshHealth, setHealth,
     selectedOrder, selectOrder: setSelectedOrder,
     panelRule, openRule: setPanelRule, closeRule: () => setPanelRule(null),
     wizard,
     openWizard: (preset) => { setSection("rules"); setPanelRule(null); setWizard(preset ?? {}); },
     closeWizard: () => setWizard(null),
     goToNode, trace, setTrace,
-  }), [trace, data, flags, apiState, health, section, setSection, checkForm, setCheckForm,
+  }), [trace, data, flags, apiState, health, section, setSection,
     reload, mutate, refreshHealth, selectedOrder, panelRule, wizard, goToNode]);
 
-  return <Context.Provider value={value}>{children}</Context.Provider>;
+  // Форма проверки — свой контекст: ввод в неё не перерисовывает потребителей каталога.
+  return <Context.Provider value={value}><CheckFormProvider>{children}</CheckFormProvider></Context.Provider>;
 }

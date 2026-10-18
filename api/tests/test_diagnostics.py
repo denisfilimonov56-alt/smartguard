@@ -202,3 +202,39 @@ def test_reports_job_descriptions_without_or_with_unreviewed_duties(db):
     assert by_code["job_descriptions_without_duties"]["items"][0]["label"] == "УЦТ — Аналитик"
     assert by_code["job_duties_unreviewed"]["severity"] == "info"
     assert report["ready"] is True
+
+
+def test_finds_rules_whose_targets_are_all_archived(db):
+    """Архивный атрибут выпадает из словаря модели — правило молча не срабатывает."""
+    _healthy(db)
+    db.rows[diagnostics.Q_RULES_ONLY_ARCHIVED_TARGETS] = [{"nodeId": RULE, "label": "R-1.1"}]
+    report = diagnostics.collect()
+    issue = next(i for i in report["issues"] if i["code"] == "rules_with_archived_targets")
+    assert issue["severity"] == "warning" and issue["items"][0]["nodeId"] == RULE
+    assert report["ready"] is True
+
+
+def test_finds_clauses_whose_rules_are_all_archived(db):
+    _healthy(db)
+    db.rows[diagnostics.Q_CLAUSES_ONLY_ARCHIVED_RULES] = [{"nodeId": "4:db:2", "label": "ПР-01 1.1"}]
+    issue = next(i for i in diagnostics.collect()["issues"] if i["code"] == "clauses_with_archived_rules")
+    assert issue["items"][0]["label"] == "ПР-01 1.1"
+
+
+def test_archived_target_queries_check_status():
+    assert "NOT EXISTS" in diagnostics.Q_RULES_ONLY_ARCHIVED_TARGETS
+    assert "coalesce(t.status, 'active') = 'active'" in diagnostics.Q_RULES_ONLY_ARCHIVED_TARGETS
+    assert "coalesce(r.status, 'active') = 'active'" in diagnostics.Q_CLAUSES_ONLY_ARCHIVED_RULES
+
+
+def test_spelling_twins_offer_a_merge(db):
+    db.rows[diagnostics.Q_TARGETS] = [
+        {"nodeId": TARGET_A, "name": "срок исполнения", "description": "о", "status": "active"},
+        {"nodeId": TARGET_B, "name": "срок_исполнения", "description": "о", "status": "active"},
+    ]
+    issue = next(i for i in diagnostics.collect()["issues"] if i["code"] == "duplicate_check_targets")
+    assert issue["fix"]["action"] == "merge_duplicate_targets"
+
+
+def test_pending_duties_are_not_reported_as_missing():
+    assert "dutiesStatus" in diagnostics.Q_JOB_DUTIES and "'pending'" in diagnostics.Q_JOB_DUTIES

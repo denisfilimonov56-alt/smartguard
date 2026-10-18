@@ -1,13 +1,14 @@
 # .env с тестовыми значениями лежит в git, чтобы стек поднимался сразу
 # после pull. Секреты (HF_TOKEN и т. п.) — только в .env.local.
+# На сервере .env свой: при обновлении из git его откладывают (docs/release.md).
 .env.local
 
-# Офлайн-набор: образы и веса модели готовятся scripts/offline/prepare.sh
-# и передаются на сервер отдельно, в git им не место (десятки гигабайт).
+# Веса модели (десятки гигабайт) скачиваются при релизе, в git им
+# не место. dist/ — артефакты сборки.
 dist/
 models/
 
-# Корневой сертификат домена для LDAPS: у каждого сервера свой.
+# Корневой сертификат Keycloak (KEYCLOAK_CA_FILE): у каждого сервера свой.
 certs/*
 !certs/.gitkeep
 
@@ -19,8 +20,9 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Дампы базы, которые README предлагает делать перед миграциями
+# Дампы базы перед миграциями (docs/data.md, «Резервная копия» — в backups/)
 *.dump
+backups/
 
 # Локальное окружение Python
 .venv/
@@ -30,3 +32,5 @@ web/node_modules/
 web/dist/
 web/test-results/
 web/playwright-report/
+# Кэш инкрементальной сборки TypeScript
+*.tsbuildinfo

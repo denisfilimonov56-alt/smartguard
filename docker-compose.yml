@@ -1,25 +1,38 @@
-# Стек рассчитан на сервер без доступа в интернет.
+# Работающий стек в интернет не ходит. Сеть нужна только при релизе
+# (docs/release.md): скачать образы, собрать API и интерфейс (pip и npm)
+# и докачать веса модели — после этого стек поднимается без сети.
 #
-#   * pull_policy: never — compose никогда не ходит в реестр; образы должны
-#     быть загружены заранее (scripts/offline/install.sh делает docker load).
+#   * pull_policy: ${PULL_POLICY:-never} — compose сам в реестр не ходит;
+#     образы скачиваются только при релизе: PULL_POLICY=always docker compose pull.
 #   * Веса модели читаются из локального каталога ${MODELS_DIR}, а не
 #     скачиваются с Hugging Face; HF_HUB_OFFLINE запрещает любые попытки.
-#   * Образ API собирается из колёс в api/vendor/wheels, pip к PyPI не ходит.
+#     Скачивает их при релизе разовый сервис model (профиль release).
 #
-#   * Наружу опубликован только интерфейс (порт 3000). Neo4j, vLLM и API
-#     слушают 127.0.0.1: у Neo4j Browser и vLLM своей проверки прав на
-#     каталог нет, а API доступен пользователям через nginx интерфейса (/api).
-#     С рабочего места к ним ходят через SSH-туннель:
+#   * Наружу может быть опубликован только интерфейс (порт 3000, адрес — в
+#     WEB_BIND). Neo4j, vLLM, API и Keycloak стенда слушают 127.0.0.1: у Neo4j
+#     Browser и vLLM своей проверки прав на каталог нет, а API доступен
+#     пользователям через nginx интерфейса (/api). С рабочего места к ним
+#     ходят через SSH-туннель:
 #       ssh -L 7474:localhost:7474 -L 7687:localhost:7687 <сервер>
+#   * Логи всех контейнеров ротируются (json-file, LOG_MAX_SIZE × LOG_MAX_FILES);
+#     журнал аудита API дополнительно пишется в файл на томе api_audit.
 #
-# Подготовка набора на машине с интернетом: scripts/offline/prepare.sh
-# Установка на сервере:                     scripts/offline/install.sh
+# Релиз (обновление и запуск) на сервере: docs/release.md
+
+# Ротация логов docker: без неё json-file растёт без предела и забивает
+# /var/lib/docker. Подключается в каждый сервис через *default-logging.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-50m}
+    max-file: "${LOG_MAX_FILES:-5}"
 
 services:
   neo4j:
     image: neo4j:5.26
-    pull_policy: never
+    pull_policy: ${PULL_POLICY:-never}
     restart: unless-stopped
+    logging: *default-logging
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
     ports:
@@ -35,20 +48,26 @@ services:
       retries: 15
       start_period: 30s
 
-  # Разовый сервис: заполняет граф из neo4j/init/seed.cypher.
-  # Neo4j 5 не исполняет .cypher из /init сам, поэтому это делает seed.py.
-  # Скрипт идемпотентен, поэтому запускается при каждом подъёме стека.
+  # Разовый сервис: создаёт схему графа из neo4j/init/seed.cypher (при каждом
+  # подъёме стека, идемпотентно) и загружает данные из neo4j/init/data.cypher —
+  # только в пустой каталог или по явному SEED_DATA=1, чтобы подъём стека не
+  # откатывал правки из интерфейса. Neo4j 5 не исполняет .cypher из /init сам,
+  # поэтому это делает seed.py.
   seeder:
     image: goal-checker-api:${APP_VERSION:-latest}
     build: ./api
     pull_policy: never
     restart: "no"
+    logging: *default-logging
     command: ["python", "seed.py"]
     environment:
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       SEED_FILE: /init/seed.cypher
+      SEED_DATA_FILE: /init/data.cypher
+      # 1 — применить data.cypher и к непустому каталогу (вернуть каталог к файлу).
+      SEED_DATA: ${SEED_DATA:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./neo4j/init:/init:ro
@@ -57,11 +76,12 @@ services:
         condition: service_healthy
 
   vllm:
-    # Тег зафиксирован: на сервере без интернета «latest» означает
-    # «что успели загрузить», а это должно быть видно в конфигурации.
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.9.2}
-    pull_policy: never
+    # Тег зафиксирован: «latest» означал бы «что скачалось при последнем
+    # релизе», а версия должна быть видна в конфигурации.
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
+    pull_policy: ${PULL_POLICY:-never}
     restart: unless-stopped
+    logging: *default-logging
     environment:
       # Запрет на любые обращения к Hugging Face и телеметрию.
       HF_HUB_OFFLINE: "1"
@@ -71,11 +91,16 @@ services:
       DO_NOT_TRACK: "1"
     # Веса лежат в ${MODELS_DIR}/${VLLM_MODEL_DIR}; наружу модель представляется
     # под именем ${VLLM_MODEL}, чтобы API не зависел от пути на диске.
+    # Промпты (тексты целей, должностные инструкции) vLLM в лог не пишет:
+    # с v0.30 это по умолчанию, флаг --enable-log-requests сюда не добавлять.
+    # --language-model-only: картинки проекту не нужны, энкодер изображений
+    # не грузится и не занимает память GPU.
     command: >
-      --model /models/${VLLM_MODEL_DIR:-Qwen3-8B}
-      --served-model-name ${VLLM_MODEL}
+      --model /models/${VLLM_MODEL_DIR:-Qwen3.6-27B-FP8}
+      --served-model-name ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --gpu-memory-utilization 0.90
+      --language-model-only
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -86,9 +111,13 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      # Загрузка весов 8B-модели с диска занимает минуты, поэтому длинный start_period.
+      # Загрузка весов 27B-модели (~30 ГБ) с диска занимает минуты, поэтому длинный start_period.
       start_period: 900s
     deploy:
+      # 0 — сервер без GPU, модель на другом сервере (VLLM_URL): сервис vllm
+      # не запускается при docker compose up -d.
+      # Настройка в .env постоянная, в отличие от --scale vllm=0.
+      replicas: ${VLLM_REPLICAS:-1}
       resources:
         reservations:
           devices:
@@ -101,69 +130,190 @@ services:
     build: ./api
     pull_policy: never
     restart: unless-stopped
+    logging: *default-logging
+    # uvicorn дорабатывает идущие запросы до 45 с (api/Dockerfile) — запас,
+    # чтобы docker не убил процесс раньше и история проверок успела записаться.
+    stop_grace_period: 60s
+    # Каждая переменная, которую читает API, перечислена здесь с тем же
+    # значением по умолчанию, что в коде (сверяет tests/test_deploy.py):
+    # переменная из .env, которой нет в этом списке, до контейнера не доходит.
     environment:
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-      VLLM_URL: http://vllm:8000/v1
-      VLLM_MODEL: ${VLLM_MODEL}
+      # Модель: по умолчанию vLLM из этого же compose; без GPU — внешний
+      # OpenAI-совместимый эндпоинт (и VLLM_REPLICAS=0 в .env).
+      VLLM_URL: ${VLLM_URL:-http://vllm:8000/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:-dummy}
+      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_CONNECT_TIMEOUT_SECONDS: ${LLM_CONNECT_TIMEOUT_SECONDS:-5}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      # Предохранитель: после стольких таймаутов подряд модель считается
+      # недоступной на LLM_BREAKER_SECONDS, проверки сразу уходят на ручную.
+      LLM_BREAKER_TIMEOUTS: ${LLM_BREAKER_TIMEOUTS:-3}
+      LLM_BREAKER_SECONDS: ${LLM_BREAKER_SECONDS:-60}
+      LLM_BREAKER_BULK_WAIT_SECONDS: ${LLM_BREAKER_BULK_WAIT_SECONDS:-300}
+      # Сколько пакетная проверка ждёт восстановления модели от начала сбоя.
+      LLM_QUEUE_TIMEOUT_SECONDS: ${LLM_QUEUE_TIMEOUT_SECONDS:-120}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
+      LLM_JSON_MODE: ${LLM_JSON_MODE:-1}
       BULK_MAX_WORKERS: ${BULK_MAX_WORKERS:-16}
+      BULK_MAX_REQUESTS: ${BULK_MAX_REQUESTS:-4}
+      # Потоков обработчиков API; пусто — по ёмкости модели.
+      API_THREADS: ${API_THREADS:-}
       LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-32}
       LLM_INTERACTIVE_RESERVE: ${LLM_INTERACTIVE_RESERVE:-4}
       CHECK_CACHE_TTL_SECONDS: ${CHECK_CACHE_TTL_SECONDS:-3600}
+      CHECK_CACHE_MAX_ENTRIES: ${CHECK_CACHE_MAX_ENTRIES:-20000}
+      SMART_CACHE_TTL_SECONDS: ${SMART_CACHE_TTL_SECONDS:-86400}
+      JOB_DESCRIPTIONS_CACHE_TTL_SECONDS: ${JOB_DESCRIPTIONS_CACHE_TTL_SECONDS:-60}
       HISTORY_RETENTION_DAYS: ${HISTORY_RETENTION_DAYS:-365}
+      SMART_SCORE_RETENTION_DAYS: ${SMART_SCORE_RETENTION_DAYS:-365}
       # Согласовано с окном модели (VLLM_MAX_MODEL_LEN): меняйте вместе.
       JOB_TEXT_MAX_CHARS: ${JOB_TEXT_MAX_CHARS:-24000}
-      LLM_JSON_MODE: ${LLM_JSON_MODE:-1}
+      # Выписка обязанностей из инструкции идёт в фоне, со своим таймаутом.
+      DUTIES_MAX_TOKENS: ${DUTIES_MAX_TOKENS:-4096}
+      DUTIES_TIMEOUT_SECONDS: ${DUTIES_TIMEOUT_SECONDS:-600}
+      DUTIES_WORKERS: ${DUTIES_WORKERS:-1}
       MAX_GOALS_PER_REQUEST: ${MAX_GOALS_PER_REQUEST:-200}
       CHECK_RATE_PER_MINUTE: ${CHECK_RATE_PER_MINUTE:-600}
+      GOAL_MAX_CHARS: ${GOAL_MAX_CHARS:-4000}
       PROMPT_EXAMPLES_PER_KIND: ${PROMPT_EXAMPLES_PER_KIND:-2}
+      PROMPT_EXAMPLE_MAX_CHARS: ${PROMPT_EXAMPLE_MAX_CHARS:-300}
+      ADVICE_MAX_ATTEMPTS: ${ADVICE_MAX_ATTEMPTS:-3}
+      ADVICE_MAX_EXAMPLES: ${ADVICE_MAX_EXAMPLES:-40}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Вход в интерфейс: пароль проверяет каталог, роли — реестр в Neo4j.
-      AUTH_BACKEND: ${AUTH_BACKEND:-ldap}
+      # Журнал аудита: файл на томе api_audit с ежедневной ротацией, плюс stdout.
+      AUDIT_LOG_DIR: /data/audit
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
+      AUDIT_MAX_FILE_MB: ${AUDIT_MAX_FILE_MB:-100}
+      # Вход в интерфейс: кто пользователь — решает Keycloak, роли — реестр в Neo4j.
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-}
+      KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_INTERNAL_URL:-}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-}
+      KEYCLOAK_CA_FILE: ${KEYCLOAK_CA_FILE:-}
+      KEYCLOAK_TIMEOUT_SECONDS: ${KEYCLOAK_TIMEOUT_SECONDS:-5}
       AUTH_ADMIN_LOGINS: ${AUTH_ADMIN_LOGINS:-}
-      AUTH_STATIC_USERS: ${AUTH_STATIC_USERS:-}
-      LDAP_URL: ${LDAP_URL:-}
-      LDAP_USER_TEMPLATE: ${LDAP_USER_TEMPLATE:-}
-      LDAP_CA_FILE: ${LDAP_CA_FILE:-}
-      LDAP_STARTTLS: ${LDAP_STARTTLS:-0}
-      LDAP_TIMEOUT_SECONDS: ${LDAP_TIMEOUT_SECONDS:-5}
-      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-1}
-      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
-      SESSION_MAX_HOURS: ${SESSION_MAX_HOURS:-12}
-      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
-      LOGIN_MAX_ATTEMPTS_PER_IP: ${LOGIN_MAX_ATTEMPTS_PER_IP:-30}
-      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
       ENABLE_DOCS: ${ENABLE_DOCS:-0}
     ports:
       # Только с самого сервера: /ready, диагностика, Swagger на стенде.
       - "127.0.0.1:8080:8080"
     volumes:
-      # Смонтировано на запись, чтобы export_graph.py мог записать seed.cypher.
+      # Смонтировано на запись, чтобы export_graph.py мог записать data.cypher
+      # (процесс работает от uid 10001: нужна запись в файл, см. docs/data.md;
+      # без неё выгрузка идёт через --stdout).
       - ./neo4j/init:/init
-      # Корневой сертификат домена для LDAPS (LDAP_CA_FILE=/certs/<файл>).
+      # Корневой сертификат Keycloak, если он не публичный (KEYCLOAK_CA_FILE=/certs/<файл>).
       - ./certs:/certs:ro
+      # Журнал аудита переживает пересоздание контейнера и обновления.
+      - api_audit:/data/audit
     depends_on:
       neo4j:
         condition: service_healthy
       seeder:
         condition: service_completed_successfully
+      # Модель API не нужна для старта: каталог, вход и настройки работают,
+      # пока vLLM грузит веса, а готовность модели видна в /ready.
+      # required: false — стек поднимается и без сервиса vllm (VLLM_REPLICAS=0).
       vllm:
-        condition: service_healthy
+        condition: service_started
+        required: false
 
-  # Интерфейс на React: статика собирается в образ (web/Dockerfile) на машине
-  # с интернетом и приезжает на сервер готовой — node и npm там не нужны.
+  # Интерфейс на React: статика собирается в образ (web/Dockerfile) при
+  # релизе; в работающем контейнере только nginx — node и npm не нужны.
   web:
     image: goal-checker-web:${APP_VERSION:-latest}
     build: ./web
     pull_policy: never
     restart: unless-stopped
+    logging: *default-logging
     environment:
       TRUSTED_PROXY: ${TRUSTED_PROXY:-127.0.0.1}
+      # Браузер ходит в Keycloak напрямую: его origin разрешается в Content-Security-Policy.
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-}
     ports:
-      - "3000:80"
+      # Адрес, на котором слушает интерфейс. 127.0.0.1 — когда TLS-прокси на
+      # этом же сервере (тогда в обход TLS к порту 3000 не подключиться);
+      # 0.0.0.0 или адрес интерфейса — когда прокси на другой машине.
+      - "${WEB_BIND:-0.0.0.0}:3000:80"
+
+  # Keycloak для стенда: поднимается только с профилем idp (COMPOSE_PROFILES=idp
+  # в .env стенда). На боевом сервере вход идёт через корпоративный Keycloak,
+  # и этот сервис не нужен — достаточно не включать профиль. Realm, клиент
+  # интерфейса и учётка стенда импортируются из keycloak/ при первом старте;
+  # данные (сессии, смена пароля) живут в томе keycloak_data.
+  keycloak:
+    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3}
+    pull_policy: ${PULL_POLICY:-never}
+    profiles: ["idp"]
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      # Без «:?»: compose подставляет переменные во всём файле до отбора
+      # профилей, и обязательный пароль ронял бы боевой стек без профиля idp.
+      # Пароль обязателен при включённом idp (docs/release.md).
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
+      # Издатель токенов — публичный адрес, тот же, что в KEYCLOAK_URL у api и web.
+      KC_HOSTNAME: ${KEYCLOAK_URL:-}
+      KC_HTTP_ENABLED: "true"
+    ports:
+      # Только с самой машины: у консоли master-realm-а пароль стенда из git.
+      - "127.0.0.1:8180:8080"
+    volumes:
+      # Том — на весь data, а не на data/h2: подкаталога h2 в образе нет, и
+      # docker создал бы его от root, а Keycloak (uid 1000) не смог бы писать базу.
+      - keycloak_data:/opt/keycloak/data
+      - ./keycloak:/opt/keycloak/data/import:ro
+
+  # Разовый сервис релиза: скачивает (докачивает) веса модели с Hugging Face
+  # в ${MODELS_DIR}/${VLLM_MODEL_DIR} и проверяет, что все шарды на месте.
+  # Профиль release: при docker compose up не запускается, только явно —
+  #   PULL_POLICY=always docker compose run --rm model
+  # Закрытая модель — HF_TOKEN=<токен> перед командой.
+  model:
+    # Тот же базовый образ, что у API (api/Dockerfile).
+    image: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+    pull_policy: ${PULL_POLICY:-never}
+    profiles: ["release"]
+    restart: "no"
+    logging: *default-logging
+    environment:
+      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
+      VLLM_MODEL_DIR: ${VLLM_MODEL_DIR:-Qwen3.6-27B-FP8}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    # hf download идемпотентен: скачанное не качает заново, прерванное
+    # докачивает. config.json появляется первым, шарды — последними, поэтому
+    # после загрузки сверяются все файлы из model.safetensors.index.json.
+    command:
+      - bash
+      - -ec
+      - |
+        pip install --quiet --disable-pip-version-check --root-user-action=ignore "huggingface_hub[cli]"
+        hf download "$$VLLM_MODEL" --local-dir "/models/$$VLLM_MODEL_DIR" \
+          --exclude "*.pth" --exclude "original/*" --exclude "*.gguf"
+        python - <<'PY'
+        import json, os, pathlib, sys
+        d = pathlib.Path("/models", os.environ["VLLM_MODEL_DIR"])
+        index = d / "model.safetensors.index.json"
+        if index.is_file():
+            shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        else:
+            shards = sorted(p.name for p in d.glob("*.safetensors"))
+        bad = [s for s in shards if not (d / s).is_file() or (d / s).stat().st_size == 0]
+        if not (d / "config.json").is_file() or not shards or bad:
+            sys.exit(f"веса в {d} неполные: {bad or 'нет config.json или *.safetensors'} — запустите ещё раз")
+        size = sum((d / s).stat().st_size for s in shards) / 2**30
+        print(f"веса на месте: {d}, шардов {len(shards)}, {size:.1f} ГБ")
+        PY
 
 volumes:
   neo4j_data:
+  keycloak_data:
+  api_audit:

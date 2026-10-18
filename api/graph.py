@@ -4,8 +4,12 @@
 (см. lifespan в main.py), чтобы соединения не текли между перезапусками.
 """
 
+import json
 import logging
 import os
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from neo4j import Driver, GraphDatabase
@@ -71,6 +75,12 @@ FOR_DEPARTMENT = """($department_id IS NULL
        OR NOT (r)-[:ONLY_IN]->(:Department)
        OR (r)-[:ONLY_IN]->(:Department {departmentId: $department_id}))"""
 
+# Правила только для студентов — свойство правила: Rule.studentsOnly = true.
+# Такое правило проверяется, только если цель ставит студент ($is_student = true).
+# $is_student = null означает «признак не передан»: тогда применяются все
+# правила — тот же отказ в сторону строгости, что и для подразделения.
+FOR_AUDIENCE = """(coalesce($is_student, true) OR NOT coalesce(r.studentsOnly, false))"""
+
 ALL_DEPARTMENTS = """
 MATCH (d:Department)
 WHERE d.departmentId IS NOT NULL
@@ -111,6 +121,7 @@ WHERE t.name IN $attributes
   AND {ACTIVE.format('r')}
   AND {ACTIVE.format('t')}
   AND {FOR_DEPARTMENT}
+  AND {FOR_AUDIENCE}
 RETURN t.name AS attribute, r.ruleId AS rule_id
 """
 
@@ -126,6 +137,7 @@ WHERE r.type = 'PROHIBITION'
   AND {ACTIVE.format('r')}
   AND {ACTIVE.format('t')}
   AND {FOR_DEPARTMENT}
+  AND {FOR_AUDIENCE}
 OPTIONAL MATCH (r)-[:HAS_EXAMPLE]->(e:ViolationExample {{isViolation: true}})
 WHERE {ACTIVE.format('e')}
 RETURN o.number             AS order_number,
@@ -133,6 +145,7 @@ RETURN o.number             AS order_number,
        c.code               AS clause_code,
        c.text               AS clause_text,
        r.ruleId             AS rule_id,
+       elementId(r)         AS rule_node_id,
        r.description        AS rule_text,
        r.checkInstruction   AS check_instruction,
        'PROHIBITION'        AS violation_type,
@@ -154,6 +167,7 @@ WHERE r.type = 'REQUIREMENT'
   AND {ACTIVE.format('r')}
   AND {ACTIVE.format('t')}
   AND {FOR_DEPARTMENT}
+  AND {FOR_AUDIENCE}
 OPTIONAL MATCH (r)-[:HAS_EXAMPLE]->(e:ViolationExample {{isViolation: false}})
 WHERE {ACTIVE.format('e')}
 RETURN o.number             AS order_number,
@@ -161,6 +175,7 @@ RETURN o.number             AS order_number,
        c.code               AS clause_code,
        c.text               AS clause_text,
        r.ruleId             AS rule_id,
+       elementId(r)         AS rule_node_id,
        r.description        AS rule_text,
        r.checkInstruction   AS check_instruction,
        'MISSING_REQUIREMENT' AS violation_type,
@@ -220,46 +235,6 @@ RETURN n, r, m
 LIMIT $limit
 """
 
-# --- Диагностика целостности словаря атрибутов ---------------------------
-# Уникальность CheckTarget.name не спасает от «срок исполнения» и
-# «срок_исполнения» — для базы это разные строки. Такие двойники приводят
-# к ложным нарушениям, поэтому их надо видеть явно, а не по симптомам.
-
-DUPLICATE_CHECK_TARGETS = f"""
-MATCH (t:CheckTarget)
-WHERE {ACTIVE.format('t')}
-WITH toLower(replace(replace(trim(t.name), ' ', '_'), '-', '_')) AS norm,
-     collect(t.name) AS variants
-WHERE size(variants) > 1
-RETURN norm, variants
-ORDER BY norm
-"""
-
-CHECK_TARGETS_WITHOUT_DESCRIPTION = f"""
-MATCH (t:CheckTarget)
-WHERE {ACTIVE.format('t')}
-  AND (t.description IS NULL OR trim(t.description) = '')
-RETURN t.name AS name
-ORDER BY name
-"""
-
-ORPHAN_CHECK_TARGETS = f"""
-MATCH (t:CheckTarget)
-WHERE {ACTIVE.format('t')}
-  AND NOT (:Rule)-[:APPLIES_TO]->(t)
-RETURN t.name AS name
-ORDER BY name
-"""
-
-RULES_WITHOUT_TARGET = f"""
-MATCH (r:Rule)
-WHERE {ACTIVE.format('r')}
-  AND NOT (r)-[:APPLIES_TO]->(:CheckTarget)
-RETURN r.ruleId AS rule_id
-ORDER BY rule_id
-"""
-
-
 # --------------------------------------------------------------------------
 #  Публичный API модуля
 # --------------------------------------------------------------------------
@@ -297,14 +272,17 @@ def get_job_descriptions(department_id: str) -> list[dict[str, str]]:
                 session.run(DEPARTMENT_JOB_DESCRIPTIONS, department_id=department_id)]
 
 
-def get_job_rules(attributes: list[str], department_id: Optional[str] = None) -> list[dict[str, Any]]:
+def get_job_rules(attributes: list[str], department_id: Optional[str] = None,
+                  is_student: Optional[bool] = None) -> list[dict[str, Any]]:
     """Правила на атрибутах, определяемых по должностным инструкциям.
 
-    Пустой список — для подразделения таких правил нет, сравнивать незачем.
+    Пустой список — для подразделения (и студента / не студента) таких правил
+    нет, сравнивать незачем. is_student — см. find_violations.
     """
     with get_driver().session() as session:
         return [dict(record) for record in session.run(
-            JOB_RULES_FOR_DEPARTMENT, attributes=attributes, department_id=department_id)]
+            JOB_RULES_FOR_DEPARTMENT, attributes=attributes, department_id=department_id,
+            is_student=is_student)]
 
 
 def get_all_attributes() -> list[str]:
@@ -319,7 +297,8 @@ def get_departments() -> dict[str, dict[str, str]]:
 
 
 def find_violations(
-    attributes: list[str], department_id: Optional[str] = None
+    attributes: list[str], department_id: Optional[str] = None,
+    is_student: Optional[bool] = None,
 ) -> list[dict[str, Any]]:
     """Все нарушения: сработавшие запреты + невыполненные требования.
 
@@ -328,8 +307,11 @@ def find_violations(
 
     department_id — подразделение, чья цель проверяется. None означает
     «неизвестно»: применяются все правила.
+    is_student — ставит ли цель студент. False отключает правила
+    с studentsOnly = true; None означает «не передано»: применяются все.
     """
-    params = {"attributes": attributes, "department_id": department_id}
+    params = {"attributes": attributes, "department_id": department_id,
+              "is_student": is_student}
     with get_driver().session() as session:
         prohibitions = [dict(r) for r in session.run(FIND_PROHIBITIONS, **params)]
         missing = [dict(r) for r in session.run(FIND_MISSING_REQUIREMENTS, **params)]
@@ -341,41 +323,116 @@ def find_violations(
     return prohibitions + missing
 
 
-def diagnose() -> dict[str, Any]:
-    """Проверка целостности словаря атрибутов и правил.
+# Оценки по SMART хранятся в графе, чтобы пережить перезапуск API: одна
+# формулировка — одна оценка. К каталогу узлы не относятся (как :Setting).
+SMART_SCORE_GET = "MATCH (s:SmartScore {goalHash: $hash}) RETURN s.scores AS scores"
+SMART_SCORE_PUT = """
+MERGE (s:SmartScore {goalHash: $hash})
+SET s.scores = $scores, s.updatedAt = $now
+"""
+# Уникальность goalHash: без неё одновременные MERGE одной формулировки
+# создают двойники. Ограничение нельзя создать поверх обычного индекса на том
+# же свойстве (его заводили прежние версии), поэтому индекс сначала убирается;
+# если в базе уже есть двойники, остаётся обычный индекс.
+SMART_SCORE_OLD_INDEX_DROP = "DROP INDEX smart_score_hash IF EXISTS"
+SMART_SCORE_CONSTRAINT = """
+CREATE CONSTRAINT smart_score_hash_unique IF NOT EXISTS
+FOR (s:SmartScore) REQUIRE s.goalHash IS UNIQUE
+"""
+SMART_SCORE_INDEX = "CREATE INDEX smart_score_hash IF NOT EXISTS FOR (s:SmartScore) ON (s.goalHash)"
+_smart_index_ready = False
 
-    Возвращает найденные проблемы: дубликаты написаний, атрибуты без
-    описания (модель не получит по ним критерия и будет их пропускать),
-    атрибуты без правил и правила без атрибутов.
+# Оценки, которые давно не перезаписывались, удаляются (раз в сутки, в фоне):
+# без этого узлы :SmartScore копятся с каждой новой формулировкой. 0 — хранить всегда.
+SMART_SCORE_RETENTION_DAYS = max(0, int(os.getenv("SMART_SCORE_RETENTION_DAYS", "365")))
+SMART_SCORE_PRUNE_INTERVAL = 24 * 3600
+# Удаление порциями в отдельных транзакциях: одна транзакция на сотни тысяч
+# узлов съела бы память Neo4j. Запускается только в авто-коммит сессии (session.run).
+SMART_SCORE_BATCH = 10_000
+SMART_SCORE_DELETE_ALL = f"""
+MATCH (s:SmartScore)
+CALL {{ WITH s DETACH DELETE s }} IN TRANSACTIONS OF {SMART_SCORE_BATCH} ROWS
+"""
+SMART_SCORE_DELETE_STALE = f"""
+MATCH (s:SmartScore)
+WHERE s.updatedAt IS NULL OR s.updatedAt < $cutoff
+CALL {{ WITH s DETACH DELETE s }} IN TRANSACTIONS OF {SMART_SCORE_BATCH} ROWS
+"""
+_smart_pruned_at = 0.0
+_smart_prune_lock = threading.Lock()
+
+
+def get_smart_score(goal_hash: str) -> Optional[dict[str, Any]]:
+    """Сохранённая оценка SMART по хэшу формулировки; None — её ещё нет."""
+    with get_driver().session() as session:
+        row = session.run(SMART_SCORE_GET, hash=goal_hash).single()
+    return json.loads(row["scores"]) if row and row["scores"] else None
+
+
+# Схему :SmartScore создаёт один поток: одновременные первые записи оценок
+# иначе наперегонки удаляли бы старый индекс и создавали ограничение.
+_smart_schema_lock = threading.Lock()
+
+
+def _ensure_smart_schema(session) -> None:
+    global _smart_index_ready
+    if _smart_index_ready:
+        return
+    with _smart_schema_lock:
+        if _smart_index_ready:
+            return
+        session.run(SMART_SCORE_OLD_INDEX_DROP).consume()
+        try:
+            session.run(SMART_SCORE_CONSTRAINT).consume()
+        except Exception as exc:  # noqa: BLE001 — двойники в базе: хотя бы индекс
+            log.warning("Ограничение уникальности :SmartScore не создано, остаётся индекс: %s", exc)
+            session.run(SMART_SCORE_INDEX).consume()
+        _smart_index_ready = True
+
+
+def save_smart_score(goal_hash: str, scores: dict[str, Any]) -> None:
+    """Запоминает оценку SMART; повторная запись той же формулировки её заменяет.
+
+    Раз в сутки заодно запускает в фоне удаление устаревших оценок.
     """
     with get_driver().session() as session:
-        duplicates = [dict(r) for r in session.run(DUPLICATE_CHECK_TARGETS)]
-        no_description = [r["name"] for r in session.run(CHECK_TARGETS_WITHOUT_DESCRIPTION)]
-        orphan_targets = [r["name"] for r in session.run(ORPHAN_CHECK_TARGETS)]
-        rules_without_target = [r["rule_id"] for r in session.run(RULES_WITHOUT_TARGET)]
+        _ensure_smart_schema(session)
+        session.run(SMART_SCORE_PUT, hash=goal_hash, scores=json.dumps(scores, ensure_ascii=False),
+                    now=datetime.now(timezone.utc).isoformat(timespec="seconds")).consume()
+    _schedule_smart_prune()
 
-    problems: list[str] = []
-    for row in duplicates:
-        problems.append(
-            "Дубликаты атрибута, различающиеся написанием: "
-            + ", ".join(f'"{v}"' for v in row["variants"])
-        )
-    if no_description:
-        problems.append(
-            "Атрибуты без описания (промпт останется без критерия, модель будет "
-            "их пропускать): " + ", ".join(no_description)
-        )
-    if orphan_targets:
-        problems.append("Атрибуты, к которым не привязано ни одного правила: "
-                        + ", ".join(orphan_targets))
-    if rules_without_target:
-        problems.append("Правила без привязки к атрибуту (никогда не сработают): "
-                        + ", ".join(rules_without_target))
 
-    return {
-        "duplicate_check_targets": duplicates,
-        "check_targets_without_description": no_description,
-        "orphan_check_targets": orphan_targets,
-        "rules_without_target": rules_without_target,
-        "problems": problems,
-    }
+def _schedule_smart_prune() -> None:
+    global _smart_pruned_at
+    if not SMART_SCORE_RETENTION_DAYS:
+        return
+    with _smart_prune_lock:
+        if time.monotonic() - _smart_pruned_at < SMART_SCORE_PRUNE_INTERVAL and _smart_pruned_at:
+            return
+        _smart_pruned_at = time.monotonic()
+    threading.Thread(target=_prune_quietly, name="smart-prune", daemon=True).start()
+
+
+def _prune_quietly() -> None:
+    try:
+        removed = prune_smart_scores(SMART_SCORE_RETENTION_DAYS)
+        if removed:
+            log.info("Удалено устаревших оценок SMART: %d", removed)
+    except Exception as exc:  # noqa: BLE001 — очистка не обязательна, повторится завтра
+        log.warning("Устаревшие оценки SMART не удалены: %s", exc)
+
+
+def prune_smart_scores(days: int) -> int:
+    """Удаляет оценки SMART, не обновлявшиеся дольше days дней. Возвращает, сколько удалено."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    with get_driver().session() as session:
+        summary = session.run(SMART_SCORE_DELETE_STALE, cutoff=cutoff).consume()
+    return summary.counters.nodes_deleted
+
+
+def delete_smart_scores() -> int:
+    """Удаляет все сохранённые оценки SMART: следующая проверка каждой формулировки спросит модель заново.
+    Возвращает, сколько оценок удалено."""
+    with get_driver().session() as session:
+        summary = session.run(SMART_SCORE_DELETE_ALL).consume()
+    return summary.counters.nodes_deleted

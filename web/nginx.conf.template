@@ -1,9 +1,11 @@
 # Интерфейс и API на одном origin: статика из образа, /api — в сервис api.
-# Благодаря этому cookie сессии ходит только «своему» сайту (SameSite=Strict),
-# CORS не нужен вовсе, а порт API наружу не публикуется.
+# Благодаря этому CORS между интерфейсом и API не нужен вовсе, а порт API
+# наружу не публикуется. В Keycloak браузер ходит напрямую — у него свой CORS
+# (Web origins клиента).
 #
 # Файл — шаблон: при старте контейнера nginx подставляет ${TRUSTED_PROXY}
 # (см. /docker-entrypoint.d/20-envsubst-on-templates.sh в образе nginx).
+# Заголовки безопасности и CSP с адресом Keycloak — в security-headers.inc.
 
 # TLS завершается на внешнем прокси. Его адрес (или подсеть) — в TRUSTED_PROXY:
 # тогда настоящий адрес клиента берётся из X-Forwarded-For этого прокси и
@@ -19,14 +21,32 @@ server {
     server_tokens off;
     root /usr/share/nginx/html;
 
-    # Страница не встраивается во фреймы и грузит скрипты только со своего
-    # origin. 'unsafe-inline' у стилей нужен React-атрибутам style, data: —
-    # значку страницы. HSTS действует, когда страница открыта по HTTPS.
-    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
-    add_header X-Frame-Options DENY always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header Referrer-Policy no-referrer always;
-    add_header Strict-Transport-Security "max-age=31536000" always;
+    include /etc/nginx/conf.d/security-headers.inc;
+
+    # Сжатие: бандл и JSON API заметно меньше. Ответы меньше килобайта не
+    # сжимаются — выигрыша нет.
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml text/plain;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_vary on;
+
+    # index.html — всегда перепроверять: после обновления браузер должен сразу
+    # получить ссылки на новые бандлы, а не держать старую страницу из
+    # эвристического кэша. Сюда же приходит SPA-фолбэк из location /.
+    location = /index.html {
+        include /etc/nginx/conf.d/security-headers.inc;
+        add_header Cache-Control "no-cache" always;
+    }
+
+    # Бандлы с хэшем в имени не меняются никогда: кэш на год. Отсутствующий
+    # файл — честный 404, а не index.html: иначе старая страница получает
+    # HTML вместо модуля и показывает белый экран.
+    location /assets/ {
+        try_files $uri =404;
+        include /etc/nginx/conf.d/security-headers.inc;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
 
     location / {
         try_files $uri /index.html;
@@ -48,8 +68,11 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        # Пакетная проверка целей ждёт модель минутами.
+        # Пакетная проверка целей ждёт модель минутами. Интерфейс ждёт ответа
+        # чуть дольше (610 с), чтобы первым сработал этот таймаут, а не его.
+        # Внешний TLS-прокси перед портом 3000 должен ждать не меньше.
         proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
         client_max_body_size 2m;
     }
 }

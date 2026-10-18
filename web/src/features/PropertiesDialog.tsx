@@ -1,8 +1,9 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 
 import { api } from "../api/client";
 import type { NodeProps } from "../api/types";
 import { useCatalog } from "../state/catalog";
+import { registerDraft } from "../state/drafts";
 import { Spinner } from "../ui/common";
 import { Overlay, useDialogs } from "../ui/Dialogs";
 import { Select } from "../ui/Select";
@@ -29,6 +30,8 @@ interface Row {
   value: string;
   isNew: boolean;
   removed: boolean;
+  /** Тип и значение при открытии: сохраняются только изменённые свойства. */
+  initial: { type: PropType; value: string };
 }
 
 function guessType(value: unknown): PropType {
@@ -39,10 +42,32 @@ function guessType(value: unknown): PropType {
 }
 
 let rowId = 0;
-const toRow = (key: string, value: unknown, isNew = false): Row => ({
-  id: ++rowId, key, type: guessType(value), isNew, removed: false,
-  value: value === null || value === undefined ? "" : String(value),
-});
+function toRow(key: string, value: unknown, isNew = false): Row {
+  const type = guessType(value);
+  const text = value === null || value === undefined ? "" : String(value);
+  return { id: ++rowId, key, type, isNew, removed: false, value: text, initial: { type, value: text } };
+}
+
+/* Свойство, которого не касались, не отправляется: иначе снимок на момент
+   открытия затёр бы правки, сделанные за это время в другом окне, а строки
+   с пробелами по краям обрезались бы без ведома редактора. */
+const touched = (row: Row) =>
+  row.isNew || row.removed || row.type !== row.initial.type || row.value !== row.initial.value;
+
+/** Черновик редактора свойств на время повторного входа (state/drafts.ts): узел и строки. */
+export interface PropertiesDraft {
+  nodeId: string;
+  rows: Omit<Row, "id">[];
+}
+export const PROPERTIES_DRAFT = "properties";
+
+/** Открыть редактор свойств с черновиком после повторного входа (features/RestoredDialogs.tsx). */
+export async function reopenProperties(draft: PropertiesDraft,
+  openCustom: (render: (close: () => void) => ReactNode) => void) {
+  const node = await api.node(draft.nodeId);
+  const rows = draft.rows.map((r) => ({ ...r, id: ++rowId }));
+  openCustom((close) => <PropertiesDialog node={node} restored={rows} close={close} />);
+}
 
 export function usePropertiesEditor() {
   const { openCustom } = useDialogs();
@@ -54,11 +79,17 @@ export function usePropertiesEditor() {
   };
 }
 
-function PropertiesDialog({ node, close }: { node: NodeProps; close: () => void }) {
+function PropertiesDialog({ node, restored, close }: { node: NodeProps; restored?: Row[]; close: () => void }) {
   const toast = useToast();
   const { reload } = useCatalog();
-  const [rows, setRows] = useState<Row[]>(() =>
-    Object.entries(node).filter(([k]) => !SKIP.has(k)).map(([k, v]) => toRow(k, v)));
+  const [rows, setRows] = useState<Row[]>(() => restored
+    ?? Object.entries(node).filter(([k]) => !SKIP.has(k)).map(([k, v]) => toRow(k, v)));
+  // Сессия кончилась посреди правки — после повторного входа окно откроется с тем же вводом.
+  const latest = useRef(rows);
+  latest.current = rows;
+  useEffect(() => registerDraft(PROPERTIES_DRAFT, () => latest.current.some(touched)
+    ? { nodeId: node.nodeId, rows: latest.current.map(({ id: _id, ...rest }) => rest) } satisfies PropertiesDraft
+    : undefined), [node.nodeId]);
   const [busy, setBusy] = useState(false);
   const update = (id: number, patch: Partial<Row>) =>
     setRows((list) => list.map((r) => (r.id === id ? { ...r, ...patch } : r)));
@@ -68,7 +99,8 @@ function PropertiesDialog({ node, close }: { node: NodeProps; close: () => void 
     const properties: Record<string, unknown> = {};
     for (const row of rows) {
       const key = row.key.trim();
-      if (!key) continue;
+      if (!key || !touched(row)) continue;
+      if (row.isNew && row.removed) continue;
       if (row.removed) { properties[key] = null; continue; }
       const raw = row.value.trim();
       if (row.type === "number") {
@@ -81,6 +113,7 @@ function PropertiesDialog({ node, close }: { node: NodeProps; close: () => void 
         properties[key] = raw;
       }
     }
+    if (!Object.keys(properties).length) { close(); return; }
     setBusy(true);
     try {
       await api.patch(node.nodeId, properties);
@@ -95,8 +128,8 @@ function PropertiesDialog({ node, close }: { node: NodeProps; close: () => void 
 
   return (
     <Overlay onClose={close}>
-      <form className="modal wide" onSubmit={submit}>
-        <h3>Свойства узла :{node.labels.join(":")}</h3>
+      <form className="modal wide" onSubmit={submit} role="dialog" aria-modal="true" aria-labelledby="propsTitle">
+        <h3 id="propsTitle">Свойства узла :{node.labels.join(":")}</h3>
         <div className="content">
           <div className="dim" style={{ marginBottom: 12 }}>
             Здесь можно править любое свойство, включая ключевые. Ключ проверяется

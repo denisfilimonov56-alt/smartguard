@@ -55,6 +55,18 @@ RETURN elementId(r) AS nodeId, coalesce(r.ruleId, '(без ruleId)') AS label
 ORDER BY label
 """
 
+# Атрибуты у правила есть, но все в архиве: архивный атрибут не попадает в
+# словарь модели, и правило молча не срабатывает.
+Q_RULES_ONLY_ARCHIVED_TARGETS = f"""
+MATCH (r:Rule) WHERE {ACTIVE.format('r')}
+  AND (r)-[:APPLIES_TO]->(:CheckTarget)
+  AND NOT EXISTS {{
+    MATCH (r)-[:APPLIES_TO]->(t:CheckTarget) WHERE {ACTIVE.format('t')}
+  }}
+RETURN elementId(r) AS nodeId, coalesce(r.ruleId, '(без ruleId)') AS label
+ORDER BY label
+"""
+
 Q_MISSING_IDS = """
 MATCH (n)
 WHERE (n:Order       AND (n.orderId   IS NULL OR trim(toString(n.orderId))   = ''))
@@ -71,6 +83,19 @@ Q_CLAUSES_WITHOUT_RULES = f"""
 MATCH (o:Order)-[:CONTAINS]->(c:Clause)
 WHERE {ACTIVE.format('o')} AND {ACTIVE.format('c')}
   AND NOT (c)-[:DEFINES]->(:Rule)
+RETURN elementId(c) AS nodeId,
+       coalesce(o.number, '?') + ' ' + coalesce(c.code, '?') AS label
+ORDER BY label
+"""
+
+# Правила у пункта есть, но все в архиве — пункт ничего не проверяет.
+Q_CLAUSES_ONLY_ARCHIVED_RULES = f"""
+MATCH (o:Order)-[:CONTAINS]->(c:Clause)
+WHERE {ACTIVE.format('o')} AND {ACTIVE.format('c')}
+  AND (c)-[:DEFINES]->(:Rule)
+  AND NOT EXISTS {{
+    MATCH (c)-[:DEFINES]->(r:Rule) WHERE {ACTIVE.format('r')}
+  }}
 RETURN elementId(c) AS nodeId,
        coalesce(o.number, '?') + ' ' + coalesce(c.code, '?') AS label
 ORDER BY label
@@ -154,6 +179,7 @@ ORDER BY label
 Q_JOB_DUTIES = f"""
 MATCH (d:Department)-[:HAS_JOB_DESCRIPTION]->(j:JobDescription)
 WHERE {ACTIVE.format('d')} AND {ACTIVE.format('j')}
+  AND coalesce(j.dutiesStatus, 'ready') <> 'pending'
   AND (size(coalesce(j.duties, [])) = 0 OR coalesce(j.dutiesReviewed, false) = false)
 RETURN elementId(d) AS nodeId,
        coalesce(d.name, d.departmentId, '?') + ' — ' + coalesce(j.title, '?') AS label,
@@ -219,6 +245,7 @@ def collect() -> dict[str, Any]:
             items=[{"label": " ↔ ".join(t["name"] for t in group),
                     "nodeId": group[0]["nodeId"], "kind": "CheckTarget"}
                    for group in duplicates],
+            fix={"action": "merge_duplicate_targets", "label": "Свести двойников"},
         ))
 
     # Атрибуты без описания
@@ -243,6 +270,17 @@ def collect() -> dict[str, Any]:
             "Такое правило не участвует ни в одном запросе и никогда не сработает.",
             items=[{"label": r["label"], "nodeId": r["nodeId"], "kind": "Rule"}
                    for r in rules_without_target],
+        ))
+
+    rules_archived_targets = _run(Q_RULES_ONLY_ARCHIVED_TARGETS)
+    if rules_archived_targets:
+        issues.append(_issue(
+            "rules_with_archived_targets", WARNING,
+            "Правила, у которых все атрибуты в архиве",
+            "Архивный атрибут не попадает в словарь модели, поэтому такое правило "
+            "молча не срабатывает. Верните атрибут из архива или привяжите правило к другому.",
+            items=[{"label": r["label"], "nodeId": r["nodeId"], "kind": "Rule"}
+                   for r in rules_archived_targets],
         ))
 
     # Отсутствующие бизнес-ключи
@@ -280,6 +318,16 @@ def collect() -> dict[str, Any]:
             "Пункт хранит текст нормативки, но ничего не проверяет.",
             items=[{"label": c["label"], "nodeId": c["nodeId"], "kind": "Clause"}
                    for c in clauses_without_rules],
+        ))
+
+    clauses_archived_rules = _run(Q_CLAUSES_ONLY_ARCHIVED_RULES)
+    if clauses_archived_rules:
+        issues.append(_issue(
+            "clauses_with_archived_rules", WARNING,
+            "Пункты, у которых все правила в архиве",
+            "Пункт действует, но ни одно его правило не участвует в проверке.",
+            items=[{"label": c["label"], "nodeId": c["nodeId"], "kind": "Clause"}
+                   for c in clauses_archived_rules],
         ))
 
     orders_without_clauses = _run(Q_ORDERS_WITHOUT_CLAUSES)

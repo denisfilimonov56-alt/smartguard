@@ -1,0 +1,41 @@
+#!/bin/sh
+# Источник Keycloak для CSP connect-src: только origin (схема://хост[:порт])
+# из KEYCLOAK_URL. По CSP3 источник с путём без завершающего «/» совпадает
+# лишь с самим этим путём: при KEYCLOAK_URL=https://sso/auth браузер не пустил
+# бы запросы к https://sso/auth/realms/... — и войти не смог бы никто.
+#
+# Файл подключается точкой из /docker-entrypoint.sh до 20-envsubst-on-templates.sh,
+# поэтому экспортированная переменная попадает в шаблоны nginx. Хост
+# проверяется по белому списку символов: кавычка или «;» в KEYCLOAK_URL иначе
+# дописали бы в заголовок свои директивы.
+
+KEYCLOAK_CSP_SOURCE=""
+_kc_url="${KEYCLOAK_URL:-}"
+# Схема и хост регистронезависимы (в .env бывает и HTTPS://); в CSP
+# они пишутся в нижнем регистре. «_» в имени хоста допустим (внутренние DNS).
+case "$_kc_url" in
+  "") ;;
+  [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+    _kc_scheme="$(printf '%s' "${_kc_url%%://*}" | tr '[:upper:]' '[:lower:]')"
+    _kc_host="${_kc_url#*://}"
+    _kc_host="${_kc_host%%[/?#]*}"
+    _kc_host="${_kc_host##*@}"
+    # Сначала посимвольный белый список средствами case: grep построчный и
+    # пропустил бы «хост<перевод строки>; script-src *» по первой строке.
+    case "$_kc_host" in
+      ""|*[!]A-Za-z0-9._:[-]*) _kc_ok=0 ;;
+      *) _kc_ok=1 ;;
+    esac
+    if [ "$_kc_ok" = 1 ] && printf '%s\n' "$_kc_host" | grep -Eq '^([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?$'; then
+      _kc_host="$(printf '%s' "$_kc_host" | tr '[:upper:]' '[:lower:]')"
+      KEYCLOAK_CSP_SOURCE="$_kc_scheme://$_kc_host"
+    else
+      echo "16-keycloak-csp: в KEYCLOAK_URL недопустимый адрес, Keycloak в CSP не добавлен" >&2
+    fi
+    ;;
+  *)
+    echo "16-keycloak-csp: KEYCLOAK_URL должен начинаться с http:// или https://, Keycloak в CSP не добавлен" >&2
+    ;;
+esac
+export KEYCLOAK_CSP_SOURCE
+unset _kc_url _kc_scheme _kc_host _kc_ok

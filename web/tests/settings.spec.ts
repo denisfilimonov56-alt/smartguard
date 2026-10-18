@@ -1,4 +1,4 @@
-import { expect, go, modal, test, toast } from "./fixtures";
+import { check, choose, expect, go, modal, test, toast } from "./fixtures";
 
 /* Раздел «Настройки»: переключатели проверки и ключи доступа внешних систем. */
 
@@ -40,6 +40,47 @@ test("число сохраняется, а недопустимое значе�
   await expect(tab(app).getByRole("spinbutton", { name: "Лимит проверок" })).toHaveValue("120");
   await expect(tab(app).getByRole("switch", { name: "Режим обслуживания" })).toHaveAttribute("aria-checked", "true");
   await expect(tab(app).getByRole("switch", { name: "Кэш ответов" })).toHaveAttribute("aria-checked", "true");
+  await expect(tab(app).getByRole("spinbutton", { name: "Кэш должностных инструкций" })).toHaveValue("60");
+});
+
+test("предел запросов к модели и резерв действуют сразу и видны в мониторинге", async ({ app }) => {
+  await go(app, "Настройки");
+  const capacity = tab(app).getByRole("spinbutton", { name: "Предел запросов к модели" });
+  const reserve = tab(app).getByRole("spinbutton", { name: "Резерв для ручных проверок" });
+  await expect(capacity).toHaveValue("32");
+  await expect(reserve).toHaveValue("4");
+  await capacity.fill("8");
+  await capacity.press("Enter");
+  await expect(toast(app, "Настройка сохранена")).toBeVisible();
+  await reserve.fill("2");
+  await reserve.press("Enter");
+  await expect(reserve).toHaveValue("2");
+
+  await go(app, "Мониторинг");
+  const monitoring = app.locator("#tab-monitoring");
+  await expect(monitoring.getByText("0 из 8")).toBeVisible();
+  await expect(monitoring.getByText("2 слотов оставлено ручным проверкам")).toBeVisible();
+
+  // Резерв не больше предела минус один: сервер обрезает его при чтении.
+  await go(app, "Настройки");
+  await tab(app).getByRole("spinbutton", { name: "Предел запросов к модели" }).fill("2");
+  await tab(app).getByRole("spinbutton", { name: "Предел запросов к модели" }).press("Enter");
+  await expect(tab(app).getByRole("spinbutton", { name: "Резерв для ручных проверок" })).toHaveValue("1");
+  await expect(tab(app).getByRole("spinbutton", { name: "Предел запросов к модели" })).toHaveValue("2");
+});
+
+test("поле показывает значение, которое сохранил сервер, даже если оно не изменилось", async ({ app }) => {
+  await go(app, "Настройки");
+  const capacity = tab(app).getByRole("spinbutton", { name: "Предел запросов к модели" });
+  const reserve = tab(app).getByRole("spinbutton", { name: "Резерв для ручных проверок" });
+  await capacity.fill("2");
+  await capacity.press("Enter");
+  await expect(reserve).toHaveValue("1");
+  // Сервер обрезает резерв до предела минус один — прежние 1, хотя ввели 5.
+  await reserve.fill("5");
+  await reserve.press("Enter");
+  await expect(toast(app, "Сервер сохранил значение 1 вместо 5")).toBeVisible();
+  await expect(reserve).toHaveValue("1");
 });
 
 test("смена настройки делает проверку примеров устаревшей", async ({ app }) => {
@@ -52,6 +93,41 @@ test("смена настройки делает проверку примеро
   await expect(toast(app, "Настройка сохранена")).toBeVisible();
   await go(app, /Замечания/);
   await expect(app.locator("#examplesCheck").getByText("Каталог менялся после проверки")).toBeVisible();
+});
+
+test("кэш проверки очищается по отдельности и по подразделению", async ({ app }) => {
+  const goal = "Снизить долю просроченных заявок до 5% к 31.12.2025";
+  await check(app, goal, "UCT");
+  await expect(app.locator("#checkResult")).toBeVisible();
+  await check(app, goal + " в финансовом управлении", "FIN");
+  await expect(app.locator("#checkResult")).toBeVisible();
+
+  await go(app, "Настройки");
+  const caches = tab(app).locator("#caches");
+  const row = (id: string) => caches.locator(`[data-cache=${id}]`);
+  await expect(row("results")).toContainText("записей: 2");
+  await expect(row("jobDescriptions")).toContainText("записей: 2");
+  await expect(row("smart")).toContainText("записей: 2");
+
+  // Только одно подразделение: вторая запись остаётся.
+  await choose(tab(app).locator("#cacheDepartment"), "Только для: УЦТ");
+  await row("results").getByRole("button", { name: "Очистить: Ответы проверок" }).click();
+  await expect(toast(app, "Кэш «Ответы проверок» очищен для «УЦТ»: записей 1")).toBeVisible();
+  await expect(row("results")).toContainText("записей: 1");
+  await expect(row("jobDescriptions")).toContainText("записей: 2");
+
+  // Целиком.
+  await choose(tab(app).locator("#cacheDepartment"), "Очистить для всех подразделений");
+  await row("jobDescriptions").getByRole("button", { name: "Очистить: Должностные инструкции" }).click();
+  await expect(toast(app, "Кэш «Должностные инструкции» очищен: записей 2")).toBeVisible();
+  await expect(row("jobDescriptions")).toContainText("записей: 0");
+
+  // Оценки SMART удаляются и из графа — с подтверждением.
+  await row("smart").getByRole("button", { name: "Очистить: Оценки по SMART" }).click();
+  await modal(app).getByRole("button", { name: "Очистить" }).click();
+  await expect(toast(app, "Кэш «Оценки по SMART» очищен: записей 2, оценок в графе: 2")).toBeVisible();
+  await expect(row("smart")).toContainText("записей: 0");
+  await expect(row("results")).toContainText("записей: 1");
 });
 
 test("ключ показывается один раз и отзывается", async ({ app }) => {

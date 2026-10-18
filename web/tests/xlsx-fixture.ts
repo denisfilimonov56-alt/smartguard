@@ -19,11 +19,12 @@ const crc32 = (bytes: Buffer) => {
 };
 
 /** ZIP-архив со сжатием deflate — как у файлов, сохранённых Excel. */
-function zipDeflate(files: [string, string][]): Buffer {
+function zipDeflate(files: [string, string, number?][]): Buffer {
   const parts: Buffer[] = [];
   const central: Buffer[] = [];
   let offset = 0;
-  for (const [name, text] of files) {
+  // Третий элемент — размер, записанный в заголовок вместо настоящего (подделка «бомбы»).
+  for (const [name, text, declared] of files) {
     const nameBytes = Buffer.from(name);
     const data = Buffer.from(text);
     const packed = deflateRawSync(data);
@@ -31,12 +32,12 @@ function zipDeflate(files: [string, string][]): Buffer {
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0x0800, 6);
     local.writeUInt16LE(8, 8); local.writeUInt32LE(crc, 14); local.writeUInt32LE(packed.length, 18);
-    local.writeUInt32LE(data.length, 22); local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt32LE(declared ?? data.length, 22); local.writeUInt16LE(nameBytes.length, 26);
     parts.push(local, nameBytes, packed);
     const entry = Buffer.alloc(46);
     entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(0x0800, 8);
     entry.writeUInt16LE(8, 10); entry.writeUInt32LE(crc, 16); entry.writeUInt32LE(packed.length, 20);
-    entry.writeUInt32LE(data.length, 24); entry.writeUInt16LE(nameBytes.length, 28); entry.writeUInt32LE(offset, 42);
+    entry.writeUInt32LE(declared ?? data.length, 24); entry.writeUInt16LE(nameBytes.length, 28); entry.writeUInt32LE(offset, 42);
     central.push(entry, nameBytes);
     offset += 30 + nameBytes.length + packed.length;
   }
@@ -47,8 +48,13 @@ function zipDeflate(files: [string, string][]): Buffer {
   return Buffer.concat([...parts, dir, end]);
 }
 
-/** Книга с одним листом: текст — через sharedStrings, числа — как числа, пустые ячейки пропущены. */
-export function workbook(rows: (string | number | null)[][], sheetName = "Лист1"): Buffer {
+/** Книга с одним листом: текст — через sharedStrings, числа — как числа, true/false — логические ячейки
+    (так Excel хранит введённые TRUE / ИСТИНА и флажки), пустые ячейки пропущены.
+    merges — объединённые диапазоны вида "B2:B4": значение только в левой верхней ячейке, как у Excel.
+    bomb — столько байт пробелов дописать в лист, а в заголовке архива указать маленький размер:
+    сжимается в десятки килобайт, распаковывается в мегабайты. */
+export function workbook(rows: (string | number | boolean | null)[][], sheetName = "Лист1",
+  { merges = [], bomb = 0 }: { merges?: string[]; bomb?: number } = {}): Buffer {
   const shared: string[] = [];
   const index = (text: string) => {
     const i = shared.indexOf(text);
@@ -61,6 +67,7 @@ export function workbook(rows: (string | number | null)[][], sheetName = "Лис
     const cells = row.map((value, c) => {
       if (value === null || value === "") return "";
       const ref = `${col(c)}${r + 1}`;
+      if (typeof value === "boolean") return `<c r="${ref}" t="b"><v>${value ? 1 : 0}</v></c>`;
       return typeof value === "number" ? `<c r="${ref}"><v>${value}</v></c>` : `<c r="${ref}" t="s"><v>${index(value)}</v></c>`;
     }).join("");
     return `<row r="${r + 1}">${cells}</row>`;
@@ -84,6 +91,8 @@ export function workbook(rows: (string | number | null)[][], sheetName = "Лис
       + `<Relationship Id="rId2" Type="${rels}/sharedStrings" Target="sharedStrings.xml"/></Relationships>`],
     ["xl/sharedStrings.xml", `<sst xmlns="${main}" count="${shared.length}" uniqueCount="${shared.length}">`
       + shared.map((s) => `<si><t xml:space="preserve">${escape(s)}</t></si>`).join("") + "</sst>"],
-    ["xl/worksheets/sheet1.xml", `<worksheet xmlns="${main}"><sheetData>${sheetRows}</sheetData></worksheet>`],
+    ["xl/worksheets/sheet1.xml", `<worksheet xmlns="${main}"><sheetData>${sheetRows}</sheetData>`
+      + (merges.length ? `<mergeCells count="${merges.length}">${merges.map((m) => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>` : "")
+      + "</worksheet>" + (bomb ? " ".repeat(bomb) : ""), bomb ? 1024 : undefined],
   ]);
 }

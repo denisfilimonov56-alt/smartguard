@@ -4,7 +4,9 @@ import { createBackend } from "../mock/backend";
 
 /* Каждый тест получает свой фейковый API: перехватываются запросы к /api
    на том же origin — ровно туда интерфейс ходит и в настоящей сборке.
-   По умолчанию пользователь уже вошёл администратором; другая роль —
+   Фейковый Keycloak живёт там же, под /api/idp (mock/backend.ts).
+   По умолчанию пользователь уже вошёл администратором: токены фейка
+   кладутся в sessionStorage до загрузки страницы; другая роль —
    test.use({ role: "viewer" }), экран входа — test.use({ role: null }).
 
    В данных фейка: R-1.1 (проект) действует только в УЦТ и АГД;
@@ -15,25 +17,48 @@ export type MockRole = "admin" | "editor" | "viewer" | null;
 /** Запрос к API, а не к файлу сборки: /api/… на origin страницы. */
 export const isApi = (url: URL) => url.pathname.startsWith("/api/");
 
-/** Подключить к странице фейковый API; логин совпадает с названием роли. */
-export async function mockApi(page: Page, role: MockRole) {
-  const backend = createBackend({ user: role ?? undefined });
+/** Токены фейкового Keycloak для логина — такие же выдаёт его /api/idp/token. */
+export const mockTokens = (login: string) => ({
+  accessToken: "mock:" + login, refreshToken: "mock-refresh:" + login, idToken: "mock-id:" + login,
+  expiresAt: Date.now() + 3600_000,
+});
+
+/** Заголовки запроса к фейковому API в обход интерфейса (page.evaluate + fetch): как у настоящего,
+    без токена запрос из браузера получает 401. */
+export const apiHeaders = (login = "admin") => ({
+  Authorization: "Bearer " + mockTokens(login).accessToken,
+  "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/json",
+});
+
+/** Подключить к странице фейковый API; логин совпадает с названием роли.
+    С ролью пользователь уже вошёл: токены лежат в sessionStorage при каждой
+    загрузке страницы (после выхода и возврата он войдёт снова сам).
+    firstLogin — обучение по интерфейсу ещё не пройдено: оно начнётся само. */
+export async function mockApi(page: Page, role: MockRole, firstLogin = false) {
+  const backend = createBackend({ user: role ?? undefined, firstLogin });
+  if (role) {
+    await page.addInitScript((tokens) => sessionStorage.setItem("gc.oidc", JSON.stringify(tokens)), mockTokens(role));
+  }
   await page.route(isApi, async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const raw = request.postData();
+    const json = (request.headers()["content-type"] ?? "").includes("json");
     const reply = backend.handle(request.method(), url.pathname.replace(/^\/api/, "") + url.search,
-      raw ? JSON.parse(raw) : undefined);
-    if (reply.status === 204) await route.fulfill({ status: 204 });
-    else await route.fulfill({ status: reply.status, contentType: "application/json", body: JSON.stringify(reply.body) });
+      raw ? (json ? JSON.parse(raw) : raw) : undefined, request.headers());
+    if (reply.status === 204 || reply.status === 302) await route.fulfill({ status: reply.status, headers: reply.headers });
+    else if (reply.contentType) await route.fulfill({ status: reply.status, contentType: reply.contentType, body: String(reply.body) });
+    else await route.fulfill({ status: reply.status, contentType: "application/json", headers: reply.headers,
+      body: JSON.stringify(reply.body) });
   });
   return backend;
 }
 
-export const test = base.extend<{ app: Page; role: MockRole }>({
+export const test = base.extend<{ app: Page; role: MockRole; firstLogin: boolean }>({
   role: ["admin", { option: true }],
-  app: async ({ page, role }, use) => {
-    await mockApi(page, role);
+  firstLogin: [false, { option: true }],
+  app: async ({ page, role, firstLogin }, use) => {
+    await mockApi(page, role, firstLogin);
     await page.goto("/");
     if (role) await expect(page.getByText("API на связи")).toBeVisible();
     else await expect(page.getByRole("button", { name: "Войти" })).toBeVisible();
@@ -49,6 +74,9 @@ export const TRAINING = "Обучение само по себе";
 
 /** Перейти в раздел через боковую панель. */
 export const go = (page: Page, section: string | RegExp) => page.getByRole("tab", { name: section }).click();
+
+/** Карточка текущего шага обучения по интерфейсу (features/tour). */
+export const tour = (page: Page) => page.locator(".tour-card");
 
 /** Диалоги, формы и окно ячейки живут в одном корне. */
 export const modal = (page: Page) => page.locator("#modalRoot");
@@ -111,10 +139,14 @@ export async function openRule(page: Page, rule: string) {
 }
 
 /** Проверить цель на главном экране; возвращает карточку результата. */
-export async function check(page: Page, goal: string, department: string | null = null) {
+export async function check(page: Page, goal: string, department: string | null = null, student = false) {
   await go(page, "Проверка цели");
+  // После ответа ввод свёрнут в строку — раскрываем его кнопкой «Изменить».
+  const summary = page.locator("#goalSummary");
+  if (await summary.count()) await summary.getByRole("button", { name: "Изменить" }).click();
   await page.getByLabel("Формулировка цели").fill(goal);
   await choose(page.locator("#departmentInput"), { value: department ?? "" });
+  await page.locator("#studentInput").setChecked(student);
   await page.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
   return page.locator("#checkResult");
 }

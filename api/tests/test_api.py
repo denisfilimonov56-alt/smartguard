@@ -8,6 +8,8 @@ import catalog
 import diagnostics
 import graph
 import main
+import metrics
+import monitoring
 
 HEALTHY = {
     "issues": [], "counts": {"error": 0, "warning": 0, "info": 0},
@@ -33,6 +35,7 @@ def client(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
     monkeypatch.setattr(diagnostics, "collect", lambda: HEALTHY)
+    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
     main.app.dependency_overrides[auth.current_user] = lambda: auth.Principal("tester", "admin")
     with TestClient(main.app, headers={"X-Requested-With": "XMLHttpRequest"}) as c:
         yield c
@@ -43,16 +46,23 @@ def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_health_and_ready_do_not_need_the_route_thread_pool():
+    """Пока все потоки синхронных маршрутов ждут модель, /health и /ready отвечают (H3)."""
+    import inspect
+    assert inspect.iscoroutinefunction(main.health) and inspect.iscoroutinefunction(main.ready)
+
+
 def test_ready_ok(client):
     body = client.get("/ready").json()
     assert body["status"] == "ready"
-    assert body["problems"] == []
+    assert body["problems"] == [] and body["llm"] is True
 
 
 def test_ready_503_on_errors(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
     monkeypatch.setattr(diagnostics, "collect", lambda: BROKEN)
+    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
     with TestClient(main.app) as c:
         response = c.get("/ready")
     assert response.status_code == 503
@@ -62,10 +72,168 @@ def test_ready_503_on_errors(monkeypatch):
 def test_ready_503_when_neo4j_down(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: False)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
+    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
     with TestClient(main.app) as c:
         response = c.get("/ready")
     assert response.status_code == 503
     assert response.json()["neo4j"] is False
+
+
+def test_ready_503_when_llm_down(client, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: seen.setdefault("timeout", timeout) and False)
+    response = client.get("/ready")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["llm"] is False and body["neo4j"] is True
+    assert any("vLLM" in p for p in body["problems"])
+    assert seen["timeout"] == 2
+
+
+def test_vllm_alive_asks_health_with_timeout(monkeypatch):
+    seen = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout):
+        seen.update(url=url, timeout=timeout)
+        return Response()
+
+    monkeypatch.setenv("VLLM_URL", "http://vllm:8000/v1")
+    monkeypatch.setattr(monitoring.urllib.request, "urlopen", urlopen)
+    assert monitoring.vllm_alive(2) is True
+    assert seen == {"url": "http://vllm:8000/health", "timeout": 2}
+
+    def down(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(monitoring.urllib.request, "urlopen", down)
+    assert monitoring.vllm_alive(2) is False
+
+
+def test_queue_timeout_is_503_with_retry_after(client, monkeypatch):
+    """Очередь к модели не подошла — 503 с Retry-After через настоящую check_goal (E5)."""
+    import agent
+    monkeypatch.setattr(agent, "get_check_targets", lambda: [{"name": "срок", "description": "есть срок"}])
+    monkeypatch.setattr(agent.settings, "_read", lambda: {"smartCheck": False})
+    monkeypatch.setattr(metrics.gate, "acquire", lambda bulk, timeout=None: (_ for _ in ()).throw(
+        metrics.QueueTimeout(120)))
+    response = client.post("/check-goal", json={"goal": "цель"})
+    assert response.status_code == 503 and response.headers["Retry-After"] == "30"
+    assert "перегружена" in response.json()["detail"]
+
+
+def test_concurrent_batches_are_limited(client, monkeypatch):
+    """Сверх BULK_MAX_REQUESTS одновременных пакетов — сразу 503, поток API не занимается (E2)."""
+    import threading
+    monkeypatch.setattr(main, "_bulk_requests", threading.BoundedSemaphore(1))
+    assert main._bulk_requests.acquire(blocking=False)  # один пакет уже идёт
+    try:
+        response = client.post("/check-goals", json=[{"goal": "цель", "department_id": "UCT"}])
+        assert response.status_code == 503 and response.headers["Retry-After"] == "30"
+    finally:
+        main._bulk_requests.release()
+    monkeypatch.setattr(main, "check_goals", lambda items: {"results": [], "summary": {}})
+    assert client.post("/check-goals", json=[{"goal": "цель", "department_id": "UCT"}]).status_code == 200
+    assert main._bulk_requests.acquire(blocking=False), "место освобождается и после ответа"
+    main._bulk_requests.release()
+
+
+def test_thread_limit_follows_model_capacity_setting(monkeypatch):
+    """Правка llmMaxConcurrency в «Настройках» поднимает предел потоков без перезапуска (E2)."""
+    import anyio.to_thread
+
+    import settings
+    monkeypatch.setattr(graph, "verify_connectivity", lambda: False)
+    monkeypatch.delenv("API_THREADS", raising=False)
+    capacity = {"value": 32}
+    monkeypatch.setattr(settings, "_read", lambda: {"llmMaxConcurrency": capacity["value"]})
+
+    async def tokens():
+        return anyio.to_thread.current_default_thread_limiter().total_tokens
+
+    with TestClient(main.app) as c:
+        before = c.portal.call(tokens)
+        capacity["value"] = 200
+        settings.forget()
+        metrics.lookups.clear()
+        metrics.gate.reconfigure()  # так делает settings.update
+        assert c.portal.call(tokens) == max(before, main._thread_limit()) > before
+
+
+def test_check_resets_actor_after_request(client, monkeypatch):
+    """Поток пула переиспользуется: логин прошлой проверки не достаётся следующему запросу (L29)."""
+    seen = {}
+    monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None:
+                        seen.setdefault("actor", metrics.actor()) and {"status": "ALLOWED"})
+    client.post("/check-goal", json={"goal": "цель"})
+    assert seen["actor"] == "tester"
+    assert metrics.actor() is None
+
+
+def test_thread_limit_counts_model_capacity(monkeypatch):
+    monkeypatch.delenv("API_THREADS", raising=False)
+    assert main._thread_limit() == 40 + 2 * 32 + main.BULK_MAX_WORKERS + main.BULK_MAX_REQUESTS
+    monkeypatch.setenv("API_THREADS", "300")
+    assert main._thread_limit() == 300
+    monkeypatch.setenv("API_THREADS", "5")
+    assert main._thread_limit() == 40, "меньше стандартного пула не опускаемся"
+
+
+def test_lifespan_raises_thread_limit_and_recovers_pending_duties(monkeypatch):
+    import anyio.to_thread
+
+    import routes
+    calls = []
+    monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
+    monkeypatch.setattr(graph, "close_driver", lambda: None)
+    monkeypatch.setattr(routes, "recover_duties_jobs", lambda: calls.append("recover") or 0)
+    monkeypatch.setattr(main, "_thread_limit", lambda: 123)
+
+    async def tokens():
+        return anyio.to_thread.current_default_thread_limiter().total_tokens
+
+    with TestClient(main.app) as c:
+        assert c.portal.call(tokens) == 123
+    assert calls == ["recover"]
+
+
+def test_advice_goal_and_reason_stay_out_of_audit(client, monkeypatch, caplog):
+    """В журнал аудита из запроса советчику идут атрибут, ожидание и подразделение (L17)."""
+    import advisor
+    from fastapi import Request
+
+    def signed_in(request: Request):
+        # Как настоящий auth.current_user: тело пишется в журнал только у вошедших.
+        request.state.user = auth.Principal("tester", "editor")
+        return request.state.user
+
+    monkeypatch.setattr(advisor, "advise", lambda *a, **k: {"ok": True})
+    monkeypatch.setitem(main.app.dependency_overrides, auth.current_user, signed_in)
+    with caplog.at_level("INFO", logger="audit"):
+        client.post("/catalog/advice", json={
+            "goal": "секретная цель", "attribute": "срок", "expected": True,
+            "reason": "личное обоснование", "department_id": "UCT"})
+    logged = " ".join(r.getMessage() for r in caplog.records if r.name == "audit")
+    assert "/catalog/advice" in logged
+    assert "секретная цель" not in logged and "личное обоснование" not in logged
+    assert "срок" in logged and "UCT" in logged
+
+
+def test_anonymous_request_body_stays_out_of_audit(client, caplog):
+    """Без входа тело и длинная строка запроса в журнал не идут: его нельзя раздуть анонимно."""
+    with caplog.at_level("INFO", logger="audit"):
+        client.post("/catalog/orders?q=" + "x" * 6000, json={"number": "y" * 5000})
+    logged = " ".join(r.getMessage() for r in caplog.records if r.name == "audit")
+    assert "yyyy" not in logged
+    assert len(logged) < 1000
 
 
 def test_diagnostics_endpoint(client):
@@ -119,6 +287,23 @@ def test_rule_type_is_validated_by_schema(client):
     assert response.status_code == 422
 
 
+def test_create_rule_passes_students_only(client, monkeypatch):
+    seen = {}
+
+    def create(clause_node_id, rule_type, description, check_instruction="", targets=None,
+               rule_id=None, students_only=False, only=None):
+        seen["students_only"] = students_only
+        return {"nodeId": "4:db:9"}
+
+    monkeypatch.setattr(catalog, "create_rule", create)
+    assert client.post("/catalog/rules", json={
+        "clauseNodeId": "4:db:2", "type": "REQUIREMENT", "description": "x"}).status_code == 201
+    assert seen["students_only"] is False, "по умолчанию правило для всех"
+    client.post("/catalog/rules", json={
+        "clauseNodeId": "4:db:2", "type": "REQUIREMENT", "description": "x", "studentsOnly": True})
+    assert seen["students_only"] is True
+
+
 def test_status_value_is_validated_by_schema(client):
     response = client.post("/catalog/nodes/4:db:1/status", json={"status": "deleted"})
     assert response.status_code == 422
@@ -132,7 +317,7 @@ def test_repair_identifiers(client, monkeypatch):
 
 
 def test_check_goal_passes_through(client, monkeypatch):
-    monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None: {
+    monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None: {
         "goal": goal, "status": "ALLOWED", "allowed": True, "seen_department": department_id})
     response = client.post("/check-goal", json={"goal": "цель"})
     assert response.status_code == 200
@@ -142,13 +327,28 @@ def test_check_goal_passes_through(client, monkeypatch):
 
 def test_check_goal_passes_department(client, monkeypatch):
     monkeypatch.setattr(main, "check_goal",
-                        lambda goal, department_id=None: {"seen_department": department_id})
+                        lambda goal, department_id=None, is_student=None: {"seen_department": department_id})
     response = client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"})
     assert response.json()["seen_department"] == "UCT"
 
 
 def test_check_goal_requires_goal_field(client):
     assert client.post("/check-goal", json={}).status_code == 422
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"goal": "цель"}, None),
+    ({"goal": "цель", "is_student": True}, True),
+    ({"goal": "цель", "is_student": False}, False),
+])
+def test_check_goal_passes_student_flag(client, monkeypatch, payload, expected):
+    monkeypatch.setattr(main, "check_goal",
+                        lambda goal, department_id=None, is_student=None: {"seen_student": is_student})
+    assert client.post("/check-goal", json=payload).json()["seen_student"] is expected
+
+
+def test_check_goal_rejects_non_boolean_student_flag(client):
+    assert client.post("/check-goal", json={"goal": "цель", "is_student": "студент"}).status_code == 422
 
 
 # --------------------------- пакетная проверка ------------------------------
@@ -169,12 +369,39 @@ def test_check_goals_accepts_array(client, monkeypatch):
     assert response.json()["summary"]["total"] == 2
 
 
+def test_check_goals_accepts_numeric_ids_and_returns_them_as_strings(client, monkeypatch):
+    """Кадровая система шлёт числовые id и department_id — пакет не отклоняется, id в ответе строкой (L90)."""
+    seen = {}
+
+    def check(items):
+        seen["items"] = items
+        return {"results": [{"id": i["id"], "goal": i["goal"], "status": "ALLOWED", "allowed": True}
+                            for i in items],
+                "summary": {"total": len(items), "allowed": len(items), "violations": 0, "manual_review": 0}}
+
+    monkeypatch.setattr(main, "check_goals", check)
+    response = client.post("/check-goals", json=[
+        {"goal": "первая", "id": 101, "department_id": 7},
+        {"goal": "вторая", "id": "g-2", "department_id": "AGD"}])
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()["results"]] == ["101", "g-2"]
+    assert [i["department_id"] for i in seen["items"]] == ["7", "AGD"]
+
+
 def test_check_goals_id_is_optional(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "check_goals",
                         lambda items: seen.setdefault("items", items) or {"results": [], "summary": {}})
     client.post("/check-goals", json=[{"goal": "без id", "department_id": "UCT"}])
-    assert seen["items"] == [{"goal": "без id", "department_id": "UCT", "id": None}]
+    assert seen["items"] == [{"goal": "без id", "department_id": "UCT", "is_student": None, "id": None}]
+
+
+def test_check_goals_passes_student_flag(client, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main, "check_goals",
+                        lambda items: seen.setdefault("items", items) or {"results": [], "summary": {}})
+    client.post("/check-goals", json=[{"goal": "студент", "department_id": "UCT", "is_student": True}])
+    assert seen["items"][0]["is_student"] is True
 
 
 @pytest.mark.parametrize("item", [{"goal": "цель"}, {"goal": "цель", "department_id": ""}])
@@ -249,6 +476,18 @@ def test_rule_scope_passes_through(client, monkeypatch):
     assert seen == {"node_id": "4:db:3", "only": ["UCT"]}
 
 
+def test_rule_audience_endpoint(client, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(catalog, "set_rule_audience",
+                        lambda node_id, students_only: seen.update(node_id=node_id, value=students_only)
+                        or {"studentsOnly": students_only})
+    response = client.put("/catalog/rules/4:db:3/audience", json={"studentsOnly": True})
+    assert response.status_code == 200
+    assert response.json() == {"studentsOnly": True}
+    assert seen == {"node_id": "4:db:3", "value": True}
+    assert client.put("/catalog/rules/4:db:3/audience", json={}).status_code == 422
+
+
 # ------------------------------ мониторинг ----------------------------------
 
 
@@ -271,17 +510,41 @@ def test_monitoring_stats_passes_period_and_step(client, monkeypatch):
     assert response.status_code == 200 and response.json()["buckets"] == []
     query, params = seen["calls"][0]
     assert "datetime.truncate('hour'" in query
-    assert params == {"start": "2026-10-01T00:00:00Z", "end": "2026-10-02T00:00:00Z",
+    assert params == {"start": "2026-10-01T00:00:00+00:00", "end": "2026-10-02T00:00:00+00:00",
                       "status": None, "mode": "bulk", "timezone": "Europe/Moscow"}
+    assert "percentileCont(CASE WHEN r.cached THEN null ELSE r.ms END" in query, \
+        "p95 считается без ответов из кэша (L38)"
 
 
 @pytest.mark.parametrize("params", [
     {"step": "second"}, {"timezone": "x'}) DETACH DELETE n //"}, {"status": "OK"}, {"mode": "all"},
+    {"timezone": "Mars/Olympus"}, {"timezone": "+25:00"}, {"start": "вчера"}, {"end": "2026-13-45"},
 ])
 def test_monitoring_stats_rejects_bad_parameters(client, params):
     response = client.get("/monitoring/stats", params={
         "start": "2026-10-01T00:00:00Z", "end": "2026-10-02T00:00:00Z", **params})
     assert response.status_code == 422
+
+
+def test_monitoring_accepts_offset_timezone(client, monkeypatch):
+    import history
+    monkeypatch.setattr(history, "_run", lambda q, **p: [])
+    response = client.get("/monitoring/stats", params={
+        "start": "2026-10-01", "end": "2026-10-02T00:00:00+03:00", "timezone": "+03:00"})
+    assert response.status_code == 200
+
+
+def test_monitoring_db_failure_does_not_leak_driver_text(client, monkeypatch):
+    import history
+
+    def down(query, **params):
+        raise RuntimeError("bolt://10.0.0.5:7687 refused, secret details")
+
+    monkeypatch.setattr(history, "_run", down)
+    response = client.get("/monitoring/history", params={
+        "start": "2026-10-01T00:00:00Z", "end": "2026-10-02T00:00:00Z"})
+    assert response.status_code == 503
+    assert "10.0.0.5" not in response.json()["detail"]
 
 
 def test_monitoring_is_admin_only(client):
@@ -316,25 +579,38 @@ def test_graph_is_readable_by_viewer_and_catalog_change_drops_cache(client, monk
 
 # ------------------------- обязанности из инструкции -------------------------
 
-JOB_NODE = {"nodeId": "4:db:20", "labels": ["JobDescription"], "title": "Аналитик", "text": "текст"}
+JOB_NODE = {"nodeId": "4:db:20", "labels": ["JobDescription"], "title": "Аналитик", "text": "текст",
+            "dutiesStatus": "pending", "dutiesError": None}
 
 
-def test_uploading_job_description_extracts_duties(client, monkeypatch):
+@pytest.fixture
+def duties_now(monkeypatch):
+    """Фоновая выписка обязанностей выполняется сразу, в потоке запроса; итог — в finished."""
+    import routes
+
+    class Inline:
+        def submit(self, fn, *args):
+            fn(*args)
+
+    finished = []
+    monkeypatch.setattr(routes, "_duties_pool", Inline())
+    monkeypatch.setattr(catalog, "finish_duties", lambda node_id, text, duties=None, error=None:
+                        finished.append({"duties": duties, "error": error}) or True)
+    return finished
+
+
+def test_uploading_job_description_extracts_duties_in_background(client, monkeypatch, duties_now):
     import agent
-    saved = {}
     monkeypatch.setattr(catalog, "create_job_description", lambda *a: dict(JOB_NODE))
     monkeypatch.setattr(agent, "extract_duties", lambda text: ["Готовит отчёт"])
-    monkeypatch.setattr(catalog, "set_job_duties",
-                        lambda node_id, duties, reviewed: saved.update(duties=duties, reviewed=reviewed) or
-                        {**JOB_NODE, "duties": duties})
     response = client.post("/catalog/job-descriptions",
                            json={"departmentNodeId": "4:db:9", "title": "Аналитик", "text": "текст"})
-    assert response.status_code == 201
-    assert response.json()["duties"] == ["Готовит отчёт"] and response.json()["dutiesError"] is None
-    assert saved == {"duties": ["Готовит отчёт"], "reviewed": False}, "список модели ждёт проверки редактором"
+    assert response.status_code == 202
+    assert response.json()["dutiesStatus"] == "pending" and response.json()["dutiesError"] is None
+    assert duties_now == [{"duties": ["Готовит отчёт"], "error": None}]
 
 
-def test_model_failure_does_not_lose_uploaded_job_description(client, monkeypatch):
+def test_model_failure_does_not_lose_uploaded_job_description(client, monkeypatch, duties_now):
     import agent
 
     def boom(text):
@@ -344,19 +620,21 @@ def test_model_failure_does_not_lose_uploaded_job_description(client, monkeypatc
     monkeypatch.setattr(agent, "extract_duties", boom)
     response = client.post("/catalog/job-descriptions",
                            json={"departmentNodeId": "4:db:9", "title": "Аналитик", "text": "текст"})
-    assert response.status_code == 201 and "модель недоступна" in response.json()["dutiesError"]
+    assert response.status_code == 202
+    assert duties_now[0]["duties"] is None and "модель недоступна" in duties_now[0]["error"]
 
 
-def test_job_description_edit_reextracts_only_when_text_changed(client, monkeypatch):
+def test_job_description_edit_reextracts_only_when_text_changed(client, monkeypatch, duties_now):
     import agent
     calls = []
     monkeypatch.setattr(agent, "extract_duties", lambda text: calls.append(text) or [])
-    monkeypatch.setattr(catalog, "set_job_duties", lambda node_id, duties, reviewed: dict(JOB_NODE))
     monkeypatch.setattr(catalog, "update_job_description", lambda n, title, text: (dict(JOB_NODE), False))
-    client.put("/catalog/job-descriptions/4:db:20", json={"title": "Аналитик", "text": "текст"})
+    assert client.put("/catalog/job-descriptions/4:db:20",
+                      json={"title": "Аналитик", "text": "текст"}).status_code == 200
     assert calls == []
     monkeypatch.setattr(catalog, "update_job_description", lambda n, title, text: (dict(JOB_NODE), True))
-    client.put("/catalog/job-descriptions/4:db:20", json={"title": "Аналитик", "text": "новый"})
+    assert client.put("/catalog/job-descriptions/4:db:20",
+                      json={"title": "Аналитик", "text": "новый"}).status_code == 202
     assert calls == ["текст"]
 
 

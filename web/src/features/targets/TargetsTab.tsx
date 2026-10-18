@@ -1,6 +1,6 @@
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { archivedClass, ArchivedBadge, Chip } from "../../ui/common";
+import { ArchivedBadge, archivedClass, Chip, Empty, PageHead } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
 import { useActions } from "../actions";
 
@@ -14,13 +14,10 @@ export function TargetsTab() {
 
   return (
     <section id="tab-targets">
-      <div className="page-head">
-        <div>
-          <h1>Атрибуты</h1>
-          <div className="sub">То, что модель ищет в формулировке цели. Атрибут без описания она не распознаёт — правило на нём срабатывает всегда.</div>
-        </div>
+      <PageHead title="Атрибуты"
+        sub="То, что модель ищет в формулировке цели. Атрибут без описания она не распознаёт — правило на нём срабатывает всегда.">
         {canEdit && <button className="btn primary" onClick={actions.addTarget}>+ Атрибут</button>}
-      </div>
+      </PageHead>
       <div className="toolbar">
         <label className="check">
           <input type="checkbox" checked={showArchivedTargets}
@@ -55,7 +52,10 @@ export function TargetsTab() {
             ))}
           </tbody>
         </table></div>
-      ) : <div className="empty">Атрибутов нет. Без них правила не срабатывают.</div>}
+      ) : <Empty icon="list" title="Атрибутов пока нет"
+        action={canEdit && <button className="btn primary" onClick={actions.addTarget}>+ Атрибут</button>}>
+        Без атрибутов правила не срабатывают: атрибут — это то, что модель ищет в формулировке цели.
+      </Empty>}
     </section>
   );
 }

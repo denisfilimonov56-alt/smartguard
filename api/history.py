@@ -14,23 +14,31 @@ import queue
 import re
 import threading
 import time
+from collections import deque
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import graph
 import metrics
 import settings
-from graph import get_driver
 
 log = logging.getLogger(__name__)
 
 FLUSH_SECONDS = 2.0
 WRITE_BATCH = 2000
 PRUNE_EVERY_SECONDS = 6 * 3600
+# Записи, которые не удалось записать (Neo4j недоступен), ждут повтора здесь;
+# сверх предела старые теряются. Повтор — с растущей паузой до RETRY_MAX_SECONDS.
+RETRY_MAX_ROWS = 50_000
+RETRY_MAX_SECONDS = 60.0
 
 STEPS = ("minute", "hour", "day", "week", "month")
 STATUSES = ("ALLOWED", "VIOLATIONS_FOUND", "NEEDS_MANUAL_REVIEW")
 MODES = ("single", "bulk")
 MAX_BUCKETS = 2000
-_TIMEZONE = re.compile(r"^[A-Za-z_]+(/[A-Za-z0-9_+\-]+){0,2}$|^[+-]\d{2}:\d{2}$")
+_TIMEZONE = re.compile(r"^[A-Za-z_]+(/[A-Za-z0-9_+\-]+){0,2}$")
+_OFFSET = re.compile(r"^[+-](0\d|1[0-4]):[0-5]\d$")
 
 Q_WRITE = """
 UNWIND $rows AS row
@@ -53,7 +61,7 @@ FILTER = """r.at >= datetime($start) AND r.at < datetime($end)
 AGGREGATES = """count(r) AS total,
        round(avg(r.ms)) AS avg_ms,
        round(avg(CASE WHEN r.cached THEN null ELSE r.ms END)) AS avg_computed_ms,
-       round(percentileCont(r.ms, 0.95)) AS p95_ms,
+       round(percentileCont(CASE WHEN r.cached THEN null ELSE r.ms END, 0.95)) AS p95_ms,
        max(r.ms) AS max_ms,
        round(avg(CASE WHEN r.cached THEN null ELSE r.queueMs END)) AS avg_queue_ms,
        round(avg(CASE WHEN r.cached THEN null ELSE r.llmMs END)) AS avg_llm_ms,
@@ -105,7 +113,7 @@ class BadRequest(ValueError):
 
 
 def _run(query: str, **params) -> list[dict[str, Any]]:
-    with get_driver().session() as session:
+    with graph.get_driver().session() as session:
         return [dict(record) for record in session.run(query, **params)]
 
 
@@ -115,6 +123,10 @@ def _run(query: str, **params) -> list[dict[str, Any]]:
 
 _pending: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=200_000)
 _dropped = 0
+_retry: "deque[dict[str, Any]]" = deque()
+_retry_lock = threading.Lock()
+_backoff = 0.0
+_retry_at = 0.0
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
 
@@ -130,25 +142,54 @@ def _enqueue(record: dict[str, Any]) -> None:
         _dropped += 1
 
 
-def flush() -> int:
-    """Пишет накопленное в Neo4j. Возвращает число записей."""
+def _take() -> list[dict[str, Any]]:
+    """Следующая пачка: сначала то, что не записалось в прошлый раз."""
+    rows: list[dict[str, Any]] = []
+    with _retry_lock:
+        while _retry and len(rows) < WRITE_BATCH:
+            rows.append(_retry.popleft())
+    while len(rows) < WRITE_BATCH:
+        try:
+            rows.append(_pending.get_nowait())
+        except queue.Empty:
+            break
+    return rows
+
+
+def _put_back(rows: list[dict[str, Any]]) -> None:
+    """Возвращает пачку в начало буфера повтора; сверх RETRY_MAX_ROWS теряются самые старые."""
     global _dropped
+    with _retry_lock:
+        _retry.extendleft(reversed(rows))
+        while len(_retry) > RETRY_MAX_ROWS:
+            _retry.popleft()
+            _dropped += 1
+
+
+def flush(force: bool = False) -> int:
+    """Пишет накопленное в Neo4j. Возвращает число записей.
+
+    При сбое пачка возвращается в буфер повтора, а следующая попытка — после
+    паузы, которая растёт вдвое до RETRY_MAX_SECONDS (force — не ждать паузы).
+    """
+    global _backoff, _retry_at
+    if not force and time.monotonic() < _retry_at:
+        return 0
     written = 0
     while True:
-        rows: list[dict[str, Any]] = []
-        while len(rows) < WRITE_BATCH:
-            try:
-                rows.append(_pending.get_nowait())
-            except queue.Empty:
-                break
+        rows = _take()
         if not rows:
             return written
         try:
             _run(Q_WRITE, rows=rows)
             written += len(rows)
+            _backoff = _retry_at = 0.0
         except Exception as exc:  # noqa: BLE001 — история не должна ронять сервис
-            _dropped += len(rows)
-            log.warning("История проверок не записана (%d записей): %s", len(rows), exc)
+            _put_back(rows)
+            _backoff = min(RETRY_MAX_SECONDS, max(FLUSH_SECONDS, _backoff * 2))
+            _retry_at = time.monotonic() + _backoff
+            log.warning("История проверок не записана (%d записей), повтор через %.0f с: %s",
+                        len(rows), _backoff, exc)
             return written
 
 
@@ -170,7 +211,7 @@ def _loop() -> None:
         if time.monotonic() >= next_prune:
             next_prune = time.monotonic() + PRUNE_EVERY_SECONDS
             prune()
-    flush()
+    flush(force=True)
 
 
 def start() -> None:
@@ -184,7 +225,9 @@ def start() -> None:
 
 
 def stop() -> None:
+    """Останавливает запись: отписывается от проверок и дописывает накопленное."""
     global _thread
+    metrics.unsubscribe(_enqueue)
     if _thread is not None:
         _stop.set()
         _thread.join(timeout=10)
@@ -192,7 +235,7 @@ def stop() -> None:
 
 
 def state() -> dict[str, Any]:
-    return {"pending": _pending.qsize(), "dropped": _dropped, "retention_days": settings.number("historyRetentionDays"),
+    return {"pending": _pending.qsize() + len(_retry), "dropped": _dropped, "retention_days": settings.number("historyRetentionDays"),
             "enabled": settings.flag("historyEnabled")}
 
 
@@ -201,7 +244,40 @@ def state() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _moment(value: str, name: str) -> str:
+    """Граница периода в ISO 8601; неверная — BadRequest, а не ошибка базы."""
+    text = (value or "").strip()
+    try:
+        # «Z» Python до 3.11 не понимает.
+        moment = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
+    except ValueError:
+        raise BadRequest(f"Недопустимая дата {name}={value!r}: ожидалась дата ISO 8601, "
+                         "например 2026-10-01T00:00:00Z") from None
+    return moment.isoformat()
+
+
+def _check_timezone(timezone: str) -> None:
+    if _OFFSET.match(timezone):
+        return
+    if _TIMEZONE.match(timezone):
+        try:
+            ZoneInfo(timezone)
+            return
+        except (ZoneInfoNotFoundError, ValueError):
+            # В образе без базы часовых поясов — та же база из pytz (её тянет драйвер neo4j).
+            try:
+                import pytz
+
+                pytz.timezone(timezone)
+                return
+            except Exception:  # noqa: BLE001 — неизвестный пояс или нет pytz
+                pass
+    raise BadRequest(f"Недопустимый часовой пояс {timezone!r}: ожидалось имя вроде "
+                     "Europe/Moscow или смещение вроде +03:00")
+
+
 def _filter(start: str, end: str, status: Optional[str], mode: Optional[str]) -> dict[str, Any]:
+    start, end = _moment(start, "start"), _moment(end, "end")
     if status and status not in STATUSES:
         raise BadRequest(f"Недопустимый статус {status!r}, ожидался один из {STATUSES}")
     if mode and mode not in MODES:
@@ -214,8 +290,7 @@ def stats(start: str, end: str, step: str = "day", timezone: str = "UTC",
     """Средние показатели за период с разбивкой по шагу step."""
     if step not in STEPS:
         raise BadRequest(f"Недопустимая периодичность {step!r}, ожидалась одна из {STEPS}")
-    if not _TIMEZONE.match(timezone):
-        raise BadRequest(f"Недопустимый часовой пояс {timezone!r}")
+    _check_timezone(timezone)
     params = _filter(start, end, status, mode)
     buckets = _run(
         Q_BUCKETS.format(filter=FILTER, step=step, aggregates=AGGREGATES, limit=MAX_BUCKETS + 1),

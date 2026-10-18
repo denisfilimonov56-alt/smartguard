@@ -7,6 +7,9 @@ const key = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.ge
 
 test("период выбирается с точностью до минуты", async ({ app }) => {
   await go(app, "Мониторинг");
+  // Календарь появляется только для своего периода; по умолчанию выбраны 7 дней.
+  await expect(app.getByRole("button", { name: "7 дней" })).toHaveAttribute("aria-pressed", "true");
+  await app.getByRole("button", { name: "Свой период" }).click();
   const first = new Date(Date.now() - 6 * 86_400_000);
   const from = app.getByRole("button", { name: "Начало периода" });
   await expect(from).toHaveAttribute("data-value", `${key(first)}T00:00`);
@@ -34,6 +37,7 @@ test("период выбирается с точностью до минуты"
 
 test("календарь листается, не пускает за границу периода и закрывается по Escape", async ({ app }) => {
   await go(app, "Мониторинг");
+  await app.getByRole("button", { name: "Свой период" }).click();
   await app.getByRole("button", { name: "Конец периода" }).click();
   const calendar = app.getByRole("dialog", { name: "Конец периода" });
   const first = new Date(Date.now() - 6 * 86_400_000);
@@ -66,4 +70,25 @@ test("у раздела свой адрес: прямая ссылка, «Наз
   await app.goBack();
   await expect(app).toHaveURL(/\/monitoring$/);
   await expect(app.locator("#tab-monitoring")).toBeVisible();
+});
+
+test("возврат на вкладку, пока опрос «Сейчас» в пути, не запускает второй опрос", async ({ app }) => {
+  let calls = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await app.route("**/api/monitoring/now", async (route) => {
+    calls++;
+    if (calls === 1) await held;   // первый ответ задерживается
+    await route.fallback();
+  });
+  await go(app, "Мониторинг");
+  await expect.poll(() => calls).toBe(1);
+  // Вкладку скрыли и вернули, пока запрос не ответил.
+  for (let i = 0; i < 3; i++) await app.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await app.waitForTimeout(500);
+  expect(calls).toBe(1);
+  release();
+  await expect(app.getByText("Запросов у модели")).toBeVisible();
+  await app.waitForTimeout(500);
+  expect(calls).toBe(1);
 });

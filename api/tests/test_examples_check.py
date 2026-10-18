@@ -175,6 +175,38 @@ def test_result_goes_stale_after_catalog_change(run):
     assert examples_check.status()["stale"] is True
 
 
+def test_manual_cache_clear_does_not_make_result_stale(run):
+    """Очистка кэша ответов в «Настройках» каталог не меняет (L45)."""
+    assert run([example("Цель", False)], {"Цель": ["проект"]})["stale"] is False
+    metrics.clear_cache("results")
+    assert examples_check.status()["stale"] is False
+
+
+def test_result_goes_stale_after_change_through_seeder(run, monkeypatch):
+    """Миграция или сброс каталога через seeder поднимает версию в графе — результат устарел."""
+    version = {"value": 1}
+    monkeypatch.setattr(metrics, "_graph_version", None)
+    monkeypatch.setattr(metrics, "_graph_query", lambda query: version["value"])
+    metrics.sync_catalog_version()
+    assert run([example("Цель", False)], {"Цель": ["проект"]})["stale"] is False
+    version["value"] = 2
+    metrics.sync_catalog_version()
+    assert examples_check.status()["stale"] is True
+
+
+def test_batch_belongs_to_whoever_started_the_run(run, monkeypatch):
+    seen = []
+    real = metrics.start_batch
+    monkeypatch.setattr(metrics, "start_batch", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    metrics.set_actor("чужой")
+    try:
+        run([example("Цель", False)], {"Цель": ["проект"]})
+    finally:
+        metrics.set_actor(None)
+    assert [b.login for b in seen] == ["tester"]
+    assert seen[0].done == seen[0].total and seen[0].running == 0
+
+
 # ------------------------------- маршруты -----------------------------------
 
 

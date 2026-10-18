@@ -4,7 +4,7 @@ import { api, type Period } from "../../api/client";
 import type {
   CheckAggregate, CheckMode, CheckRecord, CheckStatus, MonitoringNow, MonitoringStats, StatsStep,
 } from "../../api/types";
-import { Spinner } from "../../ui/common";
+import { Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
 import { DateTime, localDateTime } from "../../ui/DateTime";
 import { Select } from "../../ui/Select";
 import { errorText, useToast } from "../../ui/Toasts";
@@ -38,8 +38,11 @@ const num = (v: number | null | undefined) => (v == null ? "—" : v.toLocaleStr
 const dur = (ms: number | null | undefined) => {
   if (ms == null) return "—";
   if (ms < 1000) return `${Math.round(ms)} мс`;
-  if (ms < 60_000) return `${(ms / 1000).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} с`;
-  return `${Math.floor(ms / 60_000)} мин ${String(Math.round((ms % 60_000) / 1000)).padStart(2, "0")} с`;
+  // Граница — по округлённому до десятых: 59 960 мс — это уже «1 мин 00 с», а не «60 с».
+  if (Math.round(ms / 100) < 600) return `${(ms / 1000).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} с`;
+  // Сначала округление до секунд: иначе 119,6 с превращались в «1 мин 60 с».
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)} мин ${String(s % 60).padStart(2, "0")} с`;
 };
 const share = (part: number, total: number) => (total ? `${Math.round((part / total) * 100)}%` : "—");
 const when = (iso: string) => new Date(iso.replace(/\[.*\]$/, "")).toLocaleString("ru-RU");
@@ -61,6 +64,14 @@ export function MonitoringTab() {
   // По умолчанию — последние семь суток целиком: с начала первого дня до конца сегодняшнего.
   const [from, setFrom] = useState(() => `${localDateTime(new Date(Date.now() - 6 * 86_400_000)).slice(0, 10)}T00:00`);
   const [to, setTo] = useState(() => `${localDateTime(new Date()).slice(0, 10)}T23:59`);
+  // Быстрые периоды: сегодня, 7 и 30 дней до конца сегодняшнего дня.
+  const preset = (days: number) => ({
+    from: `${localDateTime(new Date(Date.now() - (days - 1) * 86_400_000)).slice(0, 10)}T00:00`,
+    to: `${localDateTime(new Date()).slice(0, 10)}T23:59`,
+  });
+  const PRESETS: [string, number][] = [["Сегодня", 1], ["7 дней", 7], ["30 дней", 30]];
+  // Календарь показывается только для своего периода; быстрые кнопки задают границы сами.
+  const [custom, setCustom] = useState(false);
   const [step, setStep] = useState<StatsStep>("day");
   const [mode, setMode] = useState<CheckMode | "">("");
   const [busy, setBusy] = useState(false);
@@ -72,20 +83,46 @@ export function MonitoringTab() {
   const [history, setHistory] = useState<{ records: CheckRecord[]; total: number } | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
 
-  // Сейчас: обновляется само, пока раздел открыт.
+  // Сейчас: обновляется само, пока раздел открыт. Следующий запрос — только после
+  // ответа на предыдущий (медленный API не копит запросы), в скрытой вкладке опрос
+  // пропускается, а опоздавший ответ не затирает более свежий.
   useEffect(() => {
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let seq = 0;
+    let shown = 0;
+    // Запрос в пути: второй опрос не запускается, иначе цепочек таймеров стало бы две.
+    let inFlight = false;
+    const schedule = () => { if (alive) timer = setTimeout(() => void tick(), REFRESH_MS); };
     const tick = async () => {
+      if (inFlight) return;
+      if (document.hidden) { schedule(); return; }
+      const mine = ++seq;
+      inFlight = true;
       try {
         const next = await api.monitoringNow();
-        if (alive) { setNow(next); setNowError(null); }
+        if (alive && mine > shown) { shown = mine; setNow(next); setNowError(null); }
       } catch (err) {
-        if (alive) setNowError(errorText(err));
+        if (alive && mine > shown) { shown = mine; setNowError(errorText(err)); }
+      } finally {
+        inFlight = false;
       }
+      schedule();
+    };
+    // Вернулись на вкладку — показать свежее сразу, не дожидаясь таймера. Если запрос
+    // ещё идёт, его ответ и так придёт, а следующий опрос он запланирует сам.
+    const onVisible = () => {
+      if (document.hidden || !alive || inFlight) return;
+      clearTimeout(timer);
+      void tick();
     };
     void tick();
-    const timer = setInterval(() => void tick(), REFRESH_MS);
-    return () => { alive = false; clearInterval(timer); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   const load = useCallback(async () => {
@@ -131,24 +168,31 @@ export function MonitoringTab() {
 
   return (
     <section id="tab-monitoring">
-      <div className="page-head">
-        <div>
-          <h1>Мониторинг</h1>
-          <div className="sub">Очередь и нагрузка сейчас, показатели за период и история проверок.</div>
-        </div>
-      </div>
+      <PageHead title="Мониторинг" sub="Очередь и нагрузка сейчас, показатели за период и история проверок." />
 
       <h2 className="block-title">Сейчас <span className="dim">обновляется каждые {REFRESH_MS / 1000} с</span></h2>
       {nowError && <div className="card pad"><span className="badge warn">{nowError}</span></div>}
-      {!now && !nowError && <div className="card pad"><Spinner /> Загрузка…</div>}
+      {!now && !nowError && <div className="tiles"><Skeleton rows={2} /><Skeleton rows={2} /><Skeleton rows={2} /></div>}
       {now && <NowCards now={now} />}
 
       <h2 className="block-title">Показатели за период</h2>
       <div className="toolbar">
-        <label className="row">с <DateTime id="monitoringFrom" ariaLabel="Начало периода" value={from} max={to}
-          onChange={setFrom} style={{ width: 190 }} /></label>
-        <label className="row">по <DateTime id="monitoringTo" ariaLabel="Конец периода" value={to} min={from}
-          onChange={setTo} style={{ width: 190 }} /></label>
+        <div className="seg" aria-label="Период">
+          {PRESETS.map(([label, days]) => {
+            const p = preset(days);
+            return (
+              <button key={days} type="button" aria-pressed={!custom && from === p.from && to === p.to}
+                onClick={() => { setCustom(false); setFrom(p.from); setTo(p.to); }}>{label}</button>
+            );
+          })}
+          <button type="button" aria-pressed={custom} onClick={() => setCustom(true)}>Свой период</button>
+        </div>
+        {custom && <>
+          <label className="row">с <DateTime id="monitoringFrom" ariaLabel="Начало периода" value={from} max={to}
+            onChange={setFrom} style={{ width: 190 }} /></label>
+          <label className="row">по <DateTime id="monitoringTo" ariaLabel="Конец периода" value={to} min={from}
+            onChange={setTo} style={{ width: 190 }} /></label>
+        </>}
         <Select id="monitoringStep" ariaLabel="Периодичность" value={step} style={{ width: 170 }}
           onChange={(v) => setStep(v as StatsStep)} options={STEPS} />
         <Select id="monitoringMode" ariaLabel="Вид проверок" value={mode} style={{ width: 190 }}
@@ -158,14 +202,14 @@ export function MonitoringTab() {
         </button>
       </div>
 
-      {stats && !totals && <div className="empty">За этот период проверок не было.</div>}
+      {stats && !totals && <Empty icon="chart" title="За этот период проверок не было">Выберите другой период или проверьте цель — она появится в показателях.</Empty>}
       {totals && (
         <>
           <div className="tiles">
             <Tile label="Проверок" value={num(totals.total)}
               note={`из кэша: ${num(totals.cached)} (${share(totals.cached, totals.total)})`} />
             <Tile label="Среднее время проверки" value={dur(totals.avg_computed_ms)}
-              note={`без ответов из кэша · 95% быстрее ${dur(totals.p95_ms)}`} />
+              note={`без ответов из кэша · 95% таких проверок быстрее ${dur(totals.p95_ms)}`} />
             <Tile label="Ожидание в очереди" value={dur(totals.avg_queue_ms)}
               note={`в среднем на проверку · модель: ${dur(totals.avg_llm_ms)}`} />
             <Tile label="Самая долгая" value={dur(totals.max_ms)}
@@ -185,7 +229,9 @@ export function MonitoringTab() {
             <thead>
               <tr>
                 <th>Интервал</th><th className="r">Проверок</th><th className="r">Из кэша</th>
-                <th className="r">Среднее время</th><th className="r">95%</th><th className="r">Очередь</th>
+                <th className="r" title="Без ответов из кэша">Среднее время</th>
+                <th className="r" title="95% проверок без ответов из кэша быстрее этого">95%</th>
+                <th className="r">Очередь</th>
                 <th className="r">Нарушения</th><th className="r">Ручная проверка</th>
               </tr>
             </thead>
@@ -284,7 +330,7 @@ function NowCards({ now }: { now: MonitoringNow }) {
         <Tile label="Запросов у модели" value={`${llm.running} из ${llm.capacity}`}
           note={`${llm.reserve} слотов оставлено ручным проверкам`} />
         <Tile label="Целей в работе" value={num(checks.running)}
-          note={`ждут в принятых пакетах: ${num(checks.queued)}`} />
+          note={`ещё не начаты в принятых пакетах: ${num(checks.queued)}`} />
         <Tile label="Проверок в минуту" value={num(recent.per_minute)}
           note={`за последние ${recent.window_seconds / 60} мин: ${num(recent.checks)}`} />
         <Tile label="Среднее время проверки" value={dur(recent.avg_ms)}

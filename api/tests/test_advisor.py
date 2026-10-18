@@ -160,6 +160,23 @@ def test_regression_on_catalog_examples(world):
     assert metrics.snapshot()["checks"]["batches"] == [], "пакет из мониторинга уходит"
 
 
+def test_regression_batch_is_attributed_to_the_editor(world, monkeypatch):
+    """Пакет советчика — того, кто спросил, а не того, чья проверка была в потоке раньше (L29)."""
+    seen = []
+    real = metrics.start_batch
+    monkeypatch.setattr(metrics, "start_batch", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    world["proposals"] = ["дата, квартал"]
+    world["examples"] = [example("Сдать отчёт, дата 01.03.2026", False), example("Сделать когда-нибудь", True)]
+    metrics.set_actor("hr-system")
+    try:
+        advise()
+    finally:
+        metrics.set_actor(None)
+    [batch] = seen
+    assert batch.login == "tester"
+    assert (batch.done, batch.running) == (2, 0)
+
+
 def test_goal_itself_is_not_a_regression_example(world):
     world["proposals"] = ["дата, квартал"]
     world["examples"] = [example(GOAL, False)]
@@ -277,6 +294,15 @@ def test_route_errors(client, world):
     world["proposals"] = [agent.ExtractionError("модель недоступна")]
     response = client.post("/catalog/advice", json=BODY)
     assert response.status_code == 503 and "Модель не ответила" in response.json()["detail"]
+
+
+def test_route_queue_timeout_is_503(client, world, monkeypatch):
+    def busy(*a, **k):
+        raise metrics.QueueTimeout(120)
+
+    monkeypatch.setattr(agent, "extract_attributes", busy)
+    response = client.post("/catalog/advice", json=BODY)
+    assert response.status_code == 503 and response.headers["Retry-After"]
 
 
 def test_viewer_cannot_ask(client):

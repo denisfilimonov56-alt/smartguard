@@ -3,13 +3,13 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api/client";
 import type { Role, User } from "../../api/types";
 import { ROLE_LABEL, useAuth } from "../../state/auth";
-import { Spinner } from "../../ui/common";
+import { PageHead, Skeleton } from "../../ui/common";
 import { useDialogs, type Option } from "../../ui/Dialogs";
 import { MenuButton, type MenuItem } from "../../ui/Menu";
 import { errorText, useToast } from "../../ui/Toasts";
 
 /* Кому можно в интерфейс и с какой ролью. Пароли здесь не заводятся:
-   их проверяет каталог (LDAP/AD), реестр хранит только логин и роль. */
+   кто пользователь, подтверждает Keycloak, реестр хранит только логин и роль. */
 
 const ROLE_OPTIONS: Option[] = [
   { value: "viewer", label: "Читатель", description: "просмотр каталога и проверка целей" },
@@ -48,7 +48,7 @@ export function UsersTab() {
     title: "Новый пользователь", submitLabel: "Добавить",
     fields: [
       { name: "login", label: "Логин", required: true, placeholder: "i.ivanov",
-        hint: "Тот же, что в домене, без домена: с ним пользователь входит." },
+        hint: "Тот же, что в Keycloak (в домене — без домена): с ним пользователь входит." },
       { name: "displayName", label: "Имя", placeholder: "Иванов Иван" },
       { name: "role", label: "Роль", type: "select", value: "viewer", options: ROLE_OPTIONS },
     ],
@@ -63,7 +63,8 @@ export function UsersTab() {
       { name: "displayName", label: "Имя", value: u.displayName ?? "" },
       // Свою роль менять нельзя: иначе администратор может остаться без доступа.
       ...(u.login === me.login ? [] : [
-        { name: "role", label: "Роль", type: "select" as const, value: u.role, options: ROLE_OPTIONS },
+        // Записи без роли (доступ не назначен) роль назначается здесь же.
+        { name: "role", label: "Роль", type: "select" as const, value: u.role ?? "viewer", options: ROLE_OPTIONS },
       ]),
     ],
     onSubmit: (v) => change(() => api.patchUser(u.login, {
@@ -79,27 +80,39 @@ export function UsersTab() {
     if (ok) await change(() => api.deleteUser(u.login), "Пользователь удалён");
   });
 
+  // Учётную запись в Keycloak пересоздали (новый sub) у того же человека — без снятия
+  // привязки он получит отказ; следующий вход привяжет запись заново.
+  const unbind = (u: User) => run(async () => {
+    const ok = await confirm({
+      title: "Снять привязку к учётной записи?", confirmLabel: "Снять привязку",
+      message: <>
+        <p>Запись <b>{u.login}</b> привязана к учётной записи Keycloak, с которой входили первый раз.
+          После снятия привязки её займёт тот, кто следующим войдёт с этим логином.</p>
+        <p className="muted">Нужно, когда учётную запись в Keycloak пересоздали у того же человека.</p>
+      </>,
+    });
+    if (ok) await change(() => api.unbindUser(u.login), "Привязка снята");
+  });
+
   const menu = (u: User): MenuItem[] => [
-    { label: "Изменить", run: edit(u) },
-    ...(u.login === me.login ? [] : [
+    // Администратор из настроек сервера здесь не меняется — только привязка.
+    ...(u.builtin ? [] : [{ label: "Изменить", run: edit(u) }]),
+    ...(u.bound ? [{ label: "Снять привязку к учётной записи", run: unbind(u) }] : []),
+    ...(u.login === me.login || u.builtin ? [] : [
       null,
-      u.status === "blocked"
+      ...(u.role === null ? [] : [u.status === "blocked"
         ? { label: "Разблокировать", run: run(() => change(() => api.patchUser(u.login, { status: "active" }), "Доступ возвращён")) }
-        : { label: "Заблокировать", run: run(() => change(() => api.patchUser(u.login, { status: "blocked" }), "Доступ закрыт")) },
+        : { label: "Заблокировать", run: run(() => change(() => api.patchUser(u.login, { status: "blocked" }), "Доступ закрыт")) }]),
       { label: "Удалить", run: remove(u), danger: true },
     ]),
   ];
 
   return (
     <section id="tab-users">
-      <div className="page-head">
-        <div>
-          <h1>Пользователи</h1>
-          <div className="sub">Кому можно в интерфейс и с какой ролью. Пароль проверяет домен — здесь только логин и роль.</div>
-        </div>
+      <PageHead title="Пользователи" sub="Кому можно в интерфейс и с какой ролью. Пароль проверяет Keycloak — здесь только логин и роль.">
         <button className="btn primary" onClick={add}>+ Пользователь</button>
-      </div>
-      {state.kind === "loading" && <div className="card pad"><Spinner /> Загрузка…</div>}
+      </PageHead>
+      {state.kind === "loading" && <Skeleton rows={3} />}
       {state.kind === "error" && <div className="card pad"><span className="badge warn">{state.message}</span></div>}
       {state.kind === "ready" && (
         <div className="card"><table>
@@ -119,11 +132,13 @@ export function UsersTab() {
                 </td>
                 <td>{u.displayName || <span className="dim">—</span>}</td>
                 <td>
-                  {ROLE_LABEL[u.role]}
+                  {u.role ? ROLE_LABEL[u.role] : <span className="dim">доступ не назначен</span>}
                   {u.builtin && <div className="small dim">задан в настройках сервера</div>}
+                  {u.bound && <div className="small dim" title="Вход принимается только с этой учётной записью Keycloak">
+                    привязан к учётной записи</div>}
                 </td>
                 <td className="dim">{when(u.lastLoginAt)}</td>
-                <td><div className="actions">{!u.builtin && <MenuButton items={() => menu(u)} />}</div></td>
+                <td><div className="actions">{(!u.builtin || u.bound) && <MenuButton items={() => menu(u)} />}</div></td>
               </tr>
             ))}
           </tbody>

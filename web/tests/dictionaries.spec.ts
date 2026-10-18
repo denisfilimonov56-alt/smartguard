@@ -1,5 +1,5 @@
 import {
-  check, choose,
+  apiHeaders, check, choose,
   cell, expect, go, menu, modal, optionsOf, orderItem, panel, PROJECT, ruleCard, test, toast, TRAINING,
 } from "./fixtures";
 import type { Page } from "@playwright/test";
@@ -45,9 +45,11 @@ test("должностные инструкции: загрузка, правк�
   await modal(app).getByLabel("Текст инструкции").fill(`${DUTY};\nвести реестр обращений`);
   await modal(app).getByRole("button", { name: "Загрузить" }).click();
   await expect(toast(app, "Инструкция загружена")).toBeVisible();
+  // Выписка идёт в фоне (202): интерфейс опрашивает инструкцию, пока она не готова.
+  await expect(toast(app, "Обязанности выписываются")).toBeVisible();
 
-  // Сразу после загрузки редактор сверяет список обязанностей, выписанный моделью.
-  await expect(modal(app).getByLabel("Обязанности")).toHaveValue(`${DUTY}\nвести реестр обращений`);
+  // Когда модель закончила, редактор сверяет список обязанностей, выписанный ею.
+  await expect(modal(app).getByLabel("Обязанности", { exact: true })).toHaveValue(`${DUTY}\nвести реестр обращений`);
   await expect(departmentRow(app, "UCT").getByRole("button", { name: /Аналитик · проверьте обязанности/ })).toBeVisible();
   await modal(app).getByRole("button", { name: "Подтвердить список" }).click();
   await expect(toast(app, "Список обязанностей сохранён")).toBeVisible();
@@ -68,11 +70,11 @@ test("должностные инструкции: загрузка, правк�
   await choose(modal(app).locator("#f_source"), { value: "job_descriptions" });
   await modal(app).getByRole("button", { name: "Создать" }).click();
   await expect(targetRow(app, "дублирование_обязанностей")).toContainText("по должностным инструкциям");
-  await app.evaluate(() => fetch("/api/catalog/rules", {
-    method: "POST", headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+  await app.evaluate((headers) => fetch("/api/catalog/rules", {
+    method: "POST", headers,
     body: JSON.stringify({ clauseNodeId: "c:2", type: "PROHIBITION", checkInstruction: "",
       description: "Цель не должна дублировать должностные обязанности", targets: ["дублирование_обязанностей"] }),
-  }));
+  }), apiHeaders());
   await app.getByRole("button", { name: "Меню пользователя" }).click();
   await app.getByRole("menuitem", { name: "Обновить" }).click();
 

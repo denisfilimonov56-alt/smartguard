@@ -5,7 +5,7 @@ import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { cellState, type CellState } from "../../state/scope";
 import { allRuleRefs, normalizeQuery, ruleMatches, type RuleRef } from "../../state/tree";
-import { ArchivedBadge } from "../../ui/common";
+import { ArchivedBadge, Empty, PageHead } from "../../ui/common";
 import { Select } from "../../ui/Select";
 import { useActions } from "../actions";
 import { useCellEditor } from "./CellEditor";
@@ -57,6 +57,7 @@ function Matrix() {
         <div className="s">
           п. {clause.code || "?"} · {rule.type === "PROHIBITION" ? "запрет" : "требование"}
           <ArchivedBadge status={rule.status} />
+          {rule.studentsOnly && <span className="badge requirement" title="Проверяется только у целей студентов">только студенты</span>}
           {!rule.targets.length && <span className="badge warn">нет атрибутов — не сработает</span>}
         </div>
       </td>
@@ -78,29 +79,22 @@ function Matrix() {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <h1>Где какое правило действует</h1>
-          <div className="sub">Строка — правило из приказа, столбец — подразделение.{canEdit && " Нажмите на ячейку, чтобы изменить."}</div>
-        </div>
-        {canEdit && (
-          <div className="row">
-            <button className="btn" onClick={actions.addDepartment}>+ Подразделение</button>
-            <button className="btn primary" onClick={() => openWizard()}>+ Правило</button>
-          </div>
-        )}
-      </div>
+      <PageHead title="Где какое правило действует"
+        sub={<>Строка — правило из приказа, столбец — подразделение.{canEdit && " Нажмите на ячейку, чтобы изменить."}</>}>
+        {canEdit && <button className="btn" onClick={actions.addDepartment}>+ Подразделение</button>}
+        {canEdit && <button className="btn primary" onClick={() => openWizard()}>+ Правило</button>}
+      </PageHead>
 
       <div className="toolbar">
         <Select className="pill" style={{ width: 230 }} ariaLabel="Приказ" value={orderFilter} onChange={setOrderFilter}
           options={[{ value: "", label: "Все приказы" },
             ...orders.map((o) => ({ value: o.nodeId, label: o.number || o.orderId || "(без номера)" }))]} />
-        <input type="search" className="pill grow" placeholder="Поиск по правилам…" value={search}
-          onChange={(e) => setSearch(e.target.value)} />
         <label className="check">
           <input type="checkbox" checked={showArchived}
             onChange={(e) => void reload({ showArchived: e.target.checked })} /> Архив
         </label>
+        <input type="search" className="pill grow" placeholder="Поиск по правилам…" value={search}
+          onChange={(e) => setSearch(e.target.value)} />
       </div>
       <div className="toolbar">
         <div className="legend">
@@ -132,10 +126,12 @@ function Matrix() {
           </table>
         </div>
       ) : (
-        <div className="empty">
-          {search || orderFilter ? "Ничего не найдено."
-            : canEdit ? "Правил пока нет. Начните с кнопки «+ Правило»." : "Правил пока нет."}
-        </div>
+        search || orderFilter
+          ? <Empty icon="search" title="Ничего не найдено">Измените запрос или снимите фильтр по приказу.</Empty>
+          : <Empty icon="list" title="Правил пока нет"
+            action={canEdit && <button className="btn primary" onClick={() => openWizard()}>+ Правило</button>}>
+            Правило — требование или запрет из пункта приказа, который проверяется в формулировке цели.
+          </Empty>
       )}
     </>
   );

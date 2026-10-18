@@ -1,59 +1,47 @@
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 
-import { api } from "../../api/client";
-import type { Account } from "../../api/types";
-import logo from "../../assets/logo.png";
+import * as oidc from "../../lib/oidc";
 import { Spinner } from "../../ui/common";
-import { errorText } from "../../ui/Toasts";
+import { LoginOrbits } from "./LoginOrbits";
 
-/* Вход доменной учётной записью. Пароль уходит только в API и нигде
-   в интерфейсе не сохраняется; после отправки поле очищается. */
+/* Экран входа по макету «Орбиты»: эмблема в центре графа-орбит (LoginOrbits),
+   под ним заголовок и одна кнопка. Логин и пароль здесь не спрашиваются:
+   кнопка уводит на страницу входа Keycloak, оттуда возвращаются уже с токеном
+   (lib/oidc.ts). */
 
-export function LoginView({ notice, onLogin }: { notice?: string; onLogin: (user: Account) => void }) {
-  const [login, setLogin] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+export function LoginView({ notice }: { notice?: string }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    if (!login.trim() || !password) { setError("Введите логин и пароль"); return; }
+  async function start() {
     setBusy(true);
     setError("");
     try {
-      onLogin(await api.login(login.trim(), password));
+      await oidc.login();   // страница уходит в Keycloak; сюда управление не вернётся
     } catch (err) {
-      setError(errorText(err));
-      setPassword("");
+      setError(err instanceof Error ? err.message : "Сервис входа недоступен");
       setBusy(false);
     }
   }
 
   return (
-    <div className="login-page">
-      <form className="card login-card" onSubmit={submit} noValidate>
-        <div className="brand" style={{ padding: "0 0 18px" }}>
-          <img src={logo} alt="" />
-          <div>Проверка целей<small>каталог требований</small></div>
-        </div>
-        <h2>Вход</h2>
-        <p className="muted" style={{ margin: "6px 0 16px" }}>Доменная учётная запись. Доступ назначает администратор.</p>
-        {notice && !error && <div className="alert" style={{ marginBottom: 14 }}>{notice}</div>}
-        <div className="field">
-          <label htmlFor="loginInput">Логин</label>
-          <input type="text" id="loginInput" autoComplete="username" autoCapitalize="none" spellCheck={false}
-            autoFocus value={login} onChange={(e) => setLogin(e.target.value)} />
-        </div>
-        <div className="field">
-          <label htmlFor="passwordInput">Пароль</label>
-          <input type="password" id="passwordInput" autoComplete="current-password"
-            value={password} onChange={(e) => setPassword(e.target.value)} />
-        </div>
-        {error && <div className="alert danger" role="alert" style={{ marginBottom: 14 }}>{error}</div>}
-        <button type="submit" className="btn primary" style={{ width: "100%" }} disabled={busy}>
-          {busy ? <><Spinner /> Вход…</> : "Войти"}
+    <div className="login-screen">
+      <header className="login-head">Проверка целей<small>каталог требований</small></header>
+      <main className="login-main">
+        <LoginOrbits />
+        <span className="login-tag">Вход</span>
+        <h1>Проверка целей по приказам</h1>
+        {notice && !error && <div className="alert">{notice}</div>}
+        {error && <div className="alert danger" role="alert">{error}</div>}
+        <button type="button" className="btn primary login-btn" disabled={busy} onClick={() => void start()}>
+          {busy ? <><Spinner /> Переход ко входу…</> : <>
+            Войти
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+              strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8h10M9 4l4 4-4 4" /></svg>
+          </>}
         </button>
-      </form>
+      </main>
+      <footer className="login-foot">Версия {__APP_VERSION__}</footer>
     </div>
   );
 }

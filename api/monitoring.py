@@ -42,10 +42,25 @@ def parse_vllm_metrics(text: str) -> dict[str, float]:
     return found
 
 
+def _vllm_url(path: str) -> str:
+    """Служебный адрес vLLM (/metrics, /health): VLLM_URL без суффикса /v1."""
+    base = os.getenv("VLLM_URL", "http://vllm:8000/v1").rstrip("/")
+    return (base[:-3] if base.endswith("/v1") else base) + path
+
+
+def vllm_alive(timeout: float = 2.0) -> bool:
+    """Отвечает ли vLLM на GET /health (для /ready). Не бросает исключений."""
+    try:
+        with urllib.request.urlopen(_vllm_url("/health"), timeout=timeout) as response:  # noqa: S310
+            return 200 <= response.status < 300
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vLLM не отвечает: %s", exc)
+        return False
+
+
 def vllm_state() -> Optional[dict[str, float]]:
     """Состояние vLLM или None, если он не ответил: мониторинг от него не зависит."""
-    base = os.getenv("VLLM_URL", "http://vllm:8000/v1").rstrip("/")
-    url = (base[:-3] if base.endswith("/v1") else base) + "/metrics"
+    url = _vllm_url("/metrics")
     try:
         with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310 — адрес из настроек
             return parse_vllm_metrics(response.read().decode("utf-8", "replace"))
@@ -59,9 +74,10 @@ def _handle(func, *args, **kwargs) -> Any:
         return func(*args, **kwargs)
     except history.BadRequest as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 — чаще всего неверная дата или недоступная база
+    except Exception as exc:  # noqa: BLE001 — недоступная база; неверные даты отсеивает history
+        # Текст исключения драйвера — в журнал, а не в ответ: в нём адреса и запросы.
         log.warning("Запрос истории проверок не выполнен: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Не удалось прочитать историю: {exc}") from exc
+        raise HTTPException(status_code=503, detail="Не удалось прочитать историю: база недоступна") from exc
 
 
 @router.get("/now")

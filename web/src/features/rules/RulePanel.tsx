@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../api/client";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { scopeOf, withOff, type Scope } from "../../state/scope";
+import { FUTURE_DEPARTMENTS_HINT, scopeOf, withOff, type Scope } from "../../state/scope";
 import { findRuleRef } from "../../state/tree";
 import { ArchivedBadge, Chip, IdBadge } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
@@ -19,20 +19,66 @@ export function RulePanel() {
   const toast = useToast();
   const ref = panelRule ? findRuleRef(orders, panelRule) : undefined;
   const [picking, setPicking] = useState(false);
+  // Список, отправленный последним, показывается сразу, а флажки ждут конца сохранения:
+  // иначе следующий щелчок строился бы от старого scope и затирал предыдущий (PUT заменяет список целиком).
+  // После успешного PUT отправленный список остаётся источником правды, пока не придут
+  // данные каталога после сохранения: перезагрузку могли вытеснить или она не удалась,
+  // и тогда на экране ещё старый scope. stale — правило, каким оно было до прихода данных.
+  const [pending, setPending] = useState<{ scope: Scope; stale: unknown } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const ruleRef = useRef<unknown>(null);
 
   // Правило удалили или скрыли вместе с архивом — панели показывать нечего.
   useEffect(() => { if (panelRule && !ref) closeRule(); }, [panelRule, ref, closeRule]);
-  useEffect(() => setPicking(false), [panelRule]);
+  useEffect(() => { setPicking(false); setPending(null); }, [panelRule]);
+  // Пришли свежие данные: совпали с отправленным списком или правило перечитано после сохранения.
+  const current = ref?.rule;
+  useEffect(() => {
+    if (!pending || !current) return;
+    const loaded = scopeOf(current);
+    const same = loaded.length === pending.scope.length && loaded.every((d) => pending.scope.includes(d));
+    if (same || (pending.stale !== null && current !== pending.stale)) setPending(null);
+  }, [current, pending]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || document.getElementById("modalRoot")?.childElementCount) return;
+      closeRule();
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [closeRule]);
   if (!ref) return null;
 
   const { order, clause, rule } = ref;
-  const scope = scopeOf(rule);
+  ruleRef.current = rule;
+  const scope = pending?.scope ?? scopeOf(rule);
   const known = departments.filter((d) => d.departmentId);
   const limited = scope.length > 0 || picking;
+  const locked = !canEdit || saving;
 
-  const save = (next: Scope) =>
-    mutate(() => api.setRuleScope(rule.nodeId, next), "Область действия обновлена")
+  async function save(next: Scope) {
+    setSaving(true);
+    setPending({ scope: next, stale: null });
+    try {
+      await mutate(() => api.setRuleScope(rule.nodeId, next), "Область действия обновлена");
+      // Сохранено. Если данные после сохранения уже на экране — эффект выше снимет список;
+      // иначе он держится до первого перечитывания правила.
+      const shown = ruleRef.current;
+      setPending((p) => (p && p.scope === next ? { scope: next, stale: shown } : p));
+    } catch (err) {
+      // PUT не прошёл: на сервере прежний список.
+      toast(errorText(err), "err");
+      setPending(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+  const saveAudience = (studentsOnly: boolean) => {
+    if (studentsOnly === rule.studentsOnly) return;
+    void mutate(() => api.setRuleAudience(rule.nodeId, studentsOnly),
+      studentsOnly ? "Правило теперь только для студентов" : "Правило теперь для всех")
       .catch((err) => toast(errorText(err), "err"));
+  };
 
   function toggle(id: string, checked: boolean) {
     if (checked) {
@@ -93,11 +139,11 @@ export function RulePanel() {
       <div className="sec">
         <h3><i>2</i>Где действует</h3>
         <div className="seg" role="group" aria-label="Где действует">
-          <button aria-pressed={!limited} disabled={!canEdit} onClick={() => {
+          <button aria-pressed={!limited} disabled={locked} onClick={() => {
             setPicking(false);
             if (scope.length) void save([]);
           }}>Все подразделения</button>
-          <button aria-pressed={limited} disabled={!canEdit} onClick={() => setPicking(true)}>Только выбранные</button>
+          <button aria-pressed={limited} disabled={locked} onClick={() => setPicking(true)}>Только выбранные</button>
         </div>
         {limited && (
           <div className="chips" style={{ marginTop: 10 }}>
@@ -105,15 +151,25 @@ export function RulePanel() {
               const on = scope.includes(d.departmentId!);
               return (
                 <label key={d.nodeId} className={`box ${on ? "on" : ""}`}>
-                  <input type="checkbox" checked={on} disabled={!canEdit}
+                  <input type="checkbox" checked={on} disabled={locked}
                     onChange={(e) => toggle(d.departmentId!, e.target.checked)} />
                   {d.name || d.departmentId}
                 </label>
               );
             })}
             {!known.length && <span className="dim">Подразделений нет — заведите их в разделе «Подразделения».</span>}
-            {canEdit && !scope.length && known.length > 0 && <span className="hint" style={{ margin: 0 }}>Отметьте подразделения</span>}
+            {canEdit && !scope.length && known.length > 0 && (
+              <span className="hint" style={{ margin: 0 }}>Отметьте подразделения. {FUTURE_DEPARTMENTS_HINT}</span>
+            )}
           </div>
+        )}
+        <div className="small dim" style={{ marginTop: 12 }}>Для кого</div>
+        <div className="seg" role="group" aria-label="Для кого" style={{ marginTop: 4 }}>
+          <button aria-pressed={!rule.studentsOnly} disabled={!canEdit} onClick={() => saveAudience(false)}>Для всех</button>
+          <button aria-pressed={rule.studentsOnly} disabled={!canEdit} onClick={() => saveAudience(true)}>Только для студентов</button>
+        </div>
+        {rule.studentsOnly && (
+          <div className="hint">Проверяется, только если в запросе проверки передано, что цель ставит студент.</div>
         )}
       </div>
 

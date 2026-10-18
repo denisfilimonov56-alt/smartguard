@@ -1,6 +1,7 @@
-import { clauseBlock, expect, go, menu, modal, selectMenu, test } from "./fixtures";
+import { clauseBlock, expect, go, menu, modal, openRule, panel, PROJECT, selectMenu, test } from "./fixtures";
 
-/* Выпадающий список (ui/Select.tsx) — собственный, а не системный. */
+/* Выпадающий список (ui/Select.tsx) — собственный, а не системный. Здесь же —
+   клавиатура в остальных всплывающих элементах: меню «⋯», окна, поиск. */
 
 test("список открывается под полем, выбирает мышью и закрывается кликом мимо", async ({ app }) => {
   const field = app.locator("#departmentInput");
@@ -45,7 +46,7 @@ test("список управляется с клавиатуры", async ({ app
 test("Escape закрывает список, а не диалог, в котором он открыт", async ({ app }) => {
   await go(app, "Приказы");
   await menu(clauseBlock(app, "1.1"), "Перенести");
-  const field = modal(app).getByLabel("Приказ");
+  const field = modal(app).getByLabel("Приказ", { exact: true });
   await field.click();
   await expect(selectMenu(app)).toBeVisible();
   await field.press("Escape");
@@ -60,4 +61,64 @@ test("поиск по правилам занимает всю свободну�
   const search = await app.getByPlaceholder("Поиск по правилам…").boundingBox();
   const filter = await app.locator("#tab-rules").getByLabel("Приказ").boundingBox();
   expect(search!.width).toBeGreaterThan(filter!.width * 2);
+});
+
+test("меню «⋯» управляется с клавиатуры и возвращает фокус на кнопку", async ({ app }) => {
+  const button = app.getByRole("button", { name: "Меню пользователя" });
+  await button.focus();
+  await app.keyboard.press("Enter");
+  await expect(app.getByRole("menuitem", { name: "Обновить" })).toBeFocused();
+  await app.keyboard.press("ArrowDown");
+  await expect(app.getByRole("menuitem", { name: "Обучение" })).toBeFocused();
+  await app.keyboard.press("End");
+  await expect(app.getByRole("menuitem", { name: "Выйти" })).toBeFocused();
+  await app.keyboard.press("ArrowDown");
+  await expect(app.getByRole("menuitem", { name: "Обновить" })).toBeFocused();
+  await app.keyboard.press("Escape");
+  await expect(app.getByRole("menu")).toHaveCount(0);
+  await expect(button).toBeFocused();
+});
+
+test("Escape закрывает меню в панели правила, а не саму панель", async ({ app }) => {
+  await openRule(app, PROJECT);
+  await panel(app).getByRole("button", { name: "Действия" }).first().click();
+  await expect(app.getByRole("menu")).toBeVisible();
+  await app.keyboard.press("Escape");
+  await expect(app.getByRole("menu")).toHaveCount(0);
+  await expect(panel(app)).toBeVisible();
+  await app.keyboard.press("Escape");
+  await expect(panel(app)).toHaveCount(0);
+});
+
+test("Tab не уходит из окна, а после закрытия фокус возвращается", async ({ app }) => {
+  await go(app, "Приказы");
+  const actions = clauseBlock(app, "1.1").getByRole("button", { name: "Действия" }).first();
+  await menu(clauseBlock(app, "1.1"), "Перенести");
+  await expect(modal(app).locator(".modal")).toBeVisible();
+  for (let i = 0; i < 8; i++) {
+    await app.keyboard.press(i % 3 ? "Tab" : "Shift+Tab");
+    expect(await app.evaluate(() => !!document.activeElement?.closest("#modalRoot"))).toBe(true);
+  }
+  await modal(app).getByRole("button", { name: "Отмена" }).click();
+  await expect(modal(app).locator(".modal")).toHaveCount(0);
+  await expect(actions).toBeFocused();
+});
+
+test("подтверждение по Escape отвечает «нет»", async ({ app }) => {
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Выйти" }).click();
+  await expect(app.getByRole("dialog", { name: "Выйти из учётной записи?" })).toBeVisible();
+  await app.keyboard.press("Escape");
+  await expect(app.getByRole("dialog")).toHaveCount(0);
+  await expect(app.locator(".side")).toBeVisible();
+  // Повторный вызов работает: прежнее ожидание ответа не зависло.
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Выйти" }).click();
+  await app.getByRole("dialog").getByRole("button", { name: "Отмена" }).click();
+  await expect(app.locator(".side")).toBeVisible();
+});
+
+test("поиск открывается по Ctrl+K и при русской раскладке", async ({ app }) => {
+  await app.evaluate(() => dispatchEvent(new KeyboardEvent("keydown", { key: "л", code: "KeyK", ctrlKey: true, bubbles: true })));
+  await expect(app.getByRole("dialog", { name: "Быстрый переход" })).toBeVisible();
 });

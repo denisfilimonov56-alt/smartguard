@@ -1,12 +1,10 @@
-# Надстройка для машины С ИНТЕРНЕТОМ: разработка, стенд, первичная проверка.
+# Надстройка для разработки: стек ходит в интернет и во время работы.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.online.yml up -d --build
 #
 # Снимает запреты базового файла: образы докачиваются, если их нет локально,
-# а vLLM берёт веса с Hugging Face в кэш-том, как раньше. Образ API и здесь
-# собирается из api/vendor/wheels — колёса лежат в git, к PyPI ходить незачем.
-# Образ интерфейса собирается здесь же: npm ci берёт пакеты из реестра.
-# Сервер без интернета этот файл не использует.
+# а vLLM берёт веса с Hugging Face в кэш-том. Сервер этот файл не использует:
+# образы и веса скачиваются при релизе (docs/release.md), а стек работает без сети.
 
 services:
   neo4j:
@@ -17,16 +15,20 @@ services:
     pull_policy: build
   web:
     pull_policy: build
+  keycloak:
+    pull_policy: missing
   vllm:
     pull_policy: missing
     environment:
       HF_HUB_OFFLINE: "0"
       TRANSFORMERS_OFFLINE: "0"
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    # command заменяется целиком, поэтому флаги базового файла повторены.
     command: >
-      --model ${VLLM_MODEL}
+      --model ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --gpu-memory-utilization 0.90
+      --language-model-only
     volumes:
       - hf_cache:/root/.cache/huggingface
 

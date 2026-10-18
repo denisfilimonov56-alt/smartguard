@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../../api/client";
 import type { Advice, AdviceExample, CheckResult } from "../../api/types";
+import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
+import { registerDraft } from "../../state/drafts";
 import { Spinner } from "../../ui/common";
 import { Overlay, useDialogs } from "../../ui/Dialogs";
 import { Select } from "../../ui/Select";
@@ -18,35 +20,62 @@ interface Props {
   departmentId: string | null;
   /** Атрибут, с ответом по которому не согласны; иначе его выбирают в окне. */
   attribute?: string;
+  /** Обоснование из черновика после повторного входа. */
+  reason?: string;
   /** Граф поправили: проверку стоит повторить. */
   onApplied: () => void;
   close: () => void;
 }
 
+/** Черновик советчика на время повторного входа (state/drafts.ts): ответ проверки, атрибут и обоснование.
+    Предложение модели не сохраняется — его можно запросить снова. */
+export interface AdviceDraft {
+  result: CheckResult;
+  departmentId: string | null;
+  attribute: string;
+  reason: string;
+}
+export const ADVICE_DRAFT = "advice";
+
 export function useAdviceDialog() {
   const { openCustom } = useDialogs();
-  return (props: Omit<Props, "close">) => openCustom((close) => <AdviceDialog {...props} close={close} />);
+  return useCallback((props: Omit<Props, "close">) => openCustom((close) => <AdviceDialog {...props} close={close} />),
+    [openCustom]);
 }
+
+/** Пределы запроса советчика (api/schemas.py: AdviceRequest): длиннее API отвечает 422. */
+const REASON_MAX_CHARS = 2000;
 
 const verdict = (present: boolean) => (present ? "найден" : "не найден");
 const exampleKind = (e: AdviceExample) => (e.isViolation ? "пример нарушения" : "корректный пример");
 
-function AdviceDialog({ result, departmentId, attribute: preset, onApplied, close }: Props) {
+export function AdviceDialog({ result, departmentId, attribute: preset, reason: presetReason, onApplied, close }: Props) {
   const toast = useToast();
   const { targets, mutate } = useCatalog();
   const active = targets.filter((t) => t.status === "active");
   const [attribute, setAttribute] = useState(preset ?? "");
-  const [reason, setReason] = useState("");
+  const [reason, setReason] = useState(presetReason ?? "");
   const [busy, setBusy] = useState(false);
   const [advice, setAdvice] = useState<Advice | null>(null);
   /** Что уже применено: "description" и nodeId правил, получивших пример. */
   const [applied, setApplied] = useState<string[]>([]);
 
+  // Набранное обоснование переживает повторный вход.
+  const latest = useRef({ attribute, reason });
+  latest.current = { attribute, reason };
+  useEffect(() => registerDraft(ADVICE_DRAFT, () => latest.current.reason.trim()
+    ? { result, departmentId, ...latest.current } satisfies AdviceDraft : undefined), [result, departmentId]);
+
+  const { goalMaxChars } = useAuth();
   const found = result.detected_attributes.includes(attribute);
+  // Цель длиннее предела API советчик не примет: говорим об этом до отправки, а не сырым 422.
+  const goalTooLong = result.goal.trim().length > goalMaxChars;
 
   async function ask() {
     if (!attribute) { toast("Выберите атрибут", "err"); return; }
     if (!reason.trim()) { toast("Напишите, почему ответ должен быть другим", "err"); return; }
+    if (goalTooLong) { toast(`Цель длиннее ${goalMaxChars} символов: советчик её не примет`, "err"); return; }
+    if (reason.trim().length > REASON_MAX_CHARS) { toast(`Обоснование длиннее ${REASON_MAX_CHARS} символов`, "err"); return; }
     setBusy(true);
     setAdvice(null);
     setApplied([]);
@@ -74,12 +103,20 @@ function AdviceDialog({ result, departmentId, attribute: preset, onApplied, clos
   const regression = advice?.regression;
   return (
     <Overlay onClose={close}>
-      <div className="modal wide advice" role="dialog" aria-label="Правка графа под ожидаемый ответ">
+      <div className="modal wide advice" role="dialog" aria-modal="true" aria-label="Правка графа под ожидаемый ответ">
         <h3>Как изменить граф, чтобы ответ стал другим</h3>
         <div className="content">
+          <div className="alert" id="adviceDisclaimer" style={{ marginBottom: 14 }}>
+            Гарантий, что рекомендации модели верны, нет: это черновик, решение остаётся за вами.
+          </div>
           <div className="field">
             <label>Цель</label>
             <div className="fix">«{result.goal}»</div>
+            {goalTooLong && (
+              <div className="alert danger" style={{ marginTop: 8 }}>
+                Цель длиннее {goalMaxChars} символов: советчик её не примет. Сократите формулировку и проверьте заново.
+              </div>
+            )}
           </div>
           <div className="field">
             <label>Атрибут, с ответом по которому вы не согласны</label>
@@ -96,9 +133,11 @@ function AdviceDialog({ result, departmentId, attribute: preset, onApplied, clos
           </div>
           <div className="field">
             <label htmlFor="adviceReason">Обоснование</label>
-            <textarea id="adviceReason" value={reason} onChange={(e) => setReason(e.target.value)}
+            <textarea id="adviceReason" value={reason} maxLength={REASON_MAX_CHARS} onChange={(e) => setReason(e.target.value)}
               placeholder="Почему ответ должен быть другим: что в цели считается или не считается этим атрибутом" />
-            <div className="hint">Обоснование уходит модели: по нему она переписывает описание атрибута.</div>
+            <div className="hint">
+              Обоснование уходит модели: по нему она переписывает описание атрибута. {reason.length} / {REASON_MAX_CHARS}
+            </div>
           </div>
 
           {busy && <div className="dim"><Spinner /> Модель подбирает описание и проверяет его на цели и примерах…</div>}
@@ -175,7 +214,7 @@ function AdviceDialog({ result, departmentId, attribute: preset, onApplied, clos
         </div>
         <div className="foot">
           <button className="btn" onClick={close}>Закрыть</button>
-          <button className="btn primary" disabled={busy} onClick={() => void ask()}>
+          <button className="btn primary" disabled={busy || goalTooLong} onClick={() => void ask()}>
             {busy ? <><Spinner /> Подбираем…</> : advice ? "Предложить ещё раз" : "Предложить правку"}
           </button>
         </div>

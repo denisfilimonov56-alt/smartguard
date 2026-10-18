@@ -76,11 +76,11 @@ test("перенос пункта в другой приказ", async ({ app })
   await go(app, "Приказы");
   await orderItem(app, "ПР-02").click();
   await menu(clauseBlock(app, "3.1"), "Перенести");
-  await choose(modal(app).getByLabel("Приказ"), "ПР-01");
+  await choose(modal(app).getByLabel("Приказ", { exact: true }), "ПР-01");
   await modal(app).getByRole("button", { name: "Сохранить" }).click();
   await expect(toast(app, "Пункт перенесён")).toBeVisible();
   await expect(orderItem(app, "ПР-01")).toContainText("3 п. · 3 прав.");
-  await expect(orderItem(app, "ПР-02")).toContainText("0 п. · 0 прав.");
+  await expect(orderItem(app, "ПР-02")).toContainText("1 п. · 1 прав.");
 });
 
 test("удаление активного пункта без предварительного архивирования", async ({ app }) => {

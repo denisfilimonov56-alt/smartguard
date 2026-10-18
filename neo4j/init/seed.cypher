@@ -4,7 +4,7 @@
 //  Модель данных (совпадает с запросами в api/graph.py):
 //    (:Order   {orderId, number, title, date, status})
 //      -[:CONTAINS]->   (:Clause {clauseId, code, text})
-//      -[:DEFINES]->    (:Rule   {ruleId, type, description, checkInstruction})
+//      -[:DEFINES]->    (:Rule   {ruleId, type, description, checkInstruction, studentsOnly})
 //      -[:APPLIES_TO]-> (:CheckTarget {name, description})
 //    (:Rule)-[:HAS_EXAMPLE]->(:ViolationExample {exampleId, text, isViolation})
 //    (:Clause)-[:REFERENCES]->(:Clause)
@@ -18,34 +18,42 @@
 //    (:Rule)-[:ONLY_IN]->(:Department)      правило действует только в перечисленных
 //    Правило без ONLY_IN действует для всех.
 //
+//  Правила только для студентов:
+//    Rule.studentsOnly = true — проверяется, только если в запросе проверки
+//    передано is_student = true; без признака применяются все правила.
+//
 //  Должностные инструкции:
 //    (:Department)-[:HAS_JOB_DESCRIPTION]->(:JobDescription {jobDescriptionId, title, text, status})
 //    (:CheckTarget {source: "job_descriptions"}) — атрибут определяется не по
 //    тексту цели, а сравнением цели с инструкциями её подразделения.
 //
 //  ------------------------------------------------------------
-//  ДАННЫЕ ЗДЕСЬ НЕ ХРАНЯТСЯ ВРУЧНУЮ.
+//  ЗДЕСЬ ТОЛЬКО СХЕМА. Сидер выполняет этот файл при каждом подъёме
+//  стека, поэтому данных в нём нет: иначе каждый `docker compose up`
+//  откатывал бы правки из интерфейса.
 //
-//  Источник истины — сама база. Чтобы зафиксировать её текущее
-//  состояние в этом файле:
+//  Данные каталога — в data.cypher рядом. Источник истины — сама база;
+//  зафиксировать её состояние в репозитории (на хосте):
 //
-//      docker compose exec api python export_graph.py --output /init/seed.cypher
+//      docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher
 //
-//  Скрипт выгружает приказы, пункты, правила, атрибуты, примеры и подразделения
-//  в идемпотентный MERGE-скрипт, который дописывается ниже этого
-//  комментария. После этого `docker compose up` воспроизводит граф
-//  один в один, а diff в git показывает, что именно изменилось
-//  в нормативке.
+//  Сидер применяет data.cypher только к пустому каталогу (первый запуск
+//  на новой базе) или по явному флагу — тогда MERGE возвращает каталог к
+//  состоянию файла:
 //
-//  Демонстрационные приказы ПР-2024-15 и ПР-2024-22 удалены отсюда
-//  намеренно: рабочий набор — ПР-01. Убрать их из уже поднятой базы:
+//      docker compose run --rm -e SEED_DATA=1 seeder
+//
+//  Любой запуск сидера с данными или миграцией увеличивает версию
+//  каталога (:CatalogVersion), и API сбрасывает кэш готовых ответов.
+//
+//  Демонстрационные приказы ПР-2024-15 и ПР-2024-22 удалены намеренно:
+//  рабочий набор — ПР-01. Убрать их из уже поднятой базы:
 //
 //      docker compose run --rm \
 //        -e SEED_FILE=/init/migrations/001_cleanup_demo_data.cypher seeder
 //  ------------------------------------------------------------
 //
-//  Скрипт идемпотентен: схема создаётся через IF NOT EXISTS,
-//  данные — через MERGE.
+//  Скрипт идемпотентен: схема создаётся через IF NOT EXISTS.
 // ============================================================
 
 // ---------- Ограничения и индексы ----------
@@ -89,5 +97,18 @@ FOR (r:CheckRecord) ON (r.at);
 CREATE FULLTEXT INDEX rule_description_ft IF NOT EXISTS
 FOR (r:Rule) ON EACH [r.description];
 
-// ---------- Данные ----------
-// Ниже дописывается вывод export_graph.py.
+// Ограничение уникальности кэша оценок SMART (:SmartScore.goalHash) здесь
+// не создаётся: API заводит его сам при первой записи оценки
+// (graph._ensure_smart_schema), а если в базе уже есть двойники — оставляет
+// обычный индекс. Ошибка в сидере остановила бы весь стек.
+
+// Версия каталога: сидер и API увеличивают её при каждой правке каталога,
+// API по ней сбрасывает кэш ответов (api/metrics.py). В выгрузку не попадает.
+CREATE CONSTRAINT catalog_version_id IF NOT EXISTS
+FOR (v:CatalogVersion) REQUIRE v.id IS UNIQUE;
+
+// Служебные замки каталога (api/catalog.py, _lock_key): сериализуют
+// «проверить, занято ли, и записать» — двойники атрибутов, подбор
+// свободного id. Единственный узел на id. В выгрузку не попадает.
+CREATE CONSTRAINT catalog_lock_id IF NOT EXISTS
+FOR (l:CatalogLock) REQUIRE l.id IS UNIQUE;

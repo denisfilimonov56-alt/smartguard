@@ -2,8 +2,12 @@ import { useRef, useState } from "react";
 
 import { api } from "../../api/client";
 import type { RuleType } from "../../api/types";
+import { useAuth } from "../../state/auth";
 import { useCatalog, type WizardPreset } from "../../state/catalog";
+import { useDraft } from "../../state/drafts";
+import { findOrderOf } from "../../state/tree";
 import { Chip, Spinner } from "../../ui/common";
+import { useDialogs } from "../../ui/Dialogs";
 import { Select } from "../../ui/Select";
 import { errorText, useToast } from "../../ui/Toasts";
 
@@ -22,22 +26,50 @@ interface ExampleDraft {
   key: number;
   text: string;
   isViolation: boolean;
+  /** Пример уже создан в графе (прошлая попытка): повтор его не создаёт, убрать из мастера нельзя. */
+  nodeId?: string;
+}
+
+/** Что уже создано прошлой попыткой и с какими значениями: повтор правит созданное, а не плодит дубли. */
+interface Created {
+  clause?: { nodeId: string; orderNodeId: string; code: string; text: string };
+  target?: { nodeId: string; name: string; description: string };
+  rule?: string;
 }
 
 let draftKey = 0;
 
+/** Мастер целиком — черновик на время повторного входа (state/drafts.ts). */
+interface WizardDraft {
+  step: number; reached: number;
+  orderId: string; newClause: boolean; clauseId: string; code: string; text: string;
+  type: RuleType; description: string; instruction: string; picked: string[]; newName: string; newDescription: string;
+  limited: boolean; only: string[]; studentsOnly: boolean;
+  examples: ExampleDraft[]; exampleText: string; exampleBad: boolean;
+  created: Created;
+}
+
 export function RuleWizard({ preset }: { preset: WizardPreset }) {
   const toast = useToast();
-  const { orders, targets, departments, reload, closeWizard, openRule } = useCatalog();
+  const { confirm } = useDialogs();
+  const { isAdmin } = useAuth();
+  const catalog = useCatalog();
+  const { targets, departments, reload, closeWizard, openRule } = catalog;
+  // Правило в архивном приказе или пункте не участвует в проверках — их мастер не предлагает.
+  const orders = catalog.orders.filter((o) => o.status === "active")
+    .map((o) => ({ ...o, clauses: o.clauses.filter((c) => c.status === "active") }));
   const [step, setStep] = useState(preset.clauseNodeId ? 1 : 0);
   const [reached, setReached] = useState(step);
   const [busy, setBusy] = useState(false);
 
   // Шаг 1
-  const [orderId, setOrderId] = useState(preset.orderNodeId ?? orders[0]?.nodeId ?? "");
+  const [orderId, setOrderId] = useState(
+    preset.orderNodeId && orders.some((o) => o.nodeId === preset.orderNodeId) ? preset.orderNodeId : orders[0]?.nodeId ?? "");
   const order = orders.find((o) => o.nodeId === orderId);
   const [newClause, setNewClause] = useState(false);
-  const [clauseId, setClauseId] = useState(preset.clauseNodeId ?? order?.clauses[0]?.nodeId ?? "");
+  const [clauseId, setClauseId] = useState(
+    preset.clauseNodeId && order?.clauses.some((c) => c.nodeId === preset.clauseNodeId)
+      ? preset.clauseNodeId : order?.clauses[0]?.nodeId ?? "");
   const [code, setCode] = useState("");
   const [text, setText] = useState("");
   const clause = order?.clauses.find((c) => c.nodeId === clauseId);
@@ -57,14 +89,36 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
   const known = departments.filter((d) => d.departmentId && d.status === "active");
   const [limited, setLimited] = useState(false);
   const [only, setOnly] = useState<string[]>([]);
+  const [studentsOnly, setStudentsOnly] = useState(false);
 
   // Шаг 4
   const [examples, setExamples] = useState<ExampleDraft[]>([]);
   const [exampleText, setExampleText] = useState("");
   const [exampleBad, setExampleBad] = useState(false);
 
-  // Что уже создано: повторная попытка после сбоя не должна плодить дубли.
-  const created = useRef<{ clause?: string; target?: boolean; rule?: string; scope?: boolean; examples: number }>({ examples: 0 });
+  // Что уже создано: повторная попытка после сбоя не должна плодить дубли
+  // и должна учесть исправления, сделанные после сбоя.
+  const created = useRef<Created>({});
+
+  // Сессия истекла посреди мастера — после повторного входа он откроется с тем же вводом
+  // и с тем, что уже создано прошлой попыткой.
+  useDraft<WizardDraft, WizardDraft>("wizard", {
+    step, reached, orderId, newClause, clauseId, code, text, type, description, instruction, picked, newName,
+    newDescription, limited, only, studentsOnly, examples, exampleText, exampleBad, created: created.current,
+  }, (d) => {
+    setStep(d.step); setReached(d.reached); setOrderId(d.orderId); setNewClause(d.newClause); setClauseId(d.clauseId);
+    setCode(d.code); setText(d.text); setType(d.type); setDescription(d.description); setInstruction(d.instruction);
+    setPicked(d.picked); setNewName(d.newName); setNewDescription(d.newDescription); setLimited(d.limited);
+    setOnly(d.only); setStudentsOnly(d.studentsOnly);
+    setExamples(d.examples.map((e) => ({ ...e, key: ++draftKey })));
+    setExampleText(d.exampleText); setExampleBad(d.exampleBad);
+    created.current = d.created ?? {};
+  }, (d) => {
+    // Пустой мастер сохранять незачем.
+    const typed = d.code.trim() || d.text.trim() || d.description.trim() || d.instruction.trim() || d.picked.length
+      || d.newName.trim() || d.only.length || d.examples.length || d.exampleText.trim() || d.created.rule || d.created.clause;
+    return typed ? { ...d, created: { ...d.created } } : undefined;
+  });
 
   const label = (id: string) => known.find((d) => d.departmentId === id)?.name || id;
   const clauseCode = useNewClause ? code.trim() : clause?.code ?? "";
@@ -101,6 +155,46 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
     setExampleText("");
   }
 
+  /** Пункт или атрибут, созданный прошлой попыткой, от которого пользователь потом отказался
+      (выбрал существующий пункт, стёр новый атрибут), остался бы в каталоге сиротой: с
+      подтверждением он удаляется (администратор) или уходит в архив (редактор). */
+  async function dropOrphans(done: Created) {
+    const orphans: { nodeId: string; what: string; forget: () => void }[] = [];
+    if (done.clause && !useNewClause) {
+      const c = done.clause;
+      orphans.push({ nodeId: c.nodeId, what: `пункт ${c.code}`, forget: () => { delete done.clause; } });
+    }
+    if (done.target && !hasNewTarget) {
+      const t = done.target;
+      orphans.push({ nodeId: t.nodeId, what: `атрибут «${t.name}»`, forget: () => { delete done.target; } });
+    }
+    if (!orphans.length) return;
+    const list = orphans.map((o) => o.what).join(" и ");
+    const ok = await confirm({
+      title: "Убрать созданное прошлой попыткой?",
+      confirmLabel: isAdmin ? "Удалить" : "В архив",
+      danger: isAdmin,
+      message: <>
+        <p>Прошлая попытка успела создать {list}, но в правиле {orphans.length > 1 ? "они" : "он"} теперь
+          не {orphans.length > 1 ? "используются" : "используется"}.</p>
+        <p className="muted">{isAdmin ? "Удалить навсегда" : "Убрать в архив"}, чтобы в каталоге не осталось лишнего?
+          Если оставить — найдёте в «Приказах» и «Атрибутах».</p>
+      </>,
+    });
+    for (const orphan of orphans) {
+      if (ok) {
+        try {
+          await (isAdmin ? api.remove(orphan.nodeId, true) : api.setStatus(orphan.nodeId, "archived"));
+        } catch (err) {
+          toast(`Не удалось убрать ${orphan.what}: ${errorText(err)}`, "err");
+          continue;
+        }
+      }
+      // Оставленный — уже обычный узел каталога: мастер за него больше не отвечает.
+      orphan.forget();
+    }
+  }
+
   async function submit() {
     for (let i = 0; i < 3; i++) {
       const message = problem(i);
@@ -109,29 +203,65 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
     setBusy(true);
     const done = created.current;
     try {
-      if (useNewClause && !done.clause)
-        done.clause = (await api.createClause({ orderNodeId: orderId, code: code.trim(), text: text.trim() })).nodeId;
-      const clauseNodeId = useNewClause ? done.clause! : clauseId;
+      let clauseNodeId = clauseId;
+      if (useNewClause) {
+        const want = { orderNodeId: orderId, code: code.trim(), text: text.trim() };
+        if (!done.clause) {
+          done.clause = { nodeId: (await api.createClause(want)).nodeId, ...want };
+        } else {
+          // Пункт создан прошлой попыткой — переносим и правим его под исправленные поля.
+          if (done.clause.orderNodeId !== want.orderNodeId) {
+            await api.moveClause(done.clause.nodeId, want.orderNodeId);
+            done.clause.orderNodeId = want.orderNodeId;
+          }
+          if (done.clause.code !== want.code || done.clause.text !== want.text) {
+            await api.patch(done.clause.nodeId, { code: want.code, text: want.text });
+            Object.assign(done.clause, want);
+          }
+        }
+        clauseNodeId = done.clause.nodeId;
+      }
 
-      if (hasNewTarget && !done.target) {
-        await api.createTarget({ name: newName.trim(), description: newDescription.trim() });
-        done.target = true;
+      if (hasNewTarget) {
+        const want = { name: newName.trim(), description: newDescription.trim() };
+        if (!done.target) {
+          done.target = { nodeId: (await api.createTarget(want)).nodeId, ...want };
+        } else if (done.target.name !== want.name || done.target.description !== want.description) {
+          await api.patch(done.target.nodeId, want);
+          Object.assign(done.target, want);
+        }
       }
       const ruleTargets = hasNewTarget ? [...picked, newName.trim()] : picked;
+      const scope = limited ? only : [];
 
-      if (!done.rule)
-        done.rule = (await api.createRule({
+      if (!done.rule) {
+        // Область действия задаётся в той же транзакции, что и правило (RuleCreate.only):
+        // правило не может на миг оказаться «для всех».
+        const body = {
           clauseNodeId, type, description: description.trim(), checkInstruction: instruction.trim(), targets: ruleTargets,
-        })).nodeId;
+          studentsOnly, only: scope,
+        };
+        done.rule = (await api.createRule(body)).nodeId;
+      } else {
+        // Правило создано прошлой попыткой: приводим его к тому, что сейчас в мастере.
+        const rule = done.rule;
+        if (findOrderOf(catalog.orders, rule)?.clause?.nodeId !== clauseNodeId) await api.moveRule(rule, clauseNodeId);
+        await api.patch(rule, { type, description: description.trim(), checkInstruction: instruction.trim() });
+        await api.setRuleTargets(rule, ruleTargets);
+        await api.setRuleScope(rule, scope);
+        await api.setRuleAudience(rule, studentsOnly);
+      }
 
-      if (!done.scope && limited) {
-        await api.setRuleScope(done.rule, only);
-        done.scope = true;
+      for (const example of examples) {
+        if (example.nodeId) continue;
+        const { nodeId } = await api.createExample({
+          ruleNodeId: done.rule, text: example.text, isViolation: example.isViolation,
+        });
+        example.nodeId = nodeId;
+        setExamples((list) => list.map((x) => (x.key === example.key ? { ...x, nodeId } : x)));
       }
-      for (const example of examples.slice(done.examples)) {
-        await api.createExample({ ruleNodeId: done.rule, text: example.text, isViolation: example.isViolation });
-        done.examples++;
-      }
+
+      await dropOrphans(done);
 
       toast("Правило создано", "ok");
       const ruleNodeId = done.rule;
@@ -294,6 +424,21 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
                   )}
                 </div>
               </div>
+
+              <h2 style={{ marginTop: 22 }}>Для кого действует правило?</h2>
+              <div className="muted" style={{ marginTop: 4 }}>Кто ставит цель — студент или сотрудник — передаёт запрос проверки.</div>
+              <div role="radiogroup" aria-label="Для кого" style={{ marginTop: 6 }}>
+                <button type="button" role="radio" aria-checked={!studentsOnly} className="opt"
+                  onClick={() => setStudentsOnly(false)}>
+                  <i /><span className="t">Для всех</span>
+                  <span className="d">Правило проверяется у любой цели</span>
+                </button>
+                <button type="button" role="radio" aria-checked={studentsOnly} className="opt"
+                  onClick={() => setStudentsOnly(true)}>
+                  <i /><span className="t">Только для студентов</span>
+                  <span className="d">Цели сотрудников по этому правилу проверяться не будут</span>
+                </button>
+              </div>
             </>
           )}
 
@@ -323,8 +468,10 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
                   <div key={ex.key} className={`example ${ex.isViolation ? "bad" : "good"}`}>
                     <span className="mark">{ex.isViolation ? "✕" : "✓"}</span>
                     <span className="grow">{ex.text}</span>
-                    <button className="btn sm ghost" title="Убрать пример"
-                      onClick={() => setExamples((list) => list.filter((x) => x.key !== ex.key))}>✕</button>
+                    {ex.nodeId
+                      ? <span className="small dim" title="Создан прошлой попыткой; убрать можно в панели правила">сохранён</span>
+                      : <button className="btn sm ghost" title="Убрать пример"
+                        onClick={() => setExamples((list) => list.filter((x) => x.key !== ex.key))}>✕</button>}
                   </div>
                 ))}
               </div>
@@ -375,6 +522,7 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
                 ? only.length ? only.map((id) => <span key={id} className="chip blue">{label(id)}</span>)
                   : <span className="dim">подразделения не выбраны</span>
                 : "Все подразделения"}
+              {studentsOnly && <span className="chip blue">только студенты</span>}
             </span>
           </div>
           <div className="sumline">

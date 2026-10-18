@@ -1,4 +1,4 @@
-import { api, type JobDescriptionNode } from "../api/client";
+import { api, ApiError, type JobDescriptionNode } from "../api/client";
 import type {
   CheckTarget, Clause, Department, Example, JobDescriptionRef, Order, Rule, Status, TargetSource,
 } from "../api/types";
@@ -25,11 +25,25 @@ const SOURCE_OPTIONS: Option[] = [
 ];
 const SOURCE_HINT = "При сравнении с инструкциями описание служит критерием: что именно считать совпадением.";
 const JOB_TEXT_HINT = "После сохранения модель выпишет из текста список обязанностей — с ним и "
-  + "сравнивается цель. Это занимает несколько секунд.";
+  + "сравнивается цель. Выписка идёт в фоне и может занять несколько минут.";
 const DUTIES_HINT = "По одной обязанности в строке. Цель сравнивается именно с этим списком: "
   + "пропущенная обязанность — это пропущенное нарушение.";
 
 const str = (v: unknown) => (v as string) ?? "";
+
+/* Обязанности выписываются в фоне (API отвечает 202 и dutiesStatus = pending):
+   интерфейс опрашивает инструкцию, пока выписка не закончится. */
+const DUTIES_POLL_MS = 2000;
+/** Подряд неудачных опросов, после которых интерфейс перестаёт ждать. */
+const DUTIES_POLL_FAILURES = 5;
+/** Инструкции, которые уже опрашиваются: повторное «Выписать заново» второй опрос не заводит. */
+const pollingDuties = new Set<string>();
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Открыто окно: список обязанностей не должен его подменить. */
+const dialogOpen = () => !!document.getElementById("modalRoot")?.childElementCount;
+
+/** Обязанности по одной в строке; пустые строки и пробелы по краям не считаются. */
+export const parseDuties = (text: string) => text.split("\n").map((s) => s.trim()).filter(Boolean);
 
 export function useActions() {
   const catalog = useCatalog();
@@ -46,6 +60,13 @@ export function useActions() {
     .map((t) => ({ value: t.name, label: t.name, description: t.description }));
   const clauseOptions = (exclude?: string): Option[] => clauses.filter((c) => c.nodeId !== exclude)
     .map((c) => ({ value: c.nodeId, label: `${c.order_number} — ${c.code}` }));
+  /* Правило в архивном пункте или приказе молча выпадает из проверок, поэтому
+     переносить можно только в действующие. Приказ архивного пункта в дереве без
+     архива не найдётся — такой пункт тоже не предлагается. */
+  const activeClause = (nodeId: string) => {
+    const found = findOrderOf(orders, nodeId);
+    return found?.clause?.nodeId === nodeId && found.clause.status === "active" && found.order.status === "active";
+  };
 
   /** target передаётся для атрибута: архив используемого атрибута подтверждается отдельно. */
   const archive = (nodeId: string, target?: CheckTarget) => run(async () => {
@@ -74,6 +95,7 @@ export function useActions() {
       counts.clauses ? <><b>{counts.clauses}</b> пункт(ов)</> : null,
       counts.rules ? <><b>{counts.rules}</b> правил(а)</> : null,
       counts.examples ? <><b>{counts.examples}</b> пример(ов)</> : null,
+      counts.jobDescriptions ? <><b>{counts.jobDescriptions}</b> должностн(ая/ых) инструкци(я/й)</> : null,
     ].filter(Boolean);
     const ok = await confirm({
       title: "Удалить навсегда?", danger: true, confirmLabel: "Удалить",
@@ -179,8 +201,10 @@ export function useActions() {
     title: "Перенести пункт в другой приказ",
     fields: [{
       name: "parentNodeId", label: "Приказ", type: "select",
-      value: findOrderOf(orders, c.nodeId)?.order.nodeId ?? orders[0]?.nodeId ?? "",
-      options: orders.map((o) => ({ value: o.nodeId, label: o.number || o.orderId || o.nodeId })),
+      value: findOrderOf(orders, c.nodeId)?.order.nodeId ?? "",
+      // Пункт в архивном приказе выпадает из проверок: такие приказы не предлагаются.
+      options: orders.filter((o) => o.status === "active")
+        .map((o) => ({ value: o.nodeId, label: o.number || o.orderId || o.nodeId })),
     }],
     onSubmit: (v) => mutate(() => api.moveClause(c.nodeId, str(v.parentNodeId)), "Пункт перенесён"),
   });
@@ -206,6 +230,8 @@ export function useActions() {
       { name: "type", label: "Тип", type: "select", value: r.type ?? "REQUIREMENT", options: RULE_TYPE_OPTIONS },
       { name: "description", label: "Формулировка правила", type: "textarea", value: r.description, required: true },
       { name: "checkInstruction", label: "Что подсказать автору цели", type: "textarea", value: r.checkInstruction },
+      { name: "studentsOnly", label: "Только для целей студентов", type: "checkbox", value: !!r.studentsOnly,
+        hint: "Правило проверяется, только если запрос проверки передал, что цель ставит студент." },
       { name: "ruleId", label: "Идентификатор (ruleId)", value: r.ruleId ?? "", required: true },
     ],
     onSubmit: (v) => mutate(() => api.patch(r.nodeId, v), "Правило обновлено"),
@@ -225,7 +251,7 @@ export function useActions() {
   });
 
   const moveRule = (r: Rule) => () => {
-    const options = clauseOptions();
+    const options = clauseOptions().filter((o) => activeClause(o.value));
     openForm({
       title: "Перенести правило в другой пункт",
       fields: [{ name: "parentNodeId", label: "Пункт", type: "select",
@@ -351,7 +377,7 @@ export function useActions() {
       await mutate(async () => {
         created = await api.createJobDescription({ departmentNodeId: d.nodeId, title: str(v.title), text: str(v.text) });
       }, "Инструкция загружена");
-      afterExtraction(created);
+      void followDuties(created);
     },
   });
 
@@ -360,18 +386,60 @@ export function useActions() {
     title: "Обязанности — " + title, wide: true, submitLabel: "Подтвердить список",
     fields: [{ name: "duties", label: "Обязанности", type: "textarea", value: duties.join("\n"), required: true,
       hint: DUTIES_HINT }],
-    onSubmit: (v) => mutate(() => api.setJobDuties(nodeId, str(v.duties).split("\n")), "Список обязанностей сохранён"),
+    onSubmit: (v) => mutate(() => api.setJobDuties(nodeId, parseDuties(str(v.duties))), "Список обязанностей сохранён"),
   });
 
   /** После загрузки или правки текста: показать выписанный список либо сказать, что его нет. */
   const afterExtraction = (node: JobDescriptionNode) => {
-    if (node.dutiesError) {
-      toast("Обязанности не выписаны: " + node.dutiesError
+    // Старый API выписывал синхронно и статуса не отдавал: ошибка — по dutiesError.
+    if (node.dutiesStatus === "error" || (!node.dutiesStatus && node.dutiesError)) {
+      toast("Обязанности не выписаны: " + (node.dutiesError || "модель не ответила")
         + ". Пока цель сравнивается с полным текстом; повторите через меню инструкции.", "err");
       return;
     }
+    // При готовом списке dutiesError — предупреждение (например, список обрезан).
+    if (node.dutiesError) toast(node.dutiesError, "err");
     // Форма загрузки закрывается после onSubmit — список открывается следом.
-    setTimeout(() => openDuties(node.nodeId, str(node.title), node.duties ?? []), 0);
+    setTimeout(() => {
+      // Выписка закончилась, пока открыто другое окно: не подменять его.
+      if (dialogOpen()) {
+        toast(`Обязанности «${str(node.title)}» выписаны: ${node.duties?.length ?? 0}. `
+          + "Сверьте список через меню инструкции → «Обязанности».", "ok");
+        return;
+      }
+      openDuties(node.nodeId, str(node.title), node.duties ?? []);
+    }, 0);
+  };
+
+  /** Дождаться фоновой выписки (опрос раз в 2 с), затем показать результат. */
+  const followDuties = async (node: JobDescriptionNode) => {
+    if (node.dutiesStatus !== "pending") { afterExtraction(node); return; }
+    if (pollingDuties.has(node.nodeId)) return;
+    pollingDuties.add(node.nodeId);
+    toast("Обязанности выписываются… Список откроется, когда модель закончит.");
+    let failures = 0;
+    try {
+      for (;;) {
+        await sleep(DUTIES_POLL_MS);
+        let next: JobDescriptionNode;
+        try {
+          next = await api.jobDescription(node.nodeId);
+          failures = 0;
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) return; // инструкцию удалили
+          if (++failures < DUTIES_POLL_FAILURES) continue;
+          toast("Не удалось узнать, выписаны ли обязанности: " + errorText(err)
+            + ". Список появится в меню инструкции, когда модель закончит.", "err");
+          return;
+        }
+        if (next.dutiesStatus === "pending") continue;
+        await catalog.reload();
+        afterExtraction({ ...next, title: next.title ?? node.title });
+        return;
+      }
+    } finally {
+      pollingDuties.delete(node.nodeId);
+    }
   };
 
   const editJobDescription = (j: JobDescriptionRef) => run(async () => {
@@ -389,7 +457,8 @@ export function useActions() {
         await mutate(async () => {
           updated = await api.updateJobDescription(j.nodeId, { title: str(v.title), text: str(v.text) });
         }, "Инструкция обновлена");
-        if (str(v.text) !== str(node.text).trim()) afterExtraction(updated);
+        // Текст сменился — API запустил выписку заново (202, pending).
+        if (updated.dutiesStatus === "pending" || str(v.text) !== str(node.text).trim()) void followDuties(updated);
       },
     });
   });
@@ -400,10 +469,16 @@ export function useActions() {
   });
 
   const extractDuties = (j: JobDescriptionRef) => run(async () => {
-    toast("Модель выписывает обязанности…", "ok");
-    let node!: JobDescriptionNode;
-    await mutate(async () => { node = await api.extractJobDuties(j.nodeId); });
-    afterExtraction(node);
+    let node: JobDescriptionNode;
+    try {
+      node = await api.extractJobDuties(j.nodeId);
+    } catch (err) {
+      // 409 — выписка уже идёт: дождаться её, а не запускать вторую.
+      if (!(err instanceof ApiError && err.status === 409)) throw err;
+      node = { nodeId: j.nodeId, title: j.title, dutiesStatus: "pending" };
+    }
+    await catalog.reload();
+    await followDuties({ ...node, title: node.title ?? j.title });
   });
 
   const jobDescriptionMenu = (j: JobDescriptionRef): MenuItem[] => [

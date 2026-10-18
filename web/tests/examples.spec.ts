@@ -1,4 +1,4 @@
-import { expect, go, orderItem, panel, test } from "./fixtures";
+import { apiHeaders, expect, go, orderItem, panel, test } from "./fixtures";
 
 /* Проверка примеров на модели в разделе «Замечания». Фейк определяет атрибуты
    по ключевым словам: три примера из его данных пометкам соответствуют. */
@@ -7,12 +7,9 @@ const VAGUE = "Завершить внедрение в ближайшее вр�
 
 /** Завести пример в обход интерфейса: сам редактор примеров проверяется в rules.spec.ts. */
 const addExample = (page: import("@playwright/test").Page, ruleNodeId: string, text: string, isViolation: boolean) =>
-  page.evaluate(async (body) => {
-    await fetch("/api/catalog/examples", {
-      method: "POST", headers: { "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  }, { ruleNodeId, text, isViolation });
+  page.evaluate(async ({ body, headers }) => {
+    await fetch("/api/catalog/examples", { method: "POST", headers, body: JSON.stringify(body) });
+  }, { body: { ruleNodeId, text, isViolation }, headers: apiHeaders() });
 
 const block = (page: import("@playwright/test").Page) => page.locator("#examplesCheck");
 

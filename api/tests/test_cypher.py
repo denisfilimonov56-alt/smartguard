@@ -8,7 +8,14 @@
 
 import pytest
 
-from verify_cypher import check_scopes, collect_queries, projected_names, split_top_level
+from verify_cypher import (
+    CYPHER_MARKER,
+    check_scopes,
+    collect_queries,
+    projected_names,
+    query_modules,
+    split_top_level,
+)
 
 
 def test_every_query_in_the_project_is_scope_clean():
@@ -67,3 +74,37 @@ def test_projected_names(text, expected):
 
 def test_split_top_level_respects_brackets():
     assert split_top_level("a, f(b, c), [d, e]") == ["a", " f(b, c)", " [d, e]"]
+
+
+@pytest.mark.parametrize("query,name", [
+    ("MATCH (n) OPTIONAL MATCH (n)-->(d) WITH n, collect(d) AS ds RETURN d", "d"),
+    ("MATCH (n)-[rel:X]->(m) WITH n DELETE rel", "rel"),
+    ("MATCH (n)-->(m) WITH n WHERE m:Clause RETURN n", "m"),
+    ("MATCH (n)-->(m) WITH n SET m.x = 1", "m"),
+])
+def test_checker_catches_bare_variables(query, name):
+    """Голое имя после WITH, который его не пронёс, — тоже ошибка области видимости."""
+    problems = check_scopes(query)
+    assert problems and f"'{name}'" in problems[0]
+
+
+def test_checker_handles_distinct_and_comprehension_where():
+    assert check_scopes("""
+        MATCH (r:Rule) OPTIONAL MATCH (r)-[old:A]->() DELETE old
+        WITH DISTINCT r UNWIND $values AS name MATCH (t {name: name})
+        MERGE (r)-[:A]->(t) RETURN count(DISTINCT t) AS linked
+    """) == []
+    assert check_scopes("""
+        MATCH (n) WITH collect(n) AS ns
+        RETURN size([x IN ns WHERE x:Clause]) AS a, [l IN labels(head(ns)) WHERE l IN $labels] AS b
+    """) == []
+
+
+def test_bare_create_is_recognised_as_cypher():
+    assert CYPHER_MARKER.search("CREATE (n:X {a: 1})")
+
+
+def test_modules_are_found_automatically():
+    modules = query_modules()
+    for name in ("graph", "catalog", "diagnostics", "users", "history", "settings", "apikeys"):
+        assert name in modules

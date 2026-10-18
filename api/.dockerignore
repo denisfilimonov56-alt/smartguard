@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+# Локальное окружение разработчика (macOS, другой Python) в образ не нужно.
+.venv/

@@ -5,7 +5,7 @@ import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { scopeSummary } from "../../state/scope";
 import { normalizeQuery, orderMatches } from "../../state/tree";
-import { archivedClass, ArchivedBadge, Chip, IdBadge } from "../../ui/common";
+import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
 import { useActions } from "../actions";
 
@@ -53,8 +53,11 @@ export function OrdersView() {
         </div>
 
         {order ? <OrderDocument order={order} /> : (
-          <div className="empty">{search ? "Ничего не найдено."
-            : canEdit ? "Приказов пока нет. Начните с кнопки «+ Добавить приказ»." : "Приказов пока нет."}</div>
+          search ? <Empty icon="search" title="Ничего не найдено">Измените запрос или включите архив.</Empty>
+            : <Empty icon="list" title="Приказов пока нет"
+              action={canEdit && <button className="btn primary" onClick={actions.addOrder}>+ Добавить приказ</button>}>
+              Приказ — источник пунктов и правил, по которым проверяются цели.
+            </Empty>
         )}
       </div>
     </section>

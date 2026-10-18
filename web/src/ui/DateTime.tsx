@@ -32,6 +32,8 @@ const dayKey = (d: Date) => localDateTime(d).slice(0, 10);
 const monthStart = (key: string) => new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1);
 const human = (value: string) =>
   `${value.slice(8, 10)}.${value.slice(5, 7)}.${value.slice(0, 4)} ${value.slice(11, 16)}`;
+/** Значение задано целиком; пустое или испорченное — календарь открывается на сегодня. */
+const isFull = (value: string) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value);
 
 /** Часы или минуты: ввод цифрами, стрелки вверх и вниз меняют на единицу по кругу. */
 function TimePart({ label, value, max, onChange }: {
@@ -65,25 +67,33 @@ export function DateTime({ value, onChange, min, max, id, ariaLabel, style }: Pr
   const trigger = useRef<HTMLButtonElement>(null);
   const pop = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [view, setView] = useState(() => monthStart(value));
+  const full = isFull(value);
+  const allowed = (key: string) => !(min && key < min.slice(0, 10)) && !(max && key > max.slice(0, 10));
+  const today = dayKey(new Date());
+  // День, от которого открывается календарь: выбранный, а без значения — сегодня
+  // или, если сегодня вне границ, ближайший доступный.
+  const anchor = full ? value.slice(0, 10)
+    : allowed(today) ? today : min && today < min.slice(0, 10) ? min.slice(0, 10) : max?.slice(0, 10) ?? today;
+  const time = full ? value.slice(11, 16) : "00:00";
+  const [view, setView] = useState(() => monthStart(anchor));
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
   /** День, на который нужно перевести фокус после перерисовки сетки. */
   const [focusDay, setFocusDay] = useState<string | null>(null);
 
-  const selected = value.slice(0, 10);
-  const today = dayKey(new Date());
-  const allowed = (key: string) => !(min && key < min.slice(0, 10)) && !(max && key > max.slice(0, 10));
+  const selected = full ? value.slice(0, 10) : "";
 
   // Сетка всегда из шести недель с понедельника: высота окна не прыгает от месяца к месяцу.
   const offset = (view.getDay() + 6) % 7;
   const days = Array.from({ length: 42 }, (_, i) => new Date(view.getFullYear(), view.getMonth(), 1 - offset + i));
 
   // Tab попадает на один день сетки: выбранный, а если он в другом месяце — на первое число.
-  const tabStop = days.some((d) => dayKey(d) === selected) ? selected : dayKey(view);
+  const tabStop = days.some((d) => dayKey(d) === anchor) ? anchor : dayKey(view);
 
   function show() {
-    setView(monthStart(value));
+    setView(monthStart(anchor));
     setOpen(true);
+    // С клавиатуры календарь сразу управляется стрелками: фокус — на выбранный день (без значения — на сегодня).
+    setFocusDay(anchor);
   }
 
   function close() {
@@ -91,8 +101,8 @@ export function DateTime({ value, onChange, min, max, id, ariaLabel, style }: Pr
     trigger.current?.focus();
   }
 
-  const pickDay = (key: string) => onChange(`${key}T${value.slice(11, 16)}`);
-  const setTime = (hours: number, minutes: number) => onChange(`${selected}T${pad(hours)}:${pad(minutes)}`);
+  const pickDay = (key: string) => onChange(`${key}T${time}`);
+  const setTime = (hours: number, minutes: number) => onChange(`${selected || anchor}T${pad(hours)}:${pad(minutes)}`);
   const shift = (months: number) => setView((v) => new Date(v.getFullYear(), v.getMonth() + months, 1));
 
   // Окно — под полем; если снизу тесно, а сверху места больше, открывается вверх.
@@ -130,10 +140,13 @@ export function DateTime({ value, onChange, min, max, id, ariaLabel, style }: Pr
   }, [open]);
 
   useEffect(() => {
-    if (!open || !focusDay) return;
-    pop.current?.querySelector<HTMLElement>(`[data-day="${focusDay}"]`)?.focus();
+    // Ждём, пока окно встанет на место: фокус на элементе за краем экрана прокрутил бы страницу.
+    if (!open || !focusDay || !pos) return;
+    const grid = pop.current;
+    (grid?.querySelector<HTMLElement>(`[data-day="${focusDay}"]:not(:disabled)`)
+      ?? grid?.querySelector<HTMLElement>(".dt-day:not(:disabled)"))?.focus({ preventScroll: true });
     setFocusDay(null);
-  }, [open, focusDay, view]);
+  }, [open, focusDay, view, pos]);
 
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
@@ -161,7 +174,7 @@ export function DateTime({ value, onChange, min, max, id, ariaLabel, style }: Pr
       <button ref={trigger} type="button" id={id} aria-haspopup="dialog" aria-expanded={open} aria-label={ariaLabel}
         data-value={value} className={`select dt ${open ? "open" : ""}`} style={style}
         onClick={() => (open ? setOpen(false) : show())} onKeyDown={open ? onKeyDown : undefined}>
-        <span className="select-value">{human(value)}</span>
+        <span className="select-value">{full ? human(value) : <span className="dim">не выбрано</span>}</span>
         <svg viewBox="0 0 14 14" aria-hidden="true">
           <rect x="1.5" y="2.5" width="11" height="10" rx="2" /><path d="M1.5 5.5h11M4.5 1v3M9.5 1v3" />
         </svg>
@@ -196,11 +209,11 @@ export function DateTime({ value, onChange, min, max, id, ariaLabel, style }: Pr
           <div className="dt-foot">
             <span className="dt-time">
               <span className="dim">Время</span>
-              <TimePart label="Часы" value={Number(value.slice(11, 13))} max={23}
-                onChange={(h) => setTime(h, Number(value.slice(14, 16)))} />
+              <TimePart label="Часы" value={Number(time.slice(0, 2))} max={23}
+                onChange={(h) => setTime(h, Number(time.slice(3, 5)))} />
               <b>:</b>
-              <TimePart label="Минуты" value={Number(value.slice(14, 16))} max={59}
-                onChange={(m) => setTime(Number(value.slice(11, 13)), m)} />
+              <TimePart label="Минуты" value={Number(time.slice(3, 5))} max={59}
+                onChange={(m) => setTime(Number(time.slice(0, 2)), m)} />
             </span>
             <button type="button" className="btn sm primary" onClick={close}>Готово</button>
           </div>

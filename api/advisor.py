@@ -220,20 +220,20 @@ def regression(
     if not labeled:
         return report
     # Пакет виден в мониторинге и ставит запросы в общую очередь, мимо резерва ручных проверок.
-    batch = metrics.start_batch(f"advice-{uuid.uuid4().hex[:8]}", len(labeled))
+    # Логин — явно: поток запроса мог остаться с чужим контекстом от прошлой проверки.
+    batch = metrics.start_batch(f"advice-{uuid.uuid4().hex[:8]}", len(labeled), login)
 
     def one(item: tuple[str, bool]) -> str:
         text, present = item
         metrics.set_actor(login, batch)  # поток пула: контекст вызвавшего сюда не доходит
-        try:
-            # holdout: сам пример из примеров в промпте убирается — иначе модель видела бы ответ.
-            if detect(text, new, True).present == present:
-                return "kept"
-            return "broken" if detect(text, old, True).present == present else "alreadyWrong"
-        except agent.ExtractionError:
-            return "failed"
-        finally:
-            metrics.batch_step(batch)
+        with metrics.batch_item(batch):
+            try:
+                # holdout: сам пример из примеров в промпте убирается — иначе модель видела бы ответ.
+                if detect(text, new, True).present == present:
+                    return "kept"
+                return "broken" if detect(text, old, True).present == present else "alreadyWrong"
+            except agent.ExtractionError:
+                return "failed"
 
     try:
         with ThreadPoolExecutor(max_workers=min(agent.BULK_MAX_WORKERS, len(labeled)),

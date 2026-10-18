@@ -1,11 +1,16 @@
 /* Раскладка графа силами (Фрюхтерман — Рейнгольд): узлы отталкиваются,
-   связи стягивают. Считается один раз на набор узлов, без анимации.
+   связи стягивают. Считается один раз на весь граф, без анимации; фильтры
+   в GraphTab только скрывают узлы.
    Сторонней библиотеки нет намеренно: сервер без интернета, а граф каталога
    невелик — сотни узлов. */
 
 export interface Point { x: number; y: number }
 
-export function layoutGraph(ids: string[], edges: [string, string][], iterations = 300): Map<string, Point> {
+/** Итераций по умолчанию: шаг O(n²), поэтому на больших графах их меньше — раскладка грубее, но не вешает вкладку. */
+const defaultIterations = (n: number) => (n <= 400 ? 300 : Math.max(60, Math.round((300 * 400 * 400) / (n * n))));
+
+export function layoutGraph(ids: string[], edges: [string, string][],
+    iterations = defaultIterations(ids.length)): Map<string, Point> {
   const n = ids.length;
   const k = 70;                                   // желаемая длина связи
   const size = Math.max(300, Math.sqrt(n) * k * 1.6);

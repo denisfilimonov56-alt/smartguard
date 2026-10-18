@@ -87,6 +87,59 @@ test("панель: «только выбранные» и возврат ко �
   await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "applies");
 });
 
+test("панель: быстрые отметки «где действует» не затирают друг друга", async ({ app }) => {
+  await openRule(app, TRAINING);
+  const p = panel(app);
+  await p.getByRole("button", { name: "Только выбранные" }).click();
+  await p.locator(".box", { hasText: "УЦТ" }).click();
+  // Следующая отметка — только после сохранения предыдущей: флажки на это время заблокированы.
+  await p.locator(".box", { hasText: "АГД" }).click();
+  await expect(cell(app, TRAINING, "УЦТ")).toHaveAttribute("data-state", "applies");
+  await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "applies");
+  await expect(cell(app, TRAINING, "Финансовое управление")).toHaveAttribute("data-state", "off");
+  await expect(p.locator(".box", { hasText: "УЦТ" }).locator("input")).toBeChecked();
+});
+
+test("панель: сохранённая область действия не откатывается на флажках, если перечитать каталог не удалось", async ({ app }) => {
+  await openRule(app, TRAINING);
+  const p = panel(app);
+  await p.getByRole("button", { name: "Только выбранные" }).click();
+  // После сохранения каталог не перечитывается: на экране остались бы старые данные.
+  await app.route("**/api/catalog/tree*", (route) => route.fulfill({ status: 500, contentType: "application/json", body: "{}" }));
+  await p.locator(".box", { hasText: "УЦТ" }).click();
+  await expect(toast(app, "Область действия обновлена")).toBeVisible();
+  await expect(toast(app, "Не удалось получить данные")).toBeVisible();
+  await expect(p.locator(".box", { hasText: "УЦТ" }).locator("input")).toBeChecked();
+  // Следующая отметка строится от отправленного списка, а не от старых данных.
+  await p.locator(".box", { hasText: "АГД" }).click();
+  await expect(p.locator(".box", { hasText: "АГД" }).locator("input")).toBeChecked();
+  await expect(p.locator(".box", { hasText: "УЦТ" }).locator("input")).toBeChecked();
+  await app.unroute("**/api/catalog/tree*");
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await expect(cell(app, TRAINING, "УЦТ")).toHaveAttribute("data-state", "applies");
+  await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "applies");
+  await expect(cell(app, TRAINING, "Финансовое управление")).toHaveAttribute("data-state", "off");
+});
+
+test("панель: «только для студентов» и обратно", async ({ app }) => {
+  await openRule(app, DEADLINE);
+  const p = panel(app);
+  const group = p.getByRole("group", { name: "Для кого" });
+  await expect(group.getByRole("button", { name: "Для всех" })).toHaveAttribute("aria-pressed", "true");
+  await expect(matrixRow(app, DEADLINE)).not.toContainText("только студенты");
+
+  await group.getByRole("button", { name: "Только для студентов" }).click();
+  await expect(toast(app, "Правило теперь только для студентов")).toBeVisible();
+  await expect(group.getByRole("button", { name: "Только для студентов" })).toHaveAttribute("aria-pressed", "true");
+  await expect(p).toContainText("Проверяется, только если в запросе проверки передано");
+  await expect(matrixRow(app, DEADLINE)).toContainText("только студенты");
+
+  await group.getByRole("button", { name: "Для всех" }).click();
+  await expect(toast(app, "Правило теперь для всех")).toBeVisible();
+  await expect(matrixRow(app, DEADLINE)).not.toContainText("только студенты");
+});
+
 test("панель: атрибут без описания описывается на месте", async ({ app }) => {
   await openRule(app, TRAINING);
   const alert = panel(app).locator(".alert");
@@ -116,7 +169,10 @@ test("панель: полный цикл по примерам", async ({ app }
 
   await menu(edited, "В архив");
   await expect(edited).toHaveCount(0);
+  // Под листом страница затемнена: чтобы включить архив, лист закрывается и открывается снова.
+  await app.keyboard.press("Escape");
   await app.locator("#tab-rules").getByLabel("Архив").check();
+  await openRule(app, PROJECT);
   await expect(edited.getByText("в архиве")).toBeVisible();
   await menu(edited, "Вернуть");
   await expect(edited.getByText("в архиве")).toHaveCount(0);
@@ -171,6 +227,52 @@ test("мастер: новое правило от пункта до приме�
   await expect(cell(app, "называть ответственного", "УЦТ")).toHaveAttribute("data-state", "applies");
   await expect(cell(app, "называть ответственного", "АГД")).toHaveAttribute("data-state", "applies");
   await expect(cell(app, "называть ответственного", "Финансовое управление")).toHaveAttribute("data-state", "off");
+});
+
+test("мастер: пункт и атрибут прошлой попытки, от которых отказались, убираются с подтверждением", async ({ app }) => {
+  await go(app, "Правила");
+  const w = app.locator("#tab-rules");
+  await w.getByRole("button", { name: "+ Правило" }).click();
+  await w.getByRole("button", { name: "Новый пункт" }).click();
+  await w.getByLabel("Номер пункта").fill("9.9");
+  await w.getByLabel("Текст пункта").fill("Пункт-сирота");
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByLabel("Формулировка правила").fill("Правило после сбоя");
+  await w.getByLabel("Или новый атрибут").fill("сирота_атрибут");
+  await w.getByLabel("Описание нового атрибута").fill("атрибут, от которого потом отказались");
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByRole("button", { name: /Далее/ }).click();
+
+  // Первая попытка: пункт и атрибут созданы, правило — нет.
+  let failed = false;
+  await app.route("**/api/catalog/rules", (route) => {
+    if (failed || route.request().method() !== "POST") return route.fallback();
+    failed = true;
+    return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "Сбой записи" }) });
+  });
+  await w.getByRole("button", { name: "Создать правило" }).click();
+  await expect(toast(app, "Сбой записи")).toBeVisible();
+
+  // Передумали: существующий пункт и существующий атрибут.
+  await w.getByRole("button", { name: "Пункт приказа" }).click();
+  await w.getByRole("button", { name: "Существующий пункт" }).click();
+  await w.getByRole("button", { name: /Что проверяем/ }).click();
+  await w.getByLabel("Или новый атрибут").fill("");
+  await w.getByLabel("Описание нового атрибута").fill("");
+  await w.locator(".box", { hasText: "проект" }).click();
+  await w.getByRole("button", { name: /Примеры/ }).click();
+  await w.getByRole("button", { name: "Создать правило" }).click();
+
+  const ask = modal(app).getByRole("dialog");
+  await expect(ask).toContainText("пункт 9.9");
+  await expect(ask).toContainText("атрибут «сирота_атрибут»");
+  await ask.getByRole("button", { name: "Удалить" }).click();
+  await expect(toast(app, "Правило создано")).toBeVisible();
+
+  await go(app, "Атрибуты");
+  await expect(app.locator("#tab-targets")).not.toContainText("сирота_атрибут");
+  await go(app, "Приказы");
+  await expect(app.locator("#tab-orders")).not.toContainText("Пункт-сирота");
 });
 
 test("мастер не пускает дальше с незаполненным шагом", async ({ app }) => {

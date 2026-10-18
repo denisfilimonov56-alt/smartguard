@@ -140,8 +140,9 @@ def status() -> dict[str, Any]:
     with _lock:
         state = dict(_state)
     generation = state.pop("generation")
-    # Правка каталога через API сбрасывает кэш проверок — по этому и видно, что каталог уже другой.
-    state["stale"] = state["state"] == "done" and generation != metrics.results.generation
+    # Счётчик правок каталога и промпта (в том числе через seeder); ручная очистка
+    # кэша в «Настройках» его не трогает и результат устаревшим не делает.
+    state["stale"] = state["state"] == "done" and generation != metrics.catalog_version()
     return state
 
 
@@ -152,7 +153,7 @@ def start(login: Optional[str]) -> bool:
         if _state["state"] == "running":
             return False
         _state = {**_blank(), "state": "running", "startedAt": metrics.now_iso(),
-                  "startedBy": login, "generation": metrics.results.generation}
+                  "startedBy": login, "generation": metrics.catalog_version()}
         _thread = threading.Thread(target=_run, args=(login,), name="examples-check", daemon=True)
         _thread.start()
     return True
@@ -212,9 +213,8 @@ def _check(login: Optional[str]) -> list[dict[str, Any]]:
     examples = agent.prompt_examples()
     _update(total=sum(len(group) for group in by_text.values()))
 
-    metrics.set_actor(login)
     # Пакет виден в мониторинге и ставит запросы в общую очередь, мимо резерва ручных проверок.
-    batch = metrics.start_batch(BATCH_ID, len(by_text))
+    batch = metrics.start_batch(BATCH_ID, len(by_text), login)
     failures = 0
     gave_up = threading.Event()
 
@@ -222,19 +222,20 @@ def _check(login: Optional[str]) -> list[dict[str, Any]]:
         nonlocal failures
         metrics.set_actor(login, batch)  # поток пула: контекст вызвавшего сюда не доходит
         if gave_up.is_set():
+            metrics.batch_step(batch)
             return agent.ExtractionError("прогон остановлен: модель не отвечает")
-        try:
-            # holdout: сам пример из примеров в промпте убирается — иначе модель видела бы ответ.
-            answer: list[str] | agent.ExtractionError = agent.extract_attributes(
-                text, targets, examples, holdout=True).attributes
-        except agent.ExtractionError as exc:
-            answer = exc
-        with _lock:
-            failures = failures + 1 if isinstance(answer, agent.ExtractionError) else 0
-            if failures >= GIVE_UP_AFTER:
-                gave_up.set()
-            _state["done"] += len(by_text[text])
-        metrics.batch_step(batch)
+        with metrics.batch_item(batch):
+            try:
+                # holdout: сам пример из примеров в промпте убирается — иначе модель видела бы ответ.
+                answer: list[str] | agent.ExtractionError = agent.extract_attributes(
+                    text, targets, examples, holdout=True).attributes
+            except agent.ExtractionError as exc:
+                answer = exc
+            with _lock:
+                failures = failures + 1 if isinstance(answer, agent.ExtractionError) else 0
+                if failures >= GIVE_UP_AFTER:
+                    gave_up.set()
+                _state["done"] += len(by_text[text])
         return answer
 
     try:
@@ -243,7 +244,6 @@ def _check(login: Optional[str]) -> list[dict[str, Any]]:
             answers = list(pool.map(ask, by_text))
     finally:
         metrics.finish_batch(batch)
-        metrics.set_actor(None)
 
     for group, answer in zip(by_text.values(), answers):
         for item in group:

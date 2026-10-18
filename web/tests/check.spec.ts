@@ -1,4 +1,4 @@
-import { check, choose, expect, go, isApi, modal, test, toast } from "./fixtures";
+import { check, choose, expect, go, isApi, mockTokens, modal, test, toast } from "./fixtures";
 
 const GOAL = "Снизить долю просроченных заявок до 5% к 31.12.2025";
 
@@ -19,10 +19,63 @@ test("ответ проверки объясняет, что не так и ка
   expect(JSON.parse(await app.locator("#checkJson pre").innerText())).toMatchObject(
     { goal: GOAL, status: "VIOLATIONS_FOUND", attribute_quotes: { срок_исполнения: "31.12.2025" } });
 
+  // Кнопка в заголовке копирует ответ, не сворачивая и не разворачивая блок.
+  await app.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await app.locator("#checkJson").getByRole("button", { name: "Скопировать JSON" }).click();
+  await expect(toast(app, "JSON скопирован")).toBeVisible();
+  await expect(app.locator("#checkJson pre")).toBeVisible();
+  expect(JSON.parse(await app.evaluate(() => navigator.clipboard.readText()))).toMatchObject({ goal: GOAL });
+
   // Результат не теряется при переходе между разделами.
   await go(app, "Атрибуты");
   await go(app, "Проверка цели");
   await expect(result.getByText("Нужно доработать")).toBeVisible();
+});
+
+test("после проверки формулировка остаётся в синем блоке, атрибуты открываются по клику", async ({ app }) => {
+  const result = await check(app, GOAL);
+  // Поле ввода сменилось формулировкой с подсветкой — в том же блоке, что и до проверки.
+  const summary = app.locator("#tab-check .hero #goalSummary");
+  await expect(summary).toContainText(GOAL);
+  await expect(app.locator("#goalInput")).toHaveCount(0);
+  await expect(app.locator("#tab-check .hero").getByRole("button", { name: "Проверить" })).toBeVisible();
+
+  // Пять кругов SMART: срок в цели назван, значимость не видна.
+  const smart = result.locator("#checkSmart .ring");
+  await expect(smart).toHaveCount(5);
+  await expect(smart.filter({ hasText: "В срок" })).toHaveClass(/\bok\b/);
+  await expect(smart.filter({ hasText: "Значимая" })).toHaveClass(/\bbad\b/);
+  await expect(result.getByText("справочно, на вердикт не влияет")).toBeVisible();
+
+  // Подсвеченный фрагмент ведёт к атрибуту в словаре.
+  await summary.locator("mark.hl.link", { hasText: "31.12.2025" }).click();
+  await expect(app.getByRole("tab", { name: "Атрибуты" })).toHaveAttribute("aria-selected", "true");
+  await expect(app.locator("#tab-targets tr.flash")).toContainText("срок_исполнения");
+
+  // Чип атрибута в ответе — тоже ссылка; «Изменить» возвращает поле ввода.
+  await go(app, "Проверка цели");
+  await result.locator(".chip-btn", { hasText: "срок_исполнения" }).click();
+  await expect(app.getByRole("tab", { name: "Атрибуты" })).toHaveAttribute("aria-selected", "true");
+  await go(app, "Проверка цели");
+  await summary.getByRole("button", { name: "Изменить" }).click();
+  await expect(app.locator("#goalInput")).toHaveValue(GOAL);
+});
+
+test("после правки формулировки прежний ответ не показывается", async ({ app }) => {
+  const result = await check(app, GOAL, "UCT");
+  await expect(result.getByText("Нужно доработать")).toBeVisible();
+  // Нарушенное правило отмечено крестиком в списке «Что проверяется».
+  await expect(app.locator("aside .checkline .ico.bad")).toHaveCount(1);
+
+  await app.locator("#goalSummary").getByRole("button", { name: "Изменить" }).click();
+  await app.locator("#goalInput").fill(GOAL + " в рамках проекта «Альфа»");
+  await expect(app.locator("#checkResult")).toHaveCount(0);
+  await expect(app.locator("#checkJson")).toHaveCount(0);
+  // Уход из раздела и возврат не показывают старый вердикт под новым текстом.
+  await go(app, "Атрибуты");
+  await go(app, "Проверка цели");
+  await expect(app.locator("#goalInput")).toHaveValue(GOAL + " в рамках проекта «Альфа»");
+  await expect(app.locator("#checkResult")).toHaveCount(0);
 });
 
 test("без подразделения применяются все правила, причина — в заметках", async ({ app }) => {
@@ -43,6 +96,29 @@ test("правило «только в» не применяется к друг
   await expect(result.locator(".violation")).toContainText("пункт 1.1");
 });
 
+test("правило только для студентов проверяется, когда цель ставит студент", async ({ app }) => {
+  // Сотрудник: правило для студентов не считается и в списке справа отмечено отдельно.
+  let result = await check(app, GOAL, "UCT");
+  await expect(result.getByText("не выполнено правил: 1 из 3")).toBeVisible();
+  await expect(app.getByText("правил: 3 · только для студентов: 1")).toBeVisible();
+  await expect(result.locator(".violation")).not.toContainText("наставника");
+
+  // Студент: правило проверяется, ответ помечен.
+  result = await check(app, GOAL, "UCT", true);
+  await expect(result.getByText("не выполнено правил: 2 из 4")).toBeVisible();
+  await expect(result.locator(".chip", { hasText: "студент" })).toBeVisible();
+  await expect(result.locator(".violation").filter({ hasText: "наставника" })).toContainText("Приказ ПР-02, пункт 4.2");
+  await expect(app.getByText("правил: 4")).toBeVisible();
+
+  // Признак уходит в запрос булевым полем.
+  await app.locator("#checkJson summary").click();
+  expect(JSON.parse(await app.locator("#checkJson pre").innerText())).toMatchObject({ is_student: true });
+
+  // Наставник назван — требование выполнено.
+  result = await check(app, GOAL + " под руководством наставника", "UCT", true);
+  await expect(result.getByText("не выполнено правил: 1 из 4")).toBeVisible();
+});
+
 test("главный экран показывает, что ждёт решения", async ({ app }) => {
   const todo = app.locator("#tab-check .todo");
   await todo.filter({ hasText: "Замечаний к данным: 2" }).getByRole("button", { name: "Открыть" }).click();
@@ -55,20 +131,22 @@ test("пустая цель не отправляется", async ({ app }) => {
 });
 
 test("недоступный API виден в боковой панели", async ({ page }) => {
-  // Сессия есть, а каталог не отвечает: интерфейс открыт, но данных нет.
+  // Токен есть, а каталог не отвечает: интерфейс открыт, но данных нет.
+  await page.addInitScript((tokens) => sessionStorage.setItem("gc.oidc", JSON.stringify(tokens)), mockTokens("admin"));
   await page.route(isApi, (route) => new URL(route.request().url()).pathname === "/api/auth/me"
-    ? route.fulfill({ json: { login: "admin", role: "admin", displayName: null } })
+    ? route.fulfill({ json: { login: "admin", role: "admin", displayName: null, tourSeenAt: "2025-01-10T09:05:00+00:00" } })
     : route.abort());
   await page.goto("/");
   await expect(page.locator(".side").getByText("API недоступен")).toBeVisible();
   await expect(toast(page, "Не удалось получить данные")).toBeVisible();
 });
 
-test("без связи с сервером формы входа нет — только повтор", async ({ page }) => {
+test("без связи с сервером вход не начинается — видна ошибка", async ({ page }) => {
   await page.route(isApi, (route) => route.abort());
   await page.goto("/");
-  await expect(page.getByText("Не удалось связаться с сервером")).toBeVisible();
-  await expect(page.getByLabel("Пароль")).toHaveCount(0);
+  await page.getByRole("button", { name: "Войти" }).click();
+  await expect(page.getByRole("alert")).toContainText("Сервис входа недоступен");
+  await expect(page).toHaveURL(/\/$/);
 });
 
 test("путь проверки показывается на графе", async ({ app }) => {
@@ -148,4 +226,24 @@ test.describe("читатель", () => {
     await expect(result.getByRole("button", { name: "Не согласен" })).toHaveCount(0);
     await expect(app.locator("#checkDispute")).toHaveCount(0);
   });
+});
+
+test("смена подразделения или «студента» во время проверки: ответ не показывается под новыми значениями", async ({ app }) => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await app.route("**/api/check-goal", async (route) => { await held; await route.fallback(); });
+  await app.getByLabel("Формулировка цели").fill(GOAL);
+  await choose(app.locator("#departmentInput"), { value: "UCT" });
+  await app.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
+  await expect(app.locator("#tab-check").getByRole("button", { name: /Проверяем/ })).toBeVisible();
+  // Пока проверка идёт, сменили подразделение и признак студента.
+  await choose(app.locator("#departmentInput"), { value: "FIN" });
+  await app.locator("#studentInput").check();
+  release();
+  await expect(app.locator("#tab-check").getByRole("button", { name: "Проверить" })).toBeEnabled();
+  await expect(app.locator("#checkResult")).toHaveCount(0);
+  // Вернули значения, с которыми проверяли, — ответ снова на месте.
+  await app.locator("#studentInput").uncheck();
+  await choose(app.locator("#departmentInput"), { value: "UCT" });
+  await expect(app.locator("#checkResult")).toBeVisible();
 });

@@ -51,13 +51,17 @@ export function ExamplesCheck({ onGoTo }: {
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // Неудачных опросов подряд: после сбоя следующий опрос всё равно ставится, но реже.
+  const [failures, setFailures] = useState(0);
 
   const load = useCallback(async () => {
     try {
       setReport(await api.examplesCheck());
       setError(null);
+      setFailures(0);
     } catch (err) {
       setError(errorText(err));
+      setFailures((n) => n + 1);
     }
   }, []);
 
@@ -66,9 +70,9 @@ export function ExamplesCheck({ onGoTo }: {
   const running = report?.state === "running";
   useEffect(() => {
     if (!running) return;
-    const timer = setTimeout(() => void load(), POLL_MS);
+    const timer = setTimeout(() => void load(), POLL_MS * 2 ** Math.min(failures, 5));
     return () => clearTimeout(timer);
-  }, [running, report, load]);
+  }, [running, report, failures, load]);
 
   async function start() {
     setStarting(true);

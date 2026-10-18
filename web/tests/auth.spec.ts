@@ -3,13 +3,17 @@ import type { Page } from "@playwright/test";
 import { MOCK_PASSWORD } from "../mock/backend";
 import { check, choose, expect, go, optionsOf, matrixRow, menu, mockApi, modal, openRule, orderDoc, panel, PROJECT, test, toast } from "./fixtures";
 
-/* Вход, выход и то, что интерфейс показывает каждой роли. Сами права
-   проверяет API (api/tests/test_auth.py) — здесь только то, что читатель
-   не видит кнопок, которые ему всё равно ответят отказом. */
+/* Вход через фейковый Keycloak (/api/idp), выход и то, что интерфейс
+   показывает каждой роли. Сами права проверяет API (api/tests/test_auth.py) —
+   здесь только то, что читатель не видит кнопок, которые ему всё равно
+   ответят отказом. */
 
 const userRow = (page: Page, login: string) => page.locator(`#tab-users tr[data-user="${login}"]`);
 
+/** Кнопка «Войти» уводит на страницу Keycloak; там логин и пароль, обратно — с кодом. */
 async function signIn(page: Page, login: string, password = MOCK_PASSWORD) {
+  await page.getByRole("button", { name: "Войти" }).click();
+  await expect(page).toHaveURL(/\/api\/idp\/auth\?/);
   await page.getByLabel("Логин").fill(login);
   await page.getByLabel("Пароль").fill(password);
   await page.getByRole("button", { name: "Войти" }).click();
@@ -25,26 +29,52 @@ test.describe("вход", () => {
     await page.goto("/");
     await expect(page.getByRole("button", { name: "Войти" })).toBeVisible();
     await expect(page.locator(".side")).toHaveCount(0);
-    expect(calls).toEqual(["/api/auth/me"]);
+    await expect(page.getByLabel("Пароль")).toHaveCount(0);
+    expect(calls).toEqual([]);
   });
 
-  test("неверный пароль: общая ошибка, поле пароля очищено", async ({ app }) => {
+  test("Keycloak открывается с PKCE и возвращает на тот же раздел", async ({ page }) => {
+    await mockApi(page, null);
+    await page.goto("/rules");
+    await page.getByRole("button", { name: "Войти" }).click();
+    await expect(page).toHaveURL(/\/api\/idp\/auth\?/);
+    const url = new URL(page.url());
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:4173/");
+    expect(url.searchParams.get("state")).toBeTruthy();
+
+    await page.getByLabel("Логин").fill("admin");
+    await page.getByLabel("Пароль").fill(MOCK_PASSWORD);
+    await page.getByRole("button", { name: "Войти" }).click();
+    await expect(page.getByText("API на связи")).toBeVisible();
+    await expect(page).toHaveURL(/\/rules$/);
+    expect(page.url()).not.toContain("code=");
+  });
+
+  test("неверный пароль: Keycloak не выпускает, каталог не виден", async ({ app }) => {
     await signIn(app, "admin", "wrong");
     await expect(app.getByRole("alert")).toContainText("Неверный логин или пароль");
-    await expect(app.getByLabel("Пароль")).toHaveValue("");
+    await expect(app).toHaveURL(/\/api\/idp\/auth/);
     await expect(app.locator(".side")).toHaveCount(0);
   });
 
   test("вход и выход", async ({ app }) => {
     await signIn(app, "Editor");
     await expect(app.locator(".side .who")).toContainText("Елена Редактор");
-    await expect(app.locator(".side .who")).toContainText("editor · редактор");
+    await expect(app.locator(".side .who")).toContainText("редактор");
+    await expect(app.locator(".side .who")).not.toContainText("editor");
     await expect(app.getByText("API на связи")).toBeVisible();
 
     await app.getByRole("button", { name: "Меню пользователя" }).click();
     await app.getByRole("menuitem", { name: "Выйти" }).click();
+    await app.getByRole("dialog").getByRole("button", { name: "Выйти" }).click();
     await expect(app.getByRole("button", { name: "Войти" })).toBeVisible();
-    await expect(app.getByLabel("Пароль")).toHaveValue("");
+    await expect(app.locator(".side")).toHaveCount(0);
+    // Токены забыты: перезагрузка не возвращает в приложение.
+    await app.reload();
+    await expect(app.getByRole("button", { name: "Войти" })).toBeVisible();
   });
 
   test("пароль не попадает в адресную строку и хранилища браузера", async ({ app }) => {
@@ -53,19 +83,222 @@ test.describe("вход", () => {
     expect(app.url()).not.toContain(MOCK_PASSWORD);
     const stored = await app.evaluate(() => JSON.stringify([{ ...localStorage }, { ...sessionStorage }]));
     expect(stored).not.toContain(MOCK_PASSWORD);
+    expect(stored).toContain("mock:admin");
+  });
+
+  test("вошедший в Keycloak без роли видит отказ, а не экран входа", async ({ app }) => {
+    await signIn(app, "stranger");
+    await expect(app.getByRole("alert")).toContainText("Доступ к интерфейсу не назначен");
+    await expect(app.locator(".side")).toHaveCount(0);
+    await app.getByRole("button", { name: "Войти другой учётной записью" }).click();
+    await expect(app.getByRole("button", { name: "Войти" })).toBeVisible();
   });
 });
 
-test("истёкшая сессия возвращает на экран входа", async ({ page }) => {
+test("закрытая в Keycloak сессия: окно входа поверх приложения, ввод переживает повторный вход", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  const goal = "Черновик цели, набранный до конца сессии";
+  await page.getByLabel("Формулировка цели").fill(goal);
+
+  backend.revoke();   // сессия закончилась на стороне Keycloak
+  await page.getByRole("button", { name: "Меню пользователя" }).click();
+  await page.getByRole("menuitem", { name: "Обновить" }).click();
+  const lost = page.getByRole("alertdialog", { name: "Сессия завершена" });
+  await expect(lost).toBeVisible();
+  // Приложение не размонтировано: раздел и ввод на месте.
+  await expect(page.locator(".side")).toBeVisible();
+  await expect(page.getByLabel("Формулировка цели")).toHaveValue(goal);
+
+  // «Не сейчас» оставляет на странице: вместо окна — плашка; фоновые запросы окно не поднимают.
+  await lost.getByRole("button", { name: "Не сейчас" }).click();
+  await expect(lost).toHaveCount(0);
+  const bar = page.locator(".session-bar");
+  await expect(bar).toContainText("Сессия завершена");
+
+  await page.getByRole("button", { name: "Меню пользователя" }).click();
+  await page.getByRole("menuitem", { name: "Обновить" }).click();
+  await expect(toast(page, "Не удалось получить данные")).toBeVisible();
+  await expect(lost).toHaveCount(0);
+  await expect(bar).toBeVisible();
+
+  // Окно открывает сам пользователь — кнопкой на плашке.
+  await bar.getByRole("button", { name: "Войти" }).click();
+  await lost.getByRole("button", { name: "Войти снова" }).click();
+  await relogin(page);
+  await expect(page.getByLabel("Формулировка цели")).toHaveValue(goal);
+  await expect(toast(page, "Несохранённый ввод восстановлен")).toBeVisible();
+});
+
+/** Страница входа фейкового Keycloak после «Войти снова». */
+async function relogin(page: Page) {
+  await expect(page).toHaveURL(/\/api\/idp\/auth\?/);
+  await page.getByLabel("Логин").fill("admin");
+  await page.getByLabel("Пароль").fill(MOCK_PASSWORD);
+  await page.getByRole("button", { name: "Войти" }).click();
+  await expect(page.getByText("API на связи")).toBeVisible();
+}
+
+test("после «Не сейчас» отказ на действие пользователя (запись) снова открывает окно", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  backend.revoke();
+  await page.getByRole("button", { name: "Меню пользователя" }).click();
+  await page.getByRole("menuitem", { name: "Обновить" }).click();
+  const lost = page.getByRole("alertdialog", { name: "Сессия завершена" });
+  await lost.getByRole("button", { name: "Не сейчас" }).click();
+  await expect(page.locator(".session-bar")).toBeVisible();
+
+  await page.getByLabel("Формулировка цели").fill("Улучшить работу с заявками");
+  await page.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
+  await expect(lost).toBeVisible();
+});
+
+test("черновики окна свойств и советчика переживают повторный вход", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
   await expect(page.getByText("API на связи")).toBeVisible();
 
-  backend.handle("POST", "/auth/logout");   // сессия закончилась на сервере
-  await page.getByRole("button", { name: "Меню пользователя" }).click();
-  await page.getByRole("menuitem", { name: "Обновить" }).click();
-  await expect(page.getByText("Сессия завершена. Войдите снова.")).toBeVisible();
-  await expect(page.locator(".side")).toHaveCount(0);
+  // Окно свойств узла: правка значения, сессия кончилась на сохранении.
+  await go(page, "Приказы");
+  await menu(orderDoc(page), "Свойства");
+  await modal(page).getByRole("button", { name: "+ Свойство" }).click();
+  const row = modal(page).locator(".prop-row").last();
+  await row.getByLabel("Имя свойства").fill("note");
+  await row.getByLabel("Значение свойства").fill("введено до конца сессии");
+  backend.revoke();
+  await modal(page).getByRole("button", { name: "Сохранить" }).dispatchEvent("click");
+  const lost = page.getByRole("alertdialog", { name: "Сессия завершена" });
+  await lost.getByRole("button", { name: "Войти снова" }).click();
+  await relogin(page);
+  const props = modal(page).getByRole("dialog", { name: /Свойства узла/ });
+  await expect(props).toBeVisible();
+  await expect(props.locator(".prop-row").last().getByLabel("Значение свойства")).toHaveValue("введено до конца сессии");
+  await props.getByRole("button", { name: "Сохранить" }).click();
+  await expect(toast(page, "Свойства сохранены")).toBeVisible();
+
+  // Советчик: набранное обоснование.
+  const result = await check(page, "Снизить долю просроченных заявок до 5% к 31.12.2025");
+  await result.locator(".violation").getByRole("button", { name: "Не согласен" }).click();
+  const advice = modal(page).getByRole("dialog", { name: "Правка графа под ожидаемый ответ" });
+  await advice.getByLabel("Обоснование").fill("обоснование до конца сессии");
+  backend.revoke();
+  // Фоновый запрос мог уже получить отказ и поднять окно поверх советчика: нажатие — событием.
+  await advice.getByRole("button", { name: "Предложить правку" }).dispatchEvent("click");
+  await lost.getByRole("button", { name: "Войти снова" }).click();
+  await relogin(page);
+  await expect(advice).toBeVisible();
+  await expect(advice.getByLabel("Обоснование")).toHaveValue("обоснование до конца сессии");
+  await expect(advice.locator("#adviceAttribute")).toContainText("проект");
+});
+
+test("сбои API посреди работы: 503 не выкидывает из сессии, оборванный ответ — ошибка, а не пустые данные", async ({ page }) => {
+  await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  const refresh = async () => {
+    await page.getByRole("button", { name: "Меню пользователя" }).click();
+    await page.getByRole("menuitem", { name: "Обновить" }).click();
+  };
+
+  // Ротация ключей подписи: API отвечает 503, пока не прочитал новый ключ.
+  let unavailable = true;
+  await page.route("**/api/catalog/tree*", (route) => unavailable
+    ? route.fulfill({ status: 503, contentType: "application/json", headers: { "Retry-After": "1" },
+      body: JSON.stringify({ detail: "Ключ подписи ещё не прочитан" }) })
+    : route.fallback());
+  await refresh();
+  await expect(toast(page, "Ключ подписи ещё не прочитан")).toBeVisible();
+  await expect(page.getByRole("alertdialog", { name: "Сессия завершена" })).toHaveCount(0);
+  await expect(page.locator(".session-bar")).toHaveCount(0);
+  // Повтор проходит, токены на месте.
+  unavailable = false;
+  await refresh();
+  await expect(page.getByText("API на связи")).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem("gc.oidc"))).toContain("mock:admin");
+
+  // Ответ 200, оборванный посередине.
+  await page.unroute("**/api/catalog/tree*");
+  await page.route("**/api/catalog/tree*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: '{"orders": [{"nodeId": "o:1", ' }));
+  await refresh();
+  await expect(toast(page, "API вернул неразборчивый ответ")).toBeVisible();
+  await expect(page.locator(".crash")).toHaveCount(0);
+});
+
+test("черновик другого пользователя после входа не показывается", async ({ page }) => {
+  await mockApi(page, null);
+  await page.addInitScript(() => sessionStorage.setItem("gc.drafts", JSON.stringify({
+    owner: "editor", savedAt: Date.now(), items: { check: { mode: "single", goal: "чужой черновик", departmentId: "", isStudent: false, rows: [] } },
+  })));
+  await page.goto("/");
+  await signIn(page, "admin");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByLabel("Формулировка цели")).toHaveValue("");
+});
+
+test("ошибка из адресной строки без начатого входа не показывается", async ({ page }) => {
+  await mockApi(page, null);
+  await page.goto("/rules?error=access_denied&error_description=" + encodeURIComponent("Позвоните по номеру") + "&state=чужой");
+  await expect(page.getByRole("button", { name: "Войти" })).toBeVisible();
+  await expect(page.getByText("Позвоните по номеру")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/rules$/);
+});
+
+test("Keycloak недоступен при обновлении токена: токены не стираются, вход не теряется", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.addInitScript(() => {
+    const raw = sessionStorage.getItem("gc.oidc");
+    if (raw) sessionStorage.setItem("gc.oidc", JSON.stringify({ ...JSON.parse(raw), expiresAt: Date.now() - 1 }));
+  });
+  await page.route("**/api/idp/token", (route) => route.abort("connectionrefused"));
+  await page.goto("/");
+  await expect(page.getByText("Сервис входа недоступен").first()).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem("gc.oidc"))).toContain("mock-refresh:admin");
+
+  // Keycloak вернулся: «Повторить» входит с теми же токенами, без страницы входа.
+  await page.unroute("**/api/idp/token");
+  await page.getByRole("button", { name: "Повторить" }).click();
+  await expect(page.getByText("API на связи")).toBeVisible();
+  expect(backend.handle("GET", "/auth/me", undefined, { authorization: "Bearer mock:admin" }).status).toBe(200);
+});
+
+test("Keycloak ответил 429 при обновлении токена: это не «сессия закрыта», токены не стираются", async ({ page }) => {
+  await mockApi(page, "admin");
+  await page.addInitScript(() => {
+    const raw = sessionStorage.getItem("gc.oidc");
+    if (raw) sessionStorage.setItem("gc.oidc", JSON.stringify({ ...JSON.parse(raw), expiresAt: Date.now() - 1 }));
+  });
+  let limited = true;
+  await page.route("**/api/idp/token", (route) => limited
+    ? route.fulfill({ status: 429, contentType: "application/json", body: JSON.stringify({ error: "too_many_requests" }) })
+    : route.fallback());
+  await page.goto("/");
+  await expect(page.getByText("Сервис входа недоступен").first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => sessionStorage.getItem("gc.oidc"))).toContain("mock-refresh:admin");
+
+  limited = false;
+  await page.getByRole("button", { name: "Повторить" }).click();
+  await expect(page.getByText("API на связи")).toBeVisible();
+});
+
+test("истёкший токен обновляется незаметно", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  const refreshes: string[] = [];
+  page.on("request", (r) => { if (r.url().endsWith("/api/idp/token")) refreshes.push(r.postData() ?? ""); });
+  await page.addInitScript(() => {
+    const raw = sessionStorage.getItem("gc.oidc");
+    if (raw) sessionStorage.setItem("gc.oidc", JSON.stringify({ ...JSON.parse(raw), expiresAt: Date.now() - 1 }));
+  });
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  expect(refreshes.length).toBeGreaterThanOrEqual(1);
+  expect(refreshes[0]).toContain("grant_type=refresh_token");
+  expect(backend.handle("GET", "/auth/me", undefined, { authorization: "Bearer mock:admin" }).status).toBe(200);
 });
 
 test.describe("читатель", () => {
@@ -77,7 +310,7 @@ test.describe("читатель", () => {
 
     // Граф каталога открыт всем ролям.
     await go(app, "Граф");
-    await expect(app.locator("#tab-graph .node")).toHaveCount(14);
+    await expect(app.locator("#tab-graph .node")).toHaveCount(17);
     await app.locator('#tab-graph .node[data-node="r:1"] .dot').click();
     await expect(app.locator("#tab-graph aside")).toContainText("действует только в");
 
@@ -163,13 +396,13 @@ test.describe("администратор", () => {
     await expect(userRow(app, "i.ivanov")).toHaveCount(0);
   });
 
-  test("заблокированный пользователь войти не может", async ({ page }) => {
-    const backend = await mockApi(page, "admin");
-    backend.handle("PATCH", "/auth/users/editor", { status: "blocked" });
-    backend.handle("POST", "/auth/logout");
+  test("заблокированный пользователь в интерфейс не попадает", async ({ page }) => {
+    const backend = await mockApi(page, null);
+    backend.handle("PATCH", "/auth/users/editor", { status: "blocked" }, { authorization: "Bearer mock:admin" });
     await page.goto("/");
     await signIn(page, "editor");
-    await expect(page.getByRole("alert")).toContainText("доступ к интерфейсу не назначен");
+    await expect(page.getByRole("alert")).toContainText("Доступ к интерфейсу не назначен");
+    await expect(page.locator(".side")).toHaveCount(0);
   });
 });
 
