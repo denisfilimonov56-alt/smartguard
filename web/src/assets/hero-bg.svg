@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 600" preserveAspectRatio="xMidYMid slice">
+  <!-- Синий фон блоков ввода: градиент и наклонные полупрозрачные плоскости,
+       как на фонах презентаций из дизайн-библиотеки ОЭЗ «Алабуга». -->
+  <defs>
+    <linearGradient id="base" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#083a98"/>
+      <stop offset="0.45" stop-color="#0c6ff1"/>
+      <stop offset="1" stop-color="#3a95ff"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="beam2" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#041f5c" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#041f5c" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="8"/></filter>
+    <filter id="softer" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="22"/></filter>
+  </defs>
+  <rect width="1600" height="600" fill="url(#base)"/>
+  <g transform="rotate(-32 1100 300)">
+    <rect x="1180" y="-700" width="520" height="2000" rx="90" fill="url(#beam2)" filter="url(#softer)"/>
+    <rect x="960" y="-700" width="300" height="2000" rx="70" fill="url(#beam)" filter="url(#soft)"/>
+    <rect x="740" y="-700" width="150" height="2000" rx="50" fill="url(#beam)" opacity="0.7" filter="url(#soft)"/>
+    <rect x="1320" y="-700" width="110" height="2000" rx="40" fill="#ffffff" opacity="0.08"/>
+  </g>
+  <rect width="1600" height="600" fill="url(#shade)"/>
+</svg>

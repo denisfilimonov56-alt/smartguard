@@ -1,0 +1,55 @@
+# Интерфейс и API на одном origin: статика из образа, /api — в сервис api.
+# Благодаря этому cookie сессии ходит только «своему» сайту (SameSite=Strict),
+# CORS не нужен вовсе, а порт API наружу не публикуется.
+#
+# Файл — шаблон: при старте контейнера nginx подставляет ${TRUSTED_PROXY}
+# (см. /docker-entrypoint.d/20-envsubst-on-templates.sh в образе nginx).
+
+# TLS завершается на внешнем прокси. Его адрес (или подсеть) — в TRUSTED_PROXY:
+# тогда настоящий адрес клиента берётся из X-Forwarded-For этого прокси и
+# попадает в журнал аудита и в ограничение перебора паролей. От остальных
+# источников заголовок не принимается — подделать адрес им нельзя.
+set_real_ip_from ${TRUSTED_PROXY};
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+server {
+    listen 80;
+    server_name _;
+    server_tokens off;
+    root /usr/share/nginx/html;
+
+    # Страница не встраивается во фреймы и грузит скрипты только со своего
+    # origin. 'unsafe-inline' у стилей нужен React-атрибутам style, data: —
+    # значку страницы. HSTS действует, когда страница открыта по HTTPS.
+    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    # Служебные маршруты API — только с самого сервера (localhost:8080).
+    location ~ ^/api/(ready|docs|openapi\.json)$ {
+        return 404;
+    }
+
+    location /api/ {
+        # Имя сервиса разрешается при каждом запросе, а не один раз на старте:
+        # пересозданный контейнер api получает новый адрес.
+        resolver 127.0.0.11 valid=10s;
+        set $api http://api:8080;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass $api;
+
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Пакетная проверка целей ждёт модель минутами.
+        proxy_read_timeout 600s;
+        client_max_body_size 2m;
+    }
+}

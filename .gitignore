@@ -1,0 +1,32 @@
+# .env с тестовыми значениями лежит в git, чтобы стек поднимался сразу
+# после pull. Секреты (HF_TOKEN и т. п.) — только в .env.local.
+.env.local
+
+# Офлайн-набор: образы и веса модели готовятся scripts/offline/prepare.sh
+# и передаются на сервер отдельно, в git им не место (десятки гигабайт).
+dist/
+models/
+
+# Корневой сертификат домена для LDAPS: у каждого сервера свой.
+certs/*
+!certs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Дампы базы, которые README предлагает делать перед миграциями
+*.dump
+
+# Локальное окружение Python
+.venv/
+
+# Интерфейс: зависимости и артефакты сборки и тестов
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
