@@ -29,7 +29,8 @@ class FakeGraph:
     def __call__(self, query, **params):
         key_id = params.get("key_id")
         if "MERGE (s:Setting" in query:
-            self.settings[params["key"]] = params["value"]
+            for row in params["rows"]:
+                self.settings[row["key"]] = row["value"]
             return []
         if "CREATE (k:ApiKey" in query:
             self.keys[key_id] = {"keyId": key_id, "name": params["name"], "hash": params["hash"],

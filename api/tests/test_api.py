@@ -3,6 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import audit
 import auth
 import catalog
 import diagnostics
@@ -24,6 +25,15 @@ BROKEN = {
     "check_targets": 3, "ready": False,
     "problems": ["Атрибуты без описания: проект"],
 }
+
+
+@pytest.fixture(autouse=True)
+def fresh_anonymous_counter():
+    """Счётчик анонимных отказов по адресу (audit) не переходит из теста в тест:
+    все тесты идут с одного адреса и за минуту исчерпали бы его."""
+    audit.flush_anonymous()
+    yield
+    audit.flush_anonymous()
 
 
 @pytest.fixture
@@ -86,36 +96,11 @@ def test_ready_503_when_llm_down(client, monkeypatch):
     assert response.status_code == 503
     body = response.json()
     assert body["llm"] is False and body["neo4j"] is True
-    assert any("vLLM" in p for p in body["problems"])
+    assert any(p.startswith("Модель недоступна") for p in body["problems"])
     assert seen["timeout"] == 2
 
 
-def test_vllm_alive_asks_health_with_timeout(monkeypatch):
-    seen = {}
-
-    class Response:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def urlopen(url, timeout):
-        seen.update(url=url, timeout=timeout)
-        return Response()
-
-    monkeypatch.setenv("VLLM_URL", "http://vllm:8000/v1")
-    monkeypatch.setattr(monitoring.urllib.request, "urlopen", urlopen)
-    assert monitoring.vllm_alive(2) is True
-    assert seen == {"url": "http://vllm:8000/health", "timeout": 2}
-
-    def down(url, timeout):
-        raise OSError("connection refused")
-
-    monkeypatch.setattr(monitoring.urllib.request, "urlopen", down)
-    assert monitoring.vllm_alive(2) is False
+# Проверка готовности модели (GET /v1/models) — в test_audit_model.py.
 
 
 def test_queue_timeout_is_503_with_retry_after(client, monkeypatch):
@@ -332,6 +317,16 @@ def test_check_goal_passes_department(client, monkeypatch):
     assert response.json()["seen_department"] == "UCT"
 
 
+def test_check_goal_department_is_limited_and_blank_is_none(client, monkeypatch):
+    monkeypatch.setattr(main, "check_goal",
+                        lambda goal, department_id=None, is_student=None: {"seen_department": department_id})
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": "x" * 101}).status_code == 422
+    response = client.post("/check-goal", json={"goal": "цель", "department_id": "  "})
+    assert response.json()["seen_department"] is None
+    response = client.post("/check-goal", json={"goal": "цель", "department_id": " UCT "})
+    assert response.json()["seen_department"] == "UCT"
+
+
 def test_check_goal_requires_goal_field(client):
     assert client.post("/check-goal", json={}).status_code == 422
 
@@ -391,7 +386,7 @@ def test_check_goals_accepts_numeric_ids_and_returns_them_as_strings(client, mon
 def test_check_goals_id_is_optional(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "check_goals",
-                        lambda items: seen.setdefault("items", items) or {"results": [], "summary": {}})
+                        lambda items: seen.update(items=items) or {"results": [], "summary": {}})
     client.post("/check-goals", json=[{"goal": "без id", "department_id": "UCT"}])
     assert seen["items"] == [{"goal": "без id", "department_id": "UCT", "is_student": None, "id": None}]
 
@@ -399,7 +394,7 @@ def test_check_goals_id_is_optional(client, monkeypatch):
 def test_check_goals_passes_student_flag(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "check_goals",
-                        lambda items: seen.setdefault("items", items) or {"results": [], "summary": {}})
+                        lambda items: seen.update(items=items) or {"results": [], "summary": {}})
     client.post("/check-goals", json=[{"goal": "студент", "department_id": "UCT", "is_student": True}])
     assert seen["items"][0]["is_student"] is True
 

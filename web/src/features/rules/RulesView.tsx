@@ -30,7 +30,7 @@ export function RulesView() {
 }
 
 function Matrix() {
-  const { orders, departments, showArchived, reload, openRule, openWizard, panelRule } = useCatalog();
+  const { orders, departments, showArchived, reload, openRule, openWizard, panelRule, savingRule } = useCatalog();
   const actions = useActions();
   const { canEdit } = useAuth();
   const editCell = useCellEditor();
@@ -66,7 +66,8 @@ function Matrix() {
         const key = rule.nodeId + d.nodeId;
         return (
           <td key={d.nodeId}>
-            <button className={`cell-btn ${focus === key ? "focus" : ""}`} data-state={state} disabled={!canEdit}
+            <button className={`cell-btn ${focus === key ? "focus" : ""}`} data-state={state}
+              disabled={!canEdit || savingRule === rule.nodeId} title={savingRule === rule.nodeId ? "Сохраняется…" : undefined}
               aria-label={`${rule.description} — ${d.name || d.departmentId}: ${STATE_LABEL[state]}`}
               onClick={(e) => open(rule, d, e.currentTarget)} onBlur={() => setFocus(null)}>
               <Cell state={state} />

@@ -13,6 +13,8 @@
    выход), а токены — строки вида mock:<логин>. Учётки фейка: admin, editor,
    viewer — пароль у всех MOCK_PASSWORD. */
 
+import { PROPERTY_MAX_CHARS, TEXT_LIMITS } from "../src/api/limits";
+
 type Props = Record<string, unknown>;
 type Role = "viewer" | "editor" | "admin";
 
@@ -192,6 +194,12 @@ function seed() {
 /** bulkBusy — столько первых запросов /check-goals получат 503 с Retry-After: 1, как API сверх BULK_MAX_REQUESTS. */
 export function createBackend(options: { user?: string; firstLogin?: boolean; bulkBusy?: number } = {}) {
   let bulkBusy = options.bulkBusy ?? 0;
+  // Следующий /check-goals проверит только столько целей, остальные вернёт непроверенными
+  // (unchecked), как API, чей пакет остановлен по сроку BULK_DEADLINE_SECONDS; null — проверит все.
+  let bulkStopAfter: number | null = null;
+  // Столько следующих целей /check-goals вернутся ручной проверкой с FAILURE_NOTE, как у API при
+  // временном сбое модели (agent.check_goal: исключение при проверке цели).
+  let bulkFailures = 0;
   const data = seed();
   const mockUser = (login: string, role: Role, displayName: string | null, builtin = false): MockUser =>
     ({ login, role, status: "active", displayName, builtin, createdAt: builtin ? null : "2025-01-10T09:00:00+00:00",
@@ -432,8 +440,29 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     return only.map((d) => departmentById(d)!.id);
   }
 
+  /* Оптимистичная блокировка — как catalog._assert_unchanged и _assert_links_unchanged: правка несёт
+     значения или набор связей, которые видел редактор (expected); если в базе уже другие — 409
+     с STALE_MESSAGE, ничего не записано. Без expected — запись как раньше. */
+  const STALE = "Узел изменён другим пользователем — обновите страницу и повторите правку";
+  const sameValue = (current: unknown, expected: unknown): boolean =>
+    Array.isArray(current) && Array.isArray(expected)
+      ? current.length === expected.length && current.every((c, i) => sameValue(c, expected[i]))
+      : (current ?? null) === (expected ?? null);
+  function assertUnchanged(n: Node, expected: unknown) {
+    if (expected == null) return;
+    const changed = Object.entries(expected as Props).filter(([k, v]) => !sameValue(n.props[k], v)).map(([k]) => k).sort();
+    if (changed.length) throw new HttpError(409, `${STALE}. Изменились: ${changed.join(", ")}`);
+  }
+  function assertLinksUnchanged(current: unknown[], expected: unknown) {
+    if (expected == null) return;
+    const want = new Set(expected as unknown[]);
+    const have = new Set(current);
+    if (want.size !== have.size || [...want].some((v) => !have.has(v))) throw new HttpError(409, STALE);
+  }
+
   function setRuleScope(id: string, body: any) {
     ofLabel(id, "Rule");
+    assertLinksUnchanged(onlyIn.filter(([rule]) => rule === id).map(([, d]) => nodes.get(d)?.props.departmentId), body.expected);
     const only: string[] = body.only ?? [];
     const ids = scopeDepartments(only);
     onlyIn = [...onlyIn.filter(([rule]) => rule !== id), ...ids.map((d): [string, string] => [id, d])];
@@ -492,8 +521,19 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     return { deleted: id, ...stats };
   }
 
-  function patch(id: string, properties: Props) {
+  function patch(id: string, properties: Props, expected?: unknown) {
     const n = get(id);
+    // Как catalog._checked_value: известные текстовые свойства — только строка в своём пределе длины,
+    // прочие строки — до PROPERTY_MAX_CHARS; 422 до записи и до сверки expected.
+    for (const [k, v] of Object.entries(properties)) {
+      const limit = TEXT_LIMITS[n.label]?.[k];
+      if (limit !== undefined && v !== null && typeof v !== "string")
+        throw new HttpError(422, `Свойство '${k}' — текст: значение должно быть строкой`);
+      const max = limit ?? PROPERTY_MAX_CHARS;
+      if (typeof v === "string" && v.length > max)
+        throw new HttpError(422, `Свойство '${k}': не длиннее ${max} символов, сейчас ${v.length}`);
+    }
+    assertUnchanged(n, expected);
     const key = BUSINESS_KEYS[n.label];
     if ("status" in properties) throw new HttpError(409, "Свойство 'status' меняется отдельной операцией");
     if (key && key in properties) {
@@ -526,8 +566,9 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     return names.map((name) => find(name)!.id);
   }
 
-  function setRuleTargets(id: string, names: string[]) {
+  function setRuleTargets(id: string, names: string[], expected?: unknown) {
     ofLabel(id, "Rule");
+    assertLinksUnchanged(ruleTargets(id), expected);
     const ids = targetIds(names);
     appliesTo = [...appliesTo.filter(([r]) => r !== id), ...ids.map((t): [string, string] => [id, t])];
     return { targets: ruleTargets(id) };
@@ -1001,6 +1042,8 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         const present = detected.includes(name);
         const prohibition = r.props.type === "PROHIBITION";
         if (prohibition ? !present : present) continue;
+        // Как agent: требование на атрибуте, который не сравнили с инструкциями, не нарушено и не выполнено.
+        if (!prohibition && unverified && jobNames.includes(name)) continue;
         violations.push({
           rule_node_id: r.id,
           order_number: order.props.number ?? null, order_title: order.props.title ?? null,
@@ -1036,7 +1079,10 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       is_student: isStudent,
       detected_attributes: detected, attribute_quotes: settings.evidenceQuotes ? quotesByKeywords(goal) : {},
       smart: settings.smartCheck && (!batchId || settings.smartCheckBulk) ? smartScores(goal) : null,
-      violations, notes,
+      violations,
+      // Правила на атрибутах, которые не удалось сравнить с инструкциями: ни ✓, ни ✕.
+      unverified_rule_node_ids: unverified ? jobRules.map((r) => r.id) : [],
+      notes,
     };
   }
 
@@ -1071,12 +1117,26 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
 
   /** Пакетная проверка — как main.check_many: поля проверяются схемой GoalItem, затем
       предел размера и выключатель. */
-  function checkGoals(body: unknown) {
-    // Как api/main.py: одновременных пакетов больше BULK_MAX_REQUESTS — 503 и Retry-After.
-    if (bulkBusy > 0) {
-      bulkBusy--;
-      throw new HttpError(503, "Слишком много одновременных пакетных проверок, повторите позже", { "Retry-After": "1" });
+  /* Лимит проверок в минуту — как auth.RateLimit: скользящее окно в 60 с на пользователя,
+     списывается на каждую цель запроса. Запрос крупнее самого лимита проходит при пустом окне.
+     Часы фейка сдвигает тест (advanceClock), чтобы не ждать минуту. */
+  let clockShift = 0;
+  const spent = new Map<string, [number, number][]>();
+  function spendChecks(goals: number) {
+    const limit = Number(settings.checkRatePerMinute);
+    if (limit <= 0) return;
+    const now = (Date.now() + clockShift) / 1000;
+    const window = (spent.get(current ?? "") ?? []).filter(([at]) => now - at <= 60);
+    spent.set(current ?? "", window);
+    const used = window.reduce((sum, [, n]) => sum + n, 0);
+    if (window.length && used + goals > limit) {
+      const wait = Math.floor(window[0][0] + 60 - now) + 1;
+      throw new HttpError(429, `Слишком много проверок за минуту. Повторите через ${wait} с.`, { "Retry-After": String(wait) });
     }
+    window.push([now, goals]);
+  }
+
+  function checkGoals(body: unknown) {
     if (!Array.isArray(body)) throw new HttpError(422, "Ожидался массив целей");
     const items = body.map((item: any) => ({
       goal: goalText(item?.goal, settings.goalMaxChars as number),
@@ -1088,11 +1148,33 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       throw new HttpError(413, `За один раз можно проверить не более ${MAX_GOALS_PER_REQUEST} целей, передано ${items.length}`);
     if (!settings.bulkChecks)
       throw new HttpError(503, "Пакетная проверка временно отключена администратором. Цели можно проверять по одной");
+    // Как api/main.py: одновременных пакетов больше BULK_MAX_REQUESTS — 503 и Retry-After.
+    if (bulkBusy > 0) {
+      bulkBusy--;
+      throw new HttpError(503, "Слишком много одновременных пакетных проверок, повторите позже", { "Retry-After": "1" });
+    }
+    // Как api/main.py: квота за непроверенные цели возвращается — списываются только проверенные.
+    const checkedCount = bulkStopAfter === null ? items.length : Math.min(bulkStopAfter, items.length);
+    bulkStopAfter = null;
+    spendChecks(checkedCount);
     const batchId = (++counter).toString(16);
-    const results = items.map((item) => ({
+    const results = items.map((item, i) => i < checkedCount && bulkFailures > 0 && bulkFailures-- ? {
+      // Как agent.failure_review: без анализа цели, с пометкой retryable.
+      id: item.id, goal: item.goal, status: "NEEDS_MANUAL_REVIEW", allowed: false, department: null,
+      is_student: item.is_student, detected_attributes: [], attribute_quotes: {}, smart: null, violations: [],
+      unverified_rule_node_ids: [], retryable: true,
+      notes: ["Проверку не удалось завершить из-за временного сбоя сервиса. Требуется ручная проверка."],
+    } : i < checkedCount ? {
       id: item.id,
       ...checkGoal(item.goal, item.department_id, item.is_student, batchId),
-    }));
+    } : {
+      // Как agent.unchecked_review: ручная проверка с пометкой и без анализа цели.
+      id: item.id, goal: item.goal, status: "NEEDS_MANUAL_REVIEW", allowed: false, department: null,
+      is_student: item.is_student, detected_attributes: [], attribute_quotes: {}, smart: null, violations: [],
+      unverified_rule_node_ids: [], unchecked: true,
+      notes: ["Цель не проверена: пакет не уложился в отведённое время или запрос был прерван. "
+        + "Отправьте её на проверку повторно."],
+    });
     const count = (status: string) => results.filter((r) => r.status === status).length;
     return { results, summary: { total: results.length, allowed: count("ALLOWED"),
       violations: count("VIOLATIONS_FOUND"), manual_review: count("NEEDS_MANUAL_REVIEW") } };
@@ -1141,7 +1223,10 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       const department = body?.department_id;
       if (department != null && typeof department !== "string")
         throw new HttpError(422, "department_id: Input should be a valid string");
-      return checkGoal(goalText(body?.goal, settings.goalMaxChars as number), department ?? null, studentFlag(body?.is_student));
+      const goal = goalText(body?.goal, settings.goalMaxChars as number);
+      const isStudent = studentFlag(body?.is_student);
+      spendChecks(1);
+      return checkGoal(goal, department ?? null, isStudent);
     }
     if (method === "POST" && path === "/check-goals") return checkGoals(body);
 
@@ -1152,7 +1237,7 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     }
     if ((p = m(/^\/catalog\/nodes\/([^/]+)\/(properties|status|descendants)$/))) {
       const id = decodeURIComponent(p[1]);
-      if (p[2] === "properties" && method === "PATCH") return patch(id, body?.properties ?? {});
+      if (p[2] === "properties" && method === "PATCH") return patch(id, body?.properties ?? {}, body?.expected);
       if (p[2] === "status" && method === "POST") {
         if (body?.status !== "active" && body?.status !== "archived")
           throw new HttpError(422, "status: Input should be 'active' or 'archived'");
@@ -1210,6 +1295,8 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         return jobNode(n);
       }
       if (method === "PUT" && !p[2]) {
+        // expected — название и текст, как их видел редактор: чужая правка — 409, ничего не записано.
+        assertUnchanged(n, body.expected);
         const changed = String(body.text).trim() !== n.props.text;
         Object.assign(n.props, { title: String(body.title).trim(), text: String(body.text).trim() });
         if (!changed) return jobNode(n);
@@ -1228,6 +1315,8 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         const duties = [...new Set((body.duties as string[]).map((d) => String(d).split(/\s+/).join(" ").trim())
           .filter(Boolean))];
         if (duties.length > 300) throw new HttpError(409, `Слишком длинный список обязанностей: ${duties.length}, допустимо 300`);
+        // expected — список, который видел редактор; в базе уже другой (выписали заново, поправил другой) — 409.
+        if (body.expected != null && !sameValue(n.props.duties ?? [], body.expected)) throw new HttpError(409, STALE);
         Object.assign(n.props, { duties, dutiesReviewed: true, dutiesStatus: "ready", dutiesError: null });
         return jobNode(n);
       }
@@ -1249,10 +1338,11 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     if (method === "PUT" && (p = m(/^\/catalog\/rules\/([^/]+)\/departments$/)))
       return setRuleScope(decodeURIComponent(p[1]), body ?? {});
     if (method === "PUT" && (p = m(/^\/catalog\/rules\/([^/]+)\/targets$/)))
-      return setRuleTargets(decodeURIComponent(p[1]), body.targets ?? []);
+      return setRuleTargets(decodeURIComponent(p[1]), body.targets ?? [], body.expected);
     if (method === "PUT" && (p = m(/^\/catalog\/clauses\/([^/]+)\/references$/))) {
       const id = decodeURIComponent(p[1]);
       ofLabel(id, "Clause");
+      assertLinksUnchanged(references.filter(([a]) => a === id).map(([, b]) => b), body.expected);
       const to = (body.references as string[]) ?? [];
       if (to.includes(id)) throw new HttpError(409, "Пункт не может ссылаться сам на себя");
       to.forEach((target) => ofLabel(target, "Clause"));
@@ -1279,6 +1369,12 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     revoke() { revoked = true; },
     /** Следующие n запросов /check-goals получат 503 «очередь занята» с Retry-After: 1. */
     busyBulk(n: number) { bulkBusy = n; },
+    /** Следующий /check-goals проверит n целей, остальные вернёт с unchecked: true (срок пакета вышел). */
+    stopBulkAfter(n: number) { bulkStopAfter = n; },
+    /** Следующие n целей /check-goals получат ручную проверку из-за временного сбоя модели (FAILURE_NOTE). */
+    failBulkGoals(n: number) { bulkFailures = n; },
+    /** Сдвинуть часы фейка вперёд: окно лимита проверок в минуту освобождается без ожидания. */
+    advanceClock(seconds: number) { clockShift += seconds * 1000; },
     /** Выписка обязанностей инструкции «зависла»: pending остался, а задачи нет (API перезапускался). */
     stallDuties(nodeId: string) {
       const n = nodes.get(nodeId);

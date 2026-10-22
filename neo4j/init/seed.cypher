@@ -32,14 +32,17 @@
 //  стека, поэтому данных в нём нет: иначе каждый `docker compose up`
 //  откатывал бы правки из интерфейса.
 //
-//  Данные каталога — в data.cypher рядом. Источник истины — сама база;
-//  зафиксировать её состояние в репозитории (на хосте):
+//  Данные каталога — в data.cypher рядом: выгрузка этого сервера, в git
+//  её нет (образец — data.example.cypher). Источник истины — сама база;
+//  выгрузить её состояние (на хосте, через временный файл):
 //
-//      docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher
+//      docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher.new \
+//        && mv neo4j/init/data.cypher.new neo4j/init/data.cypher
 //
 //  Сидер применяет data.cypher только к пустому каталогу (первый запуск
-//  на новой базе) или по явному флагу — тогда MERGE возвращает каталог к
-//  состоянию файла:
+//  на новой базе) или по явному флагу — тогда в одной транзакции удаляет
+//  узлы каталога и загружает файл (пользователи, ключи, настройки и
+//  история не трогаются). Нет файла — только схема.
 //
 //      docker compose run --rm -e SEED_DATA=1 seeder
 //
@@ -90,6 +93,10 @@ FOR (s:Setting) REQUIRE s.key IS UNIQUE;
 CREATE CONSTRAINT api_key_id IF NOT EXISTS
 FOR (k:ApiKey) REQUIRE k.keyId IS UNIQUE;
 
+// Названия ключей без учёта регистра (api/apikeys.py, миграция 006).
+CREATE CONSTRAINT api_key_name_key IF NOT EXISTS
+FOR (k:ApiKey) REQUIRE k.nameKey IS UNIQUE;
+
 // История проверок (api/history.py). В выгрузку не попадает.
 CREATE INDEX check_record_at IF NOT EXISTS
 FOR (r:CheckRecord) ON (r.at);
@@ -112,3 +119,8 @@ FOR (v:CatalogVersion) REQUIRE v.id IS UNIQUE;
 // свободного id. Единственный узел на id. В выгрузку не попадает.
 CREATE CONSTRAINT catalog_lock_id IF NOT EXISTS
 FOR (l:CatalogLock) REQUIRE l.id IS UNIQUE;
+
+// Учёт применённых миграций (api/seed.py): узел на миграцию, повторный
+// запуск без SEED_REAPPLY=1 пропускается. В выгрузку не попадает.
+CREATE CONSTRAINT migration_id IF NOT EXISTS
+FOR (m:Migration) REQUIRE m.id IS UNIQUE;

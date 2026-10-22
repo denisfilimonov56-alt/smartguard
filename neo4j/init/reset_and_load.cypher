@@ -4,7 +4,8 @@
 //  ВНИМАНИЕ: скрипт УДАЛЯЕТ ВСЕ УЗЛЫ КАТАЛОГА, а затем заводит
 //  каталог заново — уже со всеми полями, которых требуют
 //  текущие проверки и интерфейс. Пользователи интерфейса (:User)
-//  и их роли сохраняются.
+//  и их роли, ключи (:ApiKey), настройки (:Setting), история проверок
+//  и учёт миграций сохраняются.
 //
 //  Запуск — только после проверенной резервной копии (docs/data.md,
 //  «Резервная копия»; Community снимает дамп лишь с остановленной базы):
@@ -28,8 +29,10 @@
 //  увеличением версии каталога: API не увидит пустой каталог посреди
 //  сброса и после него сбросит кэш ответов.
 //
-//  После запуска зафиксируйте состояние в репозитории (на хосте):
-//    docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher
+//  После запуска выгрузите каталог в файл данных сервера (на хосте,
+//  через временный файл — «> data.cypher» обнулил бы его до выгрузки):
+//    docker compose exec -T api python export_graph.py --stdout > neo4j/init/data.cypher.new \
+//      && mv neo4j/init/data.cypher.new neo4j/init/data.cypher
 // ============================================================
 
 // ---------- Ограничения и индексы ----------
@@ -68,6 +71,10 @@ FOR (s:Setting) REQUIRE s.key IS UNIQUE;
 
 CREATE CONSTRAINT api_key_id IF NOT EXISTS
 FOR (k:ApiKey) REQUIRE k.keyId IS UNIQUE;
+
+// Названия ключей без учёта регистра (api/apikeys.py, миграция 006).
+CREATE CONSTRAINT api_key_name_key IF NOT EXISTS
+FOR (k:ApiKey) REQUIRE k.nameKey IS UNIQUE;
 
 CREATE FULLTEXT INDEX rule_description_ft IF NOT EXISTS
 FOR (r:Rule) ON EACH [r.description];

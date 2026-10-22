@@ -1,5 +1,5 @@
 import {
-  cell, choose, clauseBlock, DEADLINE, expect, go, matrixRow, menu, modal, openRule, panel, PROJECT,
+  apiHeaders, cell, choose, clauseBlock, DEADLINE, expect, go, matrixRow, menu, modal, openRule, panel, PROJECT,
   test, toast, TRAINING,
 } from "./fixtures";
 
@@ -289,7 +289,13 @@ test("мастер не пускает дальше с незаполненны�
   await w.getByRole("button", { name: /Далее/ }).click();
   await expect(toast(app, "Опишите новый атрибут")).toBeVisible();
 
+  // Введённое не сохранено: «Отмена» сначала переспрашивает.
   await w.getByRole("button", { name: "Отмена" }).first().click();
+  const ask = modal(app).getByRole("dialog", { name: "Закрыть мастер правила?" });
+  await ask.getByRole("button", { name: "Отмена" }).click();
+  await expect(w.getByLabel("Формулировка правила")).toHaveValue("Новое правило");
+  await w.getByRole("button", { name: "Отмена" }).first().click();
+  await ask.getByRole("button", { name: "Закрыть" }).click();
   await expect(w.getByRole("heading", { name: "Где какое правило действует" })).toBeVisible();
 });
 
@@ -299,4 +305,133 @@ test("мастер из пункта приказа начинается с ша
   const w = app.locator("#tab-rules");
   await expect(w.getByRole("button", { name: /Что проверяем/ })).toHaveAttribute("aria-current", "step");
   await expect(w.locator(".sumline").first()).toContainText("2.4 — Цель должна иметь конкретные сроки исполнения");
+});
+
+test("мастер: переход в другой раздел и обучение не теряют ввод молча; тот же раздел мастер не закрывает", async ({ app }) => {
+  await go(app, "Правила");
+  const w = app.locator("#tab-rules");
+  await w.getByRole("button", { name: "+ Правило" }).click();
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByLabel("Формулировка правила").fill("Черновик правила");
+
+  // Щелчок по тому же разделу — мастер на месте.
+  await go(app, "Правила");
+  await expect(w.getByLabel("Формулировка правила")).toHaveValue("Черновик правила");
+
+  // Другой раздел — вопрос; «Отмена» оставляет в мастере.
+  await go(app, "Приказы");
+  const ask = modal(app).getByRole("dialog", { name: "Закрыть мастер правила?" });
+  await ask.getByRole("button", { name: "Отмена" }).click();
+  await expect(w.getByLabel("Формулировка правила")).toHaveValue("Черновик правила");
+  expect(new URL(app.url()).pathname).toBe("/rules");
+
+  // Обучение тоже сначала спрашивает.
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обучение" }).click();
+  await ask.getByRole("button", { name: "Отмена" }).click();
+  await expect(app.locator(".tour-card")).toHaveCount(0);
+  await expect(w.getByLabel("Формулировка правила")).toHaveValue("Черновик правила");
+
+  // Согласились закрыть — переход состоялся.
+  await go(app, "Приказы");
+  await ask.getByRole("button", { name: "Закрыть" }).click();
+  await expect(app.locator("#tab-orders")).toBeVisible();
+});
+
+test("мастер: при закрытии предлагает убрать правило и пункт, созданные неудачной попыткой", async ({ app }) => {
+  await go(app, "Правила");
+  const w = app.locator("#tab-rules");
+  await w.getByRole("button", { name: "+ Правило" }).click();
+  await w.getByRole("button", { name: "Новый пункт" }).click();
+  await w.getByLabel("Номер пункта").fill("8.8");
+  await w.getByLabel("Текст пункта").fill("Пункт недоделанного правила");
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByLabel("Формулировка правила").fill("Недоделанное правило");
+  await w.locator(".box", { hasText: "проект" }).click();
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByRole("button", { name: /Далее/ }).click();
+  await w.getByLabel("Формулировка цели").fill("Пример, который не сохранится");
+  await w.getByRole("button", { name: "Добавить пример" }).click();
+  // Пункт и правило созданы, пример — нет.
+  await app.route("**/api/catalog/examples", (route) => route.request().method() === "POST"
+    ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "Сбой записи" }) })
+    : route.fallback());
+  await w.getByRole("button", { name: "Создать правило" }).click();
+  await expect(toast(app, "Сбой записи")).toBeVisible();
+
+  await go(app, "Приказы");
+  await modal(app).getByRole("dialog", { name: "Закрыть мастер правила?" }).getByRole("button", { name: "Закрыть" }).click();
+  const drop = modal(app).getByRole("dialog", { name: "Убрать созданное прошлой попыткой?" });
+  await expect(drop).toContainText("правило, пункт 8.8");
+  await drop.getByRole("button", { name: "Удалить" }).click();
+  await expect(app.locator("#tab-orders")).toBeVisible();
+  await expect(app.locator("#tab-orders")).not.toContainText("Пункт недоделанного правила");
+  await go(app, "Правила");
+  await expect(app.locator("#tab-rules")).not.toContainText("Недоделанное правило");
+});
+
+test("форма «Изменить» шлёт только изменённые поля и прежние значения; чужая правка — 409 и перечитывание", async ({ app }) => {
+  await openRule(app, DEADLINE);
+  const p = panel(app);
+  await p.getByRole("button", { name: "Изменить" }).first().click();
+  const form = modal(app).getByRole("dialog", { name: /Правило/ });
+  await form.getByLabel("Формулировка правила").fill("Цель обязана содержать конкретный срок исполнения (дата)");
+  const [request] = await Promise.all([
+    app.waitForRequest((r) => r.url().includes("/properties") && r.method() === "PATCH"),
+    form.getByRole("button", { name: "Сохранить" }).click(),
+  ]);
+  expect(request.postDataJSON()).toEqual({
+    properties: { description: "Цель обязана содержать конкретный срок исполнения (дата)" },
+    expected: { description: "Цель обязана содержать конкретный срок исполнения" },
+  });
+  await expect(toast(app, "Правило обновлено")).toBeVisible();
+
+  // Форма открыта, а другой редактор тем временем изменил формулировку.
+  await p.getByRole("button", { name: "Изменить" }).first().click();
+  await form.getByLabel("Что подсказать автору цели").fill("Подсказка A");
+  await form.getByLabel("Формулировка правила").fill("Версия A");
+  await app.evaluate((headers) => fetch("/api/catalog/nodes/r:2/properties", { method: "PATCH", headers,
+    body: JSON.stringify({ properties: { description: "Версия B" } }) }), apiHeaders());
+  await form.getByRole("button", { name: "Сохранить" }).click();
+  await expect(toast(app, "эти данные изменил другой пользователь")).toBeVisible();
+  await expect(form).toHaveCount(0);
+  await expect(p.getByRole("heading", { name: "Версия B" })).toBeVisible();
+});
+
+test("ячейка матрицы из старого снимка не затирает чужую область действия (409)", async ({ app }) => {
+  await go(app, "Правила");
+  // Другой редактор ограничил правило одним УЦТ — у нас на экране ещё «для всех».
+  await app.evaluate((headers) => fetch("/api/catalog/rules/r:3/departments", { method: "PUT", headers,
+    body: JSON.stringify({ only: ["UCT"] }) }), apiHeaders());
+  const [request] = await Promise.all([
+    app.waitForRequest((r) => r.url().endsWith("/departments") && r.method() === "PUT"),
+    (async () => {
+      await cell(app, TRAINING, "АГД").click();
+      await modal(app).getByRole("radio", { name: /Не действует/ }).click();
+      await modal(app).getByRole("button", { name: "Сохранить" }).click();
+    })(),
+  ]);
+  expect(request.postDataJSON()).toMatchObject({ expected: [] });
+  await expect(toast(app, "эти данные изменил другой пользователь")).toBeVisible();
+  // Каталог перечитан: видно ограничение другого редактора, оно не потеряно.
+  await expect(cell(app, TRAINING, "УЦТ")).toHaveAttribute("data-state", "applies");
+  await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "off");
+  await expect(cell(app, TRAINING, "Финансовое управление")).toHaveAttribute("data-state", "off");
+});
+
+test("пока сохраняется область действия из панели, «Изменить» и ячейки правила недоступны", async ({ app }) => {
+  await openRule(app, TRAINING);
+  const p = panel(app);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await app.route("**/api/catalog/rules/*/departments", async (route) => { await held; await route.fallback(); });
+  await p.getByRole("button", { name: "Только выбранные" }).click();
+  await p.locator(".box", { hasText: "УЦТ" }).click();
+  await expect(p.getByRole("button", { name: "Изменить" }).first()).toBeDisabled();
+  await expect(cell(app, TRAINING, "АГД")).toBeDisabled();
+  await expect(p.getByRole("group", { name: "Для кого" }).getByRole("button", { name: "Только для студентов" })).toBeDisabled();
+  release();
+  await expect(toast(app, "Область действия обновлена")).toBeVisible();
+  await expect(p.getByRole("button", { name: "Изменить" }).first()).toBeEnabled();
+  await expect(cell(app, TRAINING, "АГД")).toBeEnabled();
 });

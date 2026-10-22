@@ -11,13 +11,30 @@ Neo4j 5 не исполняет .cypher-файлы автоматически, �
     файла — миграция или reset_and_load, их запускают явно через
     `-e SEED_FILE=...`.
   * SEED_DATA_FILE (по умолчанию neo4j/init/data.cypher — выгрузка
-    export_graph.py) и всё после маркера данных в SEED_FILE прежних версий —
-    только на пустой каталог или по явному SEED_DATA=1. Иначе каждый подъём
-    стека откатывал бы правки из интерфейса к моменту выгрузки. Файл данных
-    читается, только когда данные действительно применяются.
+    export_graph.py этого сервера, в git её нет) и всё после маркера данных
+    в SEED_FILE прежних версий — только на пустой каталог или по явному
+    SEED_DATA=1. Иначе каждый подъём стека откатывал бы правки из интерфейса
+    к моменту выгрузки. Файл данных читается, только когда данные
+    действительно применяются; нет файла — загружается только схема.
+  * SEED_DATA=1 — восстановление каталога из файла: в той же транзакции
+    сначала удаляются узлы каталога (как в reset_and_load), затем
+    загружается файл. Без удаления MERGE смешал бы файл с базой: двойники
+    переименованных узлов, лишние связи. Пользователи (:User), ключи
+    (:ApiKey), настройки (:Setting), история проверок и оценки SMART не
+    трогаются.
   * Если SEED_FILE — не схема seed.cypher (reset_and_load, миграция),
     SEED_DATA_FILE не применяется вовсе: он шёл бы в той же транзакции и
     перекрыл бы сброс или миграцию.
+  * Миграция (файл из каталога migrations/) отмечается узлом
+    :Migration {id, appliedAt} в той же транзакции; уже применённая
+    пропускается, повторить — SEED_REAPPLY=1.
+  * Условная миграция (её операторы ничего не делают, пока в каталоге нет
+    нужных узлов) объявляет условие строкой-комментарием
+    `// @mark-if: <запрос, возвращающий столбец done>`. Запрос выполняется
+    в той же транзакции после операторов; done = false — отметка не
+    ставится, и миграция выполнится снова при следующем запуске (на пустом
+    каталоге 003 иначе считалась бы применённой, и правило R-3.5 после
+    загрузки каталога уже не появилось бы).
 
 Не-схемные операторы выполняются одной транзакцией и в ней же увеличивают
 версию каталога (:CatalogVersion): API по ней сбрасывает кэш ответов и не
@@ -43,6 +60,7 @@ log = logging.getLogger("seeder")
 SEED_FILE = Path(os.getenv("SEED_FILE", "/init/seed.cypher"))
 SEED_DATA_FILE = Path(os.getenv("SEED_DATA_FILE", "/init/data.cypher"))
 FORCE_DATA = os.getenv("SEED_DATA", "0").strip().lower() in ("1", "true", "yes", "on")
+REAPPLY_MIGRATION = os.getenv("SEED_REAPPLY", "0").strip().lower() in ("1", "true", "yes", "on")
 CONNECT_RETRIES = int(os.getenv("SEED_CONNECT_RETRIES", "30"))
 CONNECT_DELAY = float(os.getenv("SEED_CONNECT_DELAY", "2"))
 
@@ -57,6 +75,22 @@ MATCH (n) WHERE n:Order OR n:Clause OR n:Rule OR n:CheckTarget OR n:ViolationExa
              OR n:Department OR n:JobDescription
 RETURN count(n) = 0 AS empty LIMIT 1
 """
+# SEED_DATA=1: перед загрузкой файла удаляются узлы каталога — те же метки,
+# что очищает reset_and_load.cypher. Прочие узлы (:User, :ApiKey, :Setting,
+# :CheckRecord, :SmartScore, :CatalogVersion, :Migration) остаются.
+CLEAR_CATALOG = """
+MATCH (n) WHERE n:Order OR n:Clause OR n:Rule OR n:CheckTarget OR n:ViolationExample
+             OR n:Department OR n:JobDescription
+DETACH DELETE n
+"""
+# Учёт миграций: узел на файл миграции.
+MIGRATION_APPLIED = "MATCH (m:Migration {id: $id}) RETURN toString(m.appliedAt) AS appliedAt"
+MARK_MIGRATION = """
+MERGE (m:Migration {id: $id})
+SET m.appliedAt = datetime()
+"""
+# Условие отметки условной миграции — строка-комментарий в её файле.
+MARK_IF_RE = re.compile(r"^\s*//\s*@mark-if:\s*(\S.*?)\s*$", re.MULTILINE)
 # Контракт с API (metrics): любая правка каталога в обход API увеличивает версию.
 BUMP_CATALOG_VERSION = """
 MERGE (v:CatalogVersion {id: "catalog"})
@@ -167,11 +201,47 @@ def data_file_for(seed_file: Path, data_file: Path) -> Path | None:
     return data_file
 
 
-def _write_all(tx, statements: list[str]) -> int:
+def migration_id(seed_file: Path) -> str | None:
+    """Идентификатор миграции (имя файла без .cypher) или None, если это не миграция."""
+    return seed_file.stem if seed_file.parent.name == "migrations" else None
+
+
+def migration_applied(driver, migration: str) -> str | None:
+    """Когда миграция уже применялась (строка даты) или None."""
+    with driver.session() as session:
+        row = session.run(MIGRATION_APPLIED, id=migration).single()
+    return row["appliedAt"] if row else None
+
+
+def mark_condition(script: str) -> str | None:
+    """Условие отметки миграции (// @mark-if: ...) или None — отмечать всегда."""
+    match = MARK_IF_RE.search(script)
+    return match.group(1) if match else None
+
+
+def _mark(tx, migration: str, mark_if: str | None = None) -> bool:
+    """Отмечает миграцию применённой, если её условие выполнено. Возвращает, отмечена ли.
+
+    Условие проверяется после операторов миграции в той же транзакции: оно
+    видит их результат.
+    """
+    if mark_if:
+        row = tx.run(mark_if).single()
+        if not (row and row["done"]):
+            return False
+    tx.run(MARK_MIGRATION, id=migration).consume()
+    return True
+
+
+def _write_all(tx, statements: list[str], migration: str | None = None,
+               mark_if: str | None = None) -> tuple[int, bool]:
+    """Операторы, отметка миграции и версия каталога. Возвращает (версия, отмечена ли)."""
     for stmt in statements:
         log.debug("Данные: %s", stmt.splitlines()[0][:90])
         tx.run(stmt).consume()
-    return tx.run(BUMP_CATALOG_VERSION).single()["version"]
+    # Отметка — в той же транзакции: сбой откатит и её.
+    marked = _mark(tx, migration, mark_if) if migration else False
+    return tx.run(BUMP_CATALOG_VERSION).single()["version"], marked
 
 
 def catalog_is_empty(driver) -> bool:
@@ -181,11 +251,16 @@ def catalog_is_empty(driver) -> bool:
 
 
 def run_statements(driver, statements: list[str], data: list[str] | None = None,
-                   load_data: bool = False) -> None:
+                   load_data: bool = False, restore: bool = False,
+                   migration: str | None = None, mark_if: str | None = None) -> None:
     """Выполняет схемные операторы, затем прочие и (если load_data) данные.
 
     Прочие операторы и данные — одна транзакция с увеличением версии каталога:
     сбой откатывает всё, а API не кэширует ответы по неполному каталогу.
+    restore (SEED_DATA=1) — перед данными в той же транзакции удаляются узлы
+    каталога: каталог возвращается к состоянию файла, а не смешивается с ним.
+    migration — отметить миграцию узлом :Migration в той же транзакции;
+    mark_if — только если этот запрос вернул done = true (условная миграция).
     """
     schema = [s for s in statements if SCHEMA_RE.match(s)]
     writes = [s for s in statements if not SCHEMA_RE.match(s)]
@@ -194,6 +269,8 @@ def run_statements(driver, statements: list[str], data: list[str] | None = None,
     schema += [s for s in data if SCHEMA_RE.match(s)]
     data = [s for s in data if not SCHEMA_RE.match(s)]
     if load_data:
+        if restore and data:
+            writes.append(CLEAR_CATALOG.strip())
         writes += data
 
     with driver.session() as session:
@@ -206,14 +283,25 @@ def run_statements(driver, statements: list[str], data: list[str] | None = None,
             # может отработать до появления уникального индекса.
             session.run("CALL db.awaitIndexes(300)").consume()
 
+        marked = False
         if writes:
-            version = session.execute_write(_write_all, writes)
+            version, marked = session.execute_write(_write_all, writes, migration, mark_if)
             log.info("Версия каталога: %s", version)
+        elif migration:
+            # Миграция только из схемы (ограничения) — отметка отдельно.
+            marked = session.execute_write(_mark, migration, mark_if)
+        if marked:
+            log.info("Миграция %s отмечена как применённая", migration)
+        elif migration:
+            log.warning("Миграция %s выполнена, но не отмечена: её условие (%s) не выполнено — "
+                        "в каталоге нет узлов, которые она дополняет. Запустите её снова "
+                        "после загрузки каталога", migration, mark_if)
 
     log.info("Выполнено операторов: схема=%d, данные=%d", len(schema), len(writes))
     if data and not load_data:
         log.info("Данные (%d операторов) не применялись: каталог не пуст. "
-                 "Принудительно — SEED_DATA=1 (вернёт каталог к состоянию файла)", len(data))
+                 "Принудительно — SEED_DATA=1: узлы каталога будут удалены и загружены "
+                 "из файла заново (пользователи, ключи, настройки и история останутся)", len(data))
 
 
 def report(driver) -> None:
@@ -263,8 +351,19 @@ def main() -> int:
             os.getenv("NEO4J_PASSWORD", "password123"),
         ),
     )
+    migration = migration_id(SEED_FILE)
     try:
         wait_for_neo4j(driver)
+        if migration:
+            applied = migration_applied(driver, migration)
+            if applied and not REAPPLY_MIGRATION:
+                log.info("Миграция %s уже применена (%s) — пропущена. Повторить: SEED_REAPPLY=1",
+                         migration, applied)
+                return 0
+        if SEED_FILE.name == SCHEMA_SEED_NAME and not data_file and not SEED_DATA_FILE.exists():
+            log.info("Файла данных %s нет — загружается только схема. Каталог заполняют в "
+                     "интерфейсе; образец — data.example.cypher, выгрузка — export_graph.py",
+                     SEED_DATA_FILE)
         load_data = bool(data or data_file) and (FORCE_DATA or catalog_is_empty(driver))
         if load_data and data_file:
             # Файл данных читается, только когда он применяется: битый или
@@ -276,10 +375,18 @@ def main() -> int:
                           "кодировку (UTF-8) или выгрузите его заново (export_graph.py)",
                           data_file, exc)
                 return 1
+        if FORCE_DATA and not data:
+            log.warning("SEED_DATA=1, но данных нет (нет файла %s или в нём нет операторов) — "
+                        "каталог не тронут", SEED_DATA_FILE)
         load_data = load_data and bool(data)
         if load_data:
-            log.info("Применяются данные: %s", "SEED_DATA=1" if FORCE_DATA else "каталог пуст")
-        run_statements(driver, statements, data, load_data)
+            log.info("Применяются данные: %s", "SEED_DATA=1 — каталог удаляется и загружается из файла "
+                     "заново (пользователи, ключи, настройки и история не трогаются)"
+                     if FORCE_DATA else "каталог пуст")
+        mark_if = mark_condition(explicit) if migration else None
+        options = {"mark_if": mark_if} if mark_if else {}
+        run_statements(driver, statements, data, load_data, restore=FORCE_DATA, migration=migration,
+                       **options)
         report(driver)
     except (Neo4jError, ServiceUnavailable) as exc:
         log.error("Загрузка данных не удалась: %s", exc)

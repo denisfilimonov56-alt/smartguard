@@ -14,7 +14,8 @@ import { errorText, useToast } from "../../ui/Toasts";
 import { useAdviceDialog } from "./AdviceDialog";
 import {
   MAX_ROWS, SHEET_MAX_ROWS, STATUS_CLASS, STATUS_LABEL, detectColumns, emptyRow, hasErrors, plural, resultsWorkbook,
-  ruleKey, rowsFromSheet, sheetWidth, templateWorkbook, validateRows, type Columns, type Issue,
+  ruleKey, rowsFromSheet, sameRow, sheetWidth, summaryOf, templateWorkbook, unverifiedCount, validateRows,
+  failedTemporarily, UNCHECKED_LABEL, type Columns, type Issue,
 } from "./batch";
 import { JsonBlock } from "./JsonBlock";
 import { Verdict } from "./Verdict";
@@ -32,12 +33,8 @@ const departmentOptions = (departments: Department[]) =>
   departments.filter((d) => d.departmentId && d.status === "active")
     .map((d) => ({ value: d.departmentId!, label: d.name || d.departmentId! }));
 
-/** Ответ по строке: статус, «изменено после проверки» или ничего (строку не проверяли). */
-type Outcome = CheckStatus | "stale" | undefined;
-
-const sameRow = (a: BatchRow, b: BatchRow, fallback: string, checkedFallback: string) =>
-  a.goal.trim() === b.goal.trim() && a.isStudent === b.isStudent && a.id.trim() === b.id.trim()
-  && (a.departmentId.trim() || fallback) === (b.departmentId.trim() || checkedFallback);
+/** Ответ по строке: статус, «изменено после проверки», «API не успел проверить» или ничего (строку не проверяли). */
+type Outcome = CheckStatus | "stale" | "unchecked" | "failed" | undefined;
 
 export function BatchCheck() {
   const toast = useToast();
@@ -69,7 +66,8 @@ export function BatchCheck() {
   const outcomeOf = (row: BatchRow): Outcome => {
     const hit = checked.get(row.key);
     if (!hit?.result) return undefined;
-    return sameRow(row, hit.row, fallback, batch!.fallback) ? hit.result.status : "stale";
+    if (!sameRow(row, hit.row, fallback, batch!.fallback)) return "stale";
+    return hit.result.unchecked ? "unchecked" : failedTemporarily(hit.result) ? "failed" : hit.result.status;
   };
 
   async function pick(event: ChangeEvent<HTMLInputElement>) {
@@ -94,12 +92,20 @@ export function BatchCheck() {
     ));
   }
 
-  function run() {
+  // Строки без действующего ответа: пакет прервали (лимит, сбой, «Остановить»), API не успел их проверить
+  // до срока пакета (unchecked), проверка сорвалась из-за временного сбоя (failed) или их изменили после проверки.
+  const pending = batch ? rows.filter((r) => {
+    const o = outcomeOf(r);
+    return o === undefined || o === "stale" || o === "unchecked" || o === "failed";
+  }).length : 0;
+
+  /** onlyPending — проверить только строки без ответа и изменённые, остальным оставить прежний ответ. */
+  function run(onlyPending = false) {
     if (busy) return;
     if (!rows.length) { toast("Добавьте хотя бы одну цель", "err"); return; }
     if (broken) { toast("Сначала исправьте строки с ошибками", "err"); return; }
     if (tooMany) { toast(`За один раз можно проверить не более ${MAX_ROWS} целей`, "err"); return; }
-    void batchRun.start(rows, fallback);
+    void batchRun.start(rows, fallback, onlyPending);
   }
 
   return (
@@ -122,10 +128,16 @@ export function BatchCheck() {
             style={{ width: 300 }} onChange={(next) => setCheckForm({ departmentId: next })}
             options={[{ value: "", label: "Подразделение по умолчанию: нет" },
               ...options.map((o) => ({ value: o.value, label: `По умолчанию: ${o.label}` }))]} />
-          <button className="btn primary" id="batchRun" disabled={busy} onClick={run}>
+          {!busy && pending > 0 && pending < rows.length && (
+            <button className="btn" id="batchContinue" title="Строки с ответом не отправляются снова и не тратят лимит проверок"
+              onClick={() => run(true)}>Проверить оставшиеся ({pending})</button>
+          )}
+          <button className="btn primary" id="batchRun" disabled={busy} onClick={() => run()}>
             {busy ? <><Spinner /> Проверено {batchRun.done} из {batchRun.total}
-              {batchRun.waiting !== null ? ` · очередь занята, повтор через ${batchRun.waiting} с` : "…"}</>
-              : `Проверить${rows.length ? ` (${rows.length})` : ""}`}
+              {batchRun.waiting === null ? "…" : batchRun.waitReason === "rate"
+                ? ` · лимит проверок в минуту, повтор через ${batchRun.waiting} с`
+                : ` · очередь занята, повтор через ${batchRun.waiting} с`}</>
+              : `Проверить${rows.length ? (pending > 0 && pending < rows.length ? ` все (${rows.length})` : ` (${rows.length})`) : ""}`}
           </button>
           {busy && <button className="btn" id="batchStop" onClick={batchRun.stop}>Остановить</button>}
         </div>
@@ -218,6 +230,10 @@ const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome,
       <td className="status" data-label="Результат">
         {outcome === "stale"
           ? <span className="badge" title="Строку изменили после проверки: прежний ответ к ней не относится">изменено, не проверено</span>
+          : outcome === "unchecked"
+          ? <span className="badge" title="Пакет не уложился в отведённое время: цель не проверена, отправьте её снова">не проверено, отправьте снова</span>
+          : outcome === "failed"
+          ? <span className="badge warn" title="Проверка сорвалась из-за временного сбоя: «Проверить оставшиеся» отправит цель снова">сбой, отправьте снова</span>
           : outcome && <span className={`badge ${STATUS_CLASS[outcome]}`}>{STATUS_LABEL[outcome]}</span>}
       </td>
       <td className="x">
@@ -265,6 +281,8 @@ const BatchResults = memo(function BatchResults({ batch, canEdit, orders, target
     if (target) void goToNode(target.nodeId, "CheckTarget");
     else setSection("targets");
   };
+  // Сводка — по ответам: непроверенные цели (unchecked) отдельно, не в «ручной проверке».
+  const summary = useMemo(() => summaryOf(batch.result.results), [batch]);
   const dispute = canEdit
     ? (result: BatchResult["results"][number], attribute: string) =>
       openAdvice({ result, departmentId: result.department?.id ?? null, attribute, onApplied: () => undefined })
@@ -273,10 +291,12 @@ const BatchResults = memo(function BatchResults({ batch, canEdit, orders, target
   return (
     <div className="card verdict" id="batchResult" style={{ marginTop: 16 }}>
       <div className="row wrap" style={{ paddingBottom: 12 }}>
-        <span className="badge count">Проверено целей: {batch.result.summary.total}</span>
-        <span className="badge ok">нарушений нет: {batch.result.summary.allowed}</span>
-        <span className="badge err">нужно доработать: {batch.result.summary.violations}</span>
-        <span className="badge warn">ручная проверка: {batch.result.summary.manual_review}</span>
+        <span className="badge count">Проверено целей: {summary.total - (summary.unchecked ?? 0)}</span>
+        <span className="badge ok">нарушений нет: {summary.allowed}</span>
+        <span className="badge err">нужно доработать: {summary.violations}</span>
+        <span className="badge warn">ручная проверка: {summary.manual_review}</span>
+        {!!summary.unchecked && <span className="badge" id="batchUnchecked"
+          title="Пакет не дошёл до этих целей: они не проверены, отправьте их снова">не проверено: {summary.unchecked}</span>}
         <div className="spacer" />
         <button className="btn sm" onClick={() => downloadFile(resultsWorkbook(batch.rows, batch.result), "результат-проверки.xlsx")}>
           Скачать Excel
@@ -284,15 +304,19 @@ const BatchResults = memo(function BatchResults({ batch, canEdit, orders, target
       </div>
       {batch.result.results.map((result, i) => {
         const rules = new Set(result.violations.map(ruleKey)).size;
+        const unverified = unverifiedCount(result);
         return (
           <details key={batch.rows[i]?.key ?? i} className="batch-item" onToggle={(e) => toggle(i, e.currentTarget.open)}>
             <summary>
-              <span className={`badge ${STATUS_CLASS[result.status]}`}>{STATUS_LABEL[result.status]}</span>
+              {result.unchecked
+                ? <span className="badge" title="Пакет не дошёл до цели: она не проверена, отправьте её снова">{UNCHECKED_LABEL}</span>
+                : <span className={`badge ${STATUS_CLASS[result.status]}`}>{STATUS_LABEL[result.status]}</span>}
               {result.id && <span className="mono">{result.id}</span>}
               <span className="goal">{result.goal}</span>
               <span className="dim">{result.department ? result.department.name || result.department.id : "подразделение не определено"}
                 {result.is_student ? " · студент" : ""}
-                {rules ? ` · нарушено правил: ${rules}` : ""}</span>
+                {rules ? ` · нарушено правил: ${rules}` : ""}
+                {unverified ? ` · ? не проверено правил: ${unverified}` : ""}</span>
             </summary>
             {open.has(i) && (
               <Verdict result={result} total={totalFor(result.department?.id ?? null, result.is_student)}

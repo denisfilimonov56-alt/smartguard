@@ -1,6 +1,6 @@
 import type { CheckResult } from "../../api/types";
 import { Chip } from "../../ui/common";
-import { place, ruleKey } from "./batch";
+import { place, plural, ruleKey, unverifiedCount } from "./batch";
 import { SmartRings } from "./Smart";
 
 /* Ответ проверки одной цели человеческим языком: что не так, какой пункт
@@ -24,13 +24,19 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
   const manual = result.status === "NEEDS_MANUAL_REVIEW";
   // Нарушенных правил, а не пар «правило × атрибут»: правило с двумя атрибутами — одно.
   const bad = new Set(result.violations.map(ruleKey)).size;
+  // Правила, которые API проверить не смог: ни «выполнено», ни «не выполнено» — отдельно, со знаком «?».
+  const unverified = unverifiedCount(result);
+  const rulesLine = bad
+    ? `не выполнено правил: ${bad} из ${total}${unverified ? ` · не проверено: ${unverified}` : ""}`
+    : unverified ? `проверено правил: ${Math.max(0, total - unverified)} из ${total} · не проверено: ${unverified}`
+    : `проверено правил: ${total}`;
   return (
     <div className="card verdict" id="checkResult">
       <div className="row wrap" style={{ paddingBottom: 12 }}>
         {manual
           ? <span className="badge warn lg">Требуется ручная проверка</span>
           : bad ? <span className="badge err lg">Нужно доработать</span> : <span className="badge ok lg">Нарушений нет</span>}
-        {!manual && <span className="muted">{bad ? `не выполнено правил: ${bad} из ${total}` : `проверено правил: ${total}`}</span>}
+        {(!manual || unverified > 0) && <span className="muted" data-rules-line>{rulesLine}</span>}
         <div className="spacer" />
         {!manual && onTrace && <button className="btn sm" onClick={onTrace}>Показать на графе</button>}
         <span className="dim">подразделение: {result.department
@@ -45,6 +51,14 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
           <span className="ico smart-ico">S</span>
           <div className="t" style={{ fontSize: 14 }}>По SMART <span className="dim" style={{ fontWeight: 400 }}>справочно, на вердикт не влияет</span></div>
           <div className="d"><SmartRings smart={result.smart} /></div>
+        </div>
+      )}
+
+      {unverified > 0 && (
+        <div className="vitem unverified">
+          <span className="ico unknown" title="Не проверено: нужна ручная проверка">?</span>
+          <div className="t" style={{ fontSize: 14 }}>Не проверено: {plural(unverified, ["правило", "правила", "правил"])}</div>
+          <div className="d">Ни выполненными, ни нарушенными их считать нельзя — сверьте цель с ними вручную.</div>
         </div>
       )}
 

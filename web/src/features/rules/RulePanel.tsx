@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { api } from "../../api/client";
+import { api, isStale, STALE_TEXT } from "../../api/client";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { FUTURE_DEPARTMENTS_HINT, scopeOf, withOff, type Scope } from "../../state/scope";
@@ -13,7 +13,7 @@ import { useActions } from "../actions";
 /* Всё о правиле в одном месте: что проверяем, где действует, примеры. Открывается из матрицы и из текста приказа. */
 
 export function RulePanel() {
-  const { orders, targets, departments, panelRule, closeRule, mutate } = useCatalog();
+  const { orders, targets, departments, panelRule, closeRule, mutate, reload, setSavingRule } = useCatalog();
   const actions = useActions();
   const { canEdit, isAdmin } = useAuth();
   const toast = useToast();
@@ -25,8 +25,16 @@ export function RulePanel() {
   // данные каталога после сохранения: перезагрузку могли вытеснить или она не удалась,
   // и тогда на экране ещё старый scope. stale — правило, каким оно было до прихода данных.
   const [pending, setPending] = useState<{ scope: Scope; stale: unknown } | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [savingState, setSaving] = useState(false);
+  const [audienceSaving, setAudienceSaving] = useState(false);
+  const saving = savingState || audienceSaving;
   const ruleRef = useRef<unknown>(null);
+  // Пока идёт сохранение, «Изменить» правила и его ячейки в матрице недоступны (state/catalog.tsx).
+  useEffect(() => {
+    if (!saving || !panelRule) return;
+    setSavingRule(panelRule);
+    return () => setSavingRule(null);
+  }, [saving, panelRule, setSavingRule]);
 
   // Правило удалили или скрыли вместе с архивом — панели показывать нечего.
   useEffect(() => { if (panelRule && !ref) closeRule(); }, [panelRule, ref, closeRule]);
@@ -57,27 +65,32 @@ export function RulePanel() {
   const locked = !canEdit || saving;
 
   async function save(next: Scope) {
+    // expected — список, от которого посчитан новый (с учётом ещё не перечитанного прошлого сохранения).
+    const before = scope;
     setSaving(true);
     setPending({ scope: next, stale: null });
     try {
-      await mutate(() => api.setRuleScope(rule.nodeId, next), "Область действия обновлена");
+      await mutate(() => api.setRuleScope(rule.nodeId, next, before), "Область действия обновлена");
       // Сохранено. Если данные после сохранения уже на экране — эффект выше снимет список;
       // иначе он держится до первого перечитывания правила.
       const shown = ruleRef.current;
       setPending((p) => (p && p.scope === next ? { scope: next, stale: shown } : p));
     } catch (err) {
-      // PUT не прошёл: на сервере прежний список.
-      toast(errorText(err), "err");
+      // PUT не прошёл: на сервере прежний список. Его успели изменить — показываем, что там теперь.
+      toast(isStale(err) ? STALE_TEXT : errorText(err), "err");
       setPending(null);
+      if (isStale(err)) await reload();
     } finally {
       setSaving(false);
     }
   }
   const saveAudience = (studentsOnly: boolean) => {
-    if (studentsOnly === rule.studentsOnly) return;
+    if (studentsOnly === rule.studentsOnly || saving) return;
+    setAudienceSaving(true);
     void mutate(() => api.setRuleAudience(rule.nodeId, studentsOnly),
       studentsOnly ? "Правило теперь только для студентов" : "Правило теперь для всех")
-      .catch((err) => toast(errorText(err), "err"));
+      .catch((err) => toast(errorText(err), "err"))
+      .finally(() => setAudienceSaving(false));
   };
 
   function toggle(id: string, checked: boolean) {
@@ -108,7 +121,7 @@ export function RulePanel() {
           : <span className="badge requirement" title="Это должно быть в цели">Требование</span>}
         <ArchivedBadge status={rule.status} /><IdBadge value={rule.ruleId} name="ruleId" />
         <div className="spacer" />
-        {canEdit && <button className="btn sm" onClick={actions.editRule(rule)}>Изменить</button>}
+        {canEdit && <button className="btn sm" disabled={saving} onClick={actions.editRule(rule)}>Изменить</button>}
         <MenuButton items={() => actions.ruleMenu(rule)} />
       </div>
       {rule.checkInstruction && (
@@ -117,7 +130,7 @@ export function RulePanel() {
 
       <div className="sec">
         <h3><i>1</i>Что проверяем
-          {canEdit && <button className="btn sm ghost" onClick={actions.ruleTargets(rule)}>Изменить</button>}</h3>
+          {canEdit && <button className="btn sm ghost" disabled={saving} onClick={actions.ruleTargets(rule)}>Изменить</button>}</h3>
         {rule.targets.length ? rule.targets.map((name) => {
           const target = targets.find((t) => t.name === name);
           return (
@@ -165,8 +178,8 @@ export function RulePanel() {
         )}
         <div className="small dim" style={{ marginTop: 12 }}>Для кого</div>
         <div className="seg" role="group" aria-label="Для кого" style={{ marginTop: 4 }}>
-          <button aria-pressed={!rule.studentsOnly} disabled={!canEdit} onClick={() => saveAudience(false)}>Для всех</button>
-          <button aria-pressed={rule.studentsOnly} disabled={!canEdit} onClick={() => saveAudience(true)}>Только для студентов</button>
+          <button aria-pressed={!rule.studentsOnly} disabled={locked} onClick={() => saveAudience(false)}>Для всех</button>
+          <button aria-pressed={rule.studentsOnly} disabled={locked} onClick={() => saveAudience(true)}>Только для студентов</button>
         </div>
         {rule.studentsOnly && (
           <div className="hint">Проверяется, только если в запросе проверки передано, что цель ставит студент.</div>

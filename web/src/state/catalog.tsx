@@ -51,7 +51,9 @@ interface CatalogState extends Data, Flags {
   apiState: ApiState;
   health: Diagnostics["counts"] | null;
   section: Section;
-  setSection: (section: Section) => void;
+  /** Перейти в раздел. Открыт мастер правила с несохранённым вводом — сначала вопрос;
+      false — пользователь остался в мастере, раздел не сменился. */
+  setSection: (section: Section) => Promise<boolean>;
   /** Перечитать данные; флаги архива можно поменять тем же вызовом. */
   reload: (flags?: Partial<Flags>) => Promise<Data | null>;
   /** Выполнить изменение, показать сообщение и перечитать данные. */
@@ -69,7 +71,16 @@ interface CatalogState extends Data, Flags {
   closeRule: () => void;
   wizard: WizardPreset | null;
   openWizard: (preset?: WizardPreset) => void;
-  closeWizard: () => void;
+  /** Закрыть мастер: при несохранённом вводе он сначала спросит (force — без вопроса, например после создания). */
+  closeWizard: (force?: boolean) => void;
+  /** Закрыть мастер перед другим действием (обучение, переход): true — закрыт или не был открыт. */
+  leaveWizard: () => Promise<boolean>;
+  /** Мастер регистрирует вопрос перед закрытием: true — можно закрывать. */
+  setWizardGuard: (guard: (() => Promise<boolean>) | null) => void;
+  /** Правило, изменение которого сейчас сохраняется из панели: его «Изменить» и ячейки матрицы
+      недоступны, иначе они строились бы от снимка до сохранения. */
+  savingRule: string | null;
+  setSavingRule: (nodeId: string | null) => void;
   goToNode: (nodeId: string, kind?: NodeKind) => Promise<void>;
   /** Результат проверки, путь которой показан на графе. */
   trace: CheckResult | null;
@@ -96,7 +107,14 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
   const [section, setSectionState] = useState<Section>(() => sectionOf(location.pathname) ?? "check");
   const [selectedOrder, setSelectedOrder] = useState<string | null>(null);
   const [panelRule, setPanelRule] = useState<string | null>(null);
-  const [wizard, setWizard] = useState<WizardPreset | null>(null);
+  const [wizard, setWizardState] = useState<WizardPreset | null>(null);
+  // Открыт ли мастер — синхронно, без ожидания перерисовки: переходы решают по нему, спрашивать ли.
+  const wizardRef = useRef<WizardPreset | null>(null);
+  const setWizard = useCallback((next: WizardPreset | null) => { wizardRef.current = next; setWizardState(next); }, []);
+  const wizardGuard = useRef<(() => Promise<boolean>) | null>(null);
+  /** Вопрос мастера уже задан (например, обучение и переход одновременно): второй ждёт тот же ответ. */
+  const leaving = useRef<Promise<boolean> | null>(null);
+  const [savingRule, setSavingRule] = useState<string | null>(null);
   const [trace, setTrace] = useState<CheckResult | null>(null);
   const [flashTarget, setFlashTarget] = useState<{ id: string; seq: number } | null>(null);
 
@@ -118,7 +136,9 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
   const reloadSeq = useRef(0);
   const loadedFlags = useRef(flags);
   const healthLoaded = useRef(false);
-  const reload = useCallback(async (override?: Partial<Flags>) => {
+  /** Последняя начатая перечитка: обогнанная (null) может дождаться её данных. */
+  const lastReload = useRef<Promise<Data | null>>(Promise.resolve(null));
+  const load = useCallback(async (override?: Partial<Flags>): Promise<Data | null> => {
     const next = { ...flagsRef.current, ...override };
     flagsRef.current = next;
     setFlags(next);
@@ -149,6 +169,11 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
     else { healthLoaded.current = true; void refreshHealth(); }
     return loaded;
   }, [toast, refreshHealth, scheduleHealth]);
+  const reload = useCallback((override?: Partial<Flags>) => {
+    const promise = load(override);
+    lastReload.current = promise;
+    return promise;
+  }, [load]);
 
   const mutate = useCallback(async (fn: () => Promise<unknown>, success?: string) => {
     await fn();
@@ -158,25 +183,52 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => { void reload(); }, [reload]);
 
-  // Панель правила и мастер живут только в «Правилах» и «Приказах».
-  const showSection = useCallback((next: Section) => {
-    setSectionState(next);
+  /** Закрыть мастер, если он не против: с несохранённым вводом он спрашивает (и предлагает убрать
+      созданное прошлой попыткой). Пока вопрос открыт, повторный вызов ждёт тот же ответ. */
+  const leaveWizard = useCallback(async (): Promise<boolean> => {
+    if (!wizardRef.current) return true;
+    if (!leaving.current) {
+      const guard = wizardGuard.current;
+      leaving.current = (guard ? guard() : Promise.resolve(true)).catch(() => false)
+        .finally(() => { leaving.current = null; });
+    }
+    if (!(await leaving.current)) return false;
     setWizard(null);
-    if (next !== "rules" && next !== "orders") setPanelRule(null);
-  }, []);
+    return true;
+  }, [setWizard]);
 
-  const setSection = useCallback((next: Section) => {
+  // Раздел, показанный сейчас: «Назад» браузера, от которого мастер отказался, возвращает его адрес.
+  const shownSection = useRef(section);
+  // Панель правила и мастер живут только в «Правилах» и «Приказах». Мастер — в «Правилах»:
+  // переход в тот же раздел его не закрывает, в другой — только после вопроса о несохранённом.
+  // Без открытого мастера раздел меняется сразу, в том же вызове.
+  const showSection = useCallback(async (next: Section) => {
+    if (wizardRef.current && next !== "rules" && !(await leaveWizard())) return false;
+    shownSection.current = next;
+    setSectionState(next);
+    if (next !== "rules") setWizard(null);
+    if (next !== "rules" && next !== "orders") setPanelRule(null);
+    return true;
+  }, [leaveWizard, setWizard]);
+
+  const setSection = useCallback(async (next: Section) => {
+    if (wizardRef.current && next !== "rules" && !(await leaveWizard())) return false;
     if (location.pathname !== sectionPath(next)) history.pushState(null, "", sectionPath(next));
-    showSection(next);
-  }, [showSection]);
+    return showSection(next);
+  }, [leaveWizard, showSection]);
 
   // Адрес — источник правды: «Назад» и «Вперёд» браузера переключают раздел,
   // а неизвестный адрес заменяется адресом показанного раздела.
   useEffect(() => {
     if (sectionOf(location.pathname) === null) history.replaceState(null, "", sectionPath("check"));
-    const onPop = () => showSection(sectionOf(location.pathname) ?? "check");
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
+    const onPop = async () => {
+      // Остались в мастере — адрес возвращается к показанному разделу.
+      if (!(await showSection(sectionOf(location.pathname) ?? "check")))
+        history.pushState(null, "", sectionPath(shownSection.current));
+    };
+    const listener = () => void onPop();
+    window.addEventListener("popstate", listener);
+    return () => window.removeEventListener("popstate", listener);
   }, [showSection]);
 
   const goToNode = useCallback(async (nodeId: string, kind?: NodeKind) => {
@@ -185,17 +237,26 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
     if (kind === "CheckTarget" || kind === "Department") {
       const [list, flag]: [{ nodeId: string }[], keyof Flags] = kind === "CheckTarget"
         ? [data.targets, "showArchivedTargets"] : [data.departments, "showArchivedDepartments"];
-      setSection(kind === "CheckTarget" ? "targets" : "departments");
+      if (!(await setSection(kind === "CheckTarget" ? "targets" : "departments"))) return;
       if (!list.some((n) => n.nodeId === nodeId) && !flagsRef.current[flag]) await reload({ [flag]: true });
       flash();
       return;
     }
 
     let orders = data.orders;
-    if (!findOrderOf(orders, nodeId) && !flagsRef.current.showArchived)
-      orders = (await reload({ showArchived: true }))?.orders ?? orders;
+    if (!findOrderOf(orders, nodeId) && !flagsRef.current.showArchived) {
+      let pending = reload({ showArchived: true });
+      let loaded = await pending;
+      // Перечитку обогнала более новая (null): её данные свежее и уже с архивом (флаг в flagsRef) —
+      // дождаться её, а не искать узел в старых orders без архива.
+      while (!loaded && lastReload.current !== pending) {
+        pending = lastReload.current;
+        loaded = await pending;
+      }
+      orders = loaded?.orders ?? orders;
+    }
     const found = findOrderOf(orders, nodeId);
-    setSection("orders");
+    if (!(await setSection("orders"))) return;
     if (found) setSelectedOrder(found.order.nodeId);
     // Правило и его примеры открываются в панели — там видно всё сразу.
     const rule = findRuleRef(orders, nodeId);
@@ -206,8 +267,8 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
   // Черновик мастера правила, сохранённый перед повторным входом, забирает сам
   // мастер — поэтому после входа он открывается сразу.
   useEffect(() => {
-    if (hasDraft("wizard")) { setSection("rules"); setWizard({}); }
-  }, [setSection]);
+    if (hasDraft("wizard")) { void setSection("rules"); setWizard({}); }
+  }, [setSection, setWizard]);
 
   // Подсветка — после того как React отрисовал нужный раздел.
   useEffect(() => {
@@ -228,11 +289,18 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
     selectedOrder, selectOrder: setSelectedOrder,
     panelRule, openRule: setPanelRule, closeRule: () => setPanelRule(null),
     wizard,
-    openWizard: (preset) => { setSection("rules"); setPanelRule(null); setWizard(preset ?? {}); },
-    closeWizard: () => setWizard(null),
+    openWizard: (preset) => {
+      // Мастер уже открыт — второй поверх не открывается: его ввод не должен пропасть молча.
+      if (wizardRef.current) return;
+      void setSection("rules"); setPanelRule(null); setWizard(preset ?? {});
+    },
+    closeWizard: (force) => { if (force) setWizard(null); else void leaveWizard(); },
+    leaveWizard,
+    setWizardGuard: (guard) => { wizardGuard.current = guard; },
+    savingRule, setSavingRule,
     goToNode, trace, setTrace,
   }), [trace, data, flags, apiState, health, section, setSection,
-    reload, mutate, refreshHealth, selectedOrder, panelRule, wizard, goToNode]);
+    reload, mutate, refreshHealth, selectedOrder, panelRule, wizard, goToNode, leaveWizard, setWizard, savingRule]);
 
   // Форма проверки — свой контекст: ввод в неё не перерисовывает потребителей каталога.
   return <Context.Provider value={value}><CheckFormProvider>{children}</CheckFormProvider></Context.Provider>;

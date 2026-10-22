@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import anyio
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 import agent
 import auth
@@ -64,6 +66,12 @@ ADVICE_MAX_ATTEMPTS = max(1, int(os.getenv("ADVICE_MAX_ATTEMPTS", "3")))
 ADVICE_MAX_EXAMPLES = max(0, int(os.getenv("ADVICE_MAX_EXAMPLES", "40")))
 # Примеров каждого вида в запросе советчика.
 ADVICE_PROMPT_EXAMPLES = 5
+# Срок совета: раньше, чем nginx перестанет ждать ответа (proxy_read_timeout 600 с).
+# Вышел — запросы к модели, ждущие очереди, снимаются, ответ — 503.
+ADVICE_DEADLINE_SECONDS = 300.0
+# Как часто обработчик смотрит, не закрыл ли клиент соединение.
+ADVICE_WATCH_SECONDS = 1.0
+ADVICE_STOPPED = "совет остановлен: не уложился в срок или запрос был прерван"
 
 ADVICE_SYSTEM = """Ты помогаешь редактору каталога требований к формулировкам целей.
 
@@ -154,14 +162,13 @@ def job_detector(target: dict[str, Any], department_id: Optional[str]) -> Detect
     groups, _ = agent.split_job_descriptions(agent.comparable(descriptions))
 
     def detect(text: str, description: str, holdout: bool = False) -> Answer:
-        criterion = description.strip() or target["name"]
-        found: list[dict[str, Any]] | None = None
-        for group in groups:
-            matches = agent.compare_with_job_descriptions(text, criterion, group)
-            if matches is not None:
-                found = (found or []) + matches
+        criterion = agent.sanitize_prompt_text(description) or target["name"]
+        # Тот же разбор, что в проверке: обязанность, которой нет в инструкции,
+        # атрибут не подтверждает — проверка такую цель тоже не засчитает.
+        found = agent.confirmed_matches(
+            (group, agent.compare_with_job_descriptions(text, criterion, group)) for group in groups)
         duty = next((m["duty"] for m in found or [] if m.get("duty")), None)
-        return Answer(found is not None, duty)
+        return Answer(bool(found), duty)
 
     return detect
 
@@ -177,14 +184,14 @@ def advice_message(
     """Что известно о споре — сообщением пользователя, отдельно от инструкций."""
     lines = [
         f'Атрибут: "{target["name"]}"',
-        f'Текущее описание: {(target.get("description") or "").strip() or "(пусто)"}',
+        f'Текущее описание: {agent.sanitize_prompt_text(target.get("description")) or "(пусто)"}',
     ]
     for kind, label in (("present", "Примеры каталога, где атрибут есть"),
                         ("absent", "Примеры каталога, где атрибута нет")):
         texts = examples.get(kind, [])[:ADVICE_PROMPT_EXAMPLES]
         if texts:
             lines.append(label + ":")
-            lines.extend(f"- «{t[:agent.PROMPT_EXAMPLE_MAX_CHARS]}»" for t in texts)
+            lines.extend(f"- «{agent.sanitize_prompt_text(t)[:agent.PROMPT_EXAMPLE_MAX_CHARS]}»" for t in texts)
     lines += [
         f"Цель: «{agent.clean_goal(goal)}»",
         "Ответ классификатора сейчас: " + _verdict(current.present)
@@ -193,7 +200,7 @@ def advice_message(
         f"Обоснование редактора: {agent.clean_goal(reason)}",
     ]
     for description, answer in tried:
-        lines.append(f"Уже пробовали описание «{description}» — не помогло: "
+        lines.append(f"Уже пробовали описание «{agent.sanitize_prompt_text(description)}» — не помогло: "
                      + _verdict(answer.present) + ". Предложи другое.")
     return "\n".join(lines)
 
@@ -221,18 +228,21 @@ def regression(
         return report
     # Пакет виден в мониторинге и ставит запросы в общую очередь, мимо резерва ручных проверок.
     # Логин — явно: поток запроса мог остаться с чужим контекстом от прошлой проверки.
-    batch = metrics.start_batch(f"advice-{uuid.uuid4().hex[:8]}", len(labeled), login)
+    batch = metrics.start_batch(f"advice-{uuid.uuid4().hex[:8]}", len(labeled), login,
+                                metrics.current_cancel())
 
     def one(item: tuple[str, bool]) -> str:
         text, present = item
         metrics.set_actor(login, batch)  # поток пула: контекст вызвавшего сюда не доходит
         with metrics.batch_item(batch):
             try:
+                if metrics.cancelled():
+                    return "failed"
                 # holdout: сам пример из примеров в промпте убирается — иначе модель видела бы ответ.
                 if detect(text, new, True).present == present:
                     return "kept"
                 return "broken" if detect(text, old, True).present == present else "alreadyWrong"
-            except agent.ExtractionError:
+            except (agent.ExtractionError, metrics.Cancelled):
                 return "failed"
 
     try:
@@ -271,8 +281,32 @@ def example_options(rules: list[dict[str, Any]], expected: bool) -> list[dict[st
 
 
 def advise(goal: str, attribute: str, expected: bool, reason: str,
-           department_id: Optional[str] = None, login: Optional[str] = None) -> dict[str, Any]:
-    """Предложение правок графа. Бросает ExtractionError, если модель не ответила."""
+           department_id: Optional[str] = None, login: Optional[str] = None,
+           cancel: Optional[threading.Event] = None) -> dict[str, Any]:
+    """Предложение правок графа. Бросает ExtractionError, если модель не ответила,
+    совет не уложился в ADVICE_DEADLINE_SECONDS или поднят флаг cancel (клиент ушёл)."""
+    stop = cancel if cancel is not None else threading.Event()
+    timer = threading.Timer(ADVICE_DEADLINE_SECONDS, stop.set)
+    timer.daemon = True
+    timer.start()
+    metrics.set_cancel(stop)
+    try:
+        return _advise(goal, attribute, expected, reason, department_id, login)
+    except metrics.Cancelled as exc:
+        raise agent.ExtractionError(ADVICE_STOPPED) from exc
+    finally:
+        timer.cancel()
+        metrics.set_cancel(None)
+
+
+def _checkpoint() -> None:
+    """Между запросами к модели: остановлен совет — дальше не идём."""
+    if metrics.cancelled():
+        raise metrics.Cancelled()
+
+
+def _advise(goal: str, attribute: str, expected: bool, reason: str,
+            department_id: Optional[str], login: Optional[str]) -> dict[str, Any]:
     targets = get_check_targets()
     key = normalize_name(attribute)
     target = next((t for t in targets if t["name"] == attribute), None) \
@@ -282,7 +316,7 @@ def advise(goal: str, attribute: str, expected: bool, reason: str,
     name = target["name"]
     by_job = target.get("source") == JOB_SOURCE
     rules = get_target_rules(name)
-    old = (target.get("description") or "").strip()
+    old = str(target.get("description") or "").strip()
 
     detect = job_detector(target, department_id) if by_job else text_detector(name, targets)
     current = detect(goal, old, False)
@@ -313,8 +347,10 @@ def advise(goal: str, attribute: str, expected: bool, reason: str,
     diagnosis = description = ""
     verified = False
     for _ in range(ADVICE_MAX_ATTEMPTS):
+        _checkpoint()
         diagnosis, description = propose(
             target, advice_message(target, goal, expected, reason, current, examples, tried))
+        _checkpoint()
         answer = detect(goal, description, False) if description != old else current
         if answer.present == expected:
             verified = True
@@ -331,7 +367,10 @@ def advise(goal: str, attribute: str, expected: bool, reason: str,
         if len(labeled) > ADVICE_MAX_EXAMPLES:
             notes.append(f"Новое описание проверено на {ADVICE_MAX_EXAMPLES} примерах каталога "
                          f"из {len(labeled)}.")
+        _checkpoint()
         result["regression"] = regression(detect, old, description, labeled[:ADVICE_MAX_EXAMPLES], login)
+        if metrics.cancelled():
+            raise metrics.Cancelled()
 
     if not by_job and not is_example:
         result["examples"] = example_options(rules, expected)
@@ -347,12 +386,46 @@ def advise(goal: str, attribute: str, expected: bool, reason: str,
 # --------------------------------------------------------------------------
 
 
+async def _until_done(request: Request, work: Callable[[], Any], stop: threading.Event) -> Any:
+    """work в потоке; клиент закрыл соединение (или обработчик отменён) — поднимает stop."""
+    outcome: dict[str, Any] = {}
+
+    async def run() -> None:
+        try:
+            outcome["value"] = await anyio.to_thread.run_sync(work)
+        except Exception as exc:  # noqa: BLE001 — поднимется ниже, вне группы задач
+            outcome["error"] = exc
+        group.cancel_scope.cancel()
+
+    async def watch() -> None:
+        try:
+            while not await request.is_disconnected():
+                await anyio.sleep(ADVICE_WATCH_SECONDS)
+            log.warning("Клиент закрыл соединение: совет останавливается")
+        finally:
+            stop.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run)
+        group.start_soon(watch)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
 @router.post("")
-def post_advice(body: schemas.AdviceRequest, user: auth.Principal = Depends(auth.editor)):
-    """Как поправить граф, чтобы по этой цели атрибут определялся иначе."""
+async def post_advice(request: Request, body: schemas.AdviceRequest,
+                      user: auth.Principal = Depends(auth.editor)):
+    """Как поправить граф, чтобы по этой цели атрибут определялся иначе.
+
+    Совет идёт не дольше ADVICE_DEADLINE_SECONDS и останавливается, если клиент
+    закрыл соединение: модель не занята впустую.
+    """
+    stop = threading.Event()
     try:
-        return advise(body.goal, body.attribute, body.expected, body.reason,
-                      body.department_id, user.login)
+        return await _until_done(request, lambda: advise(
+            body.goal, body.attribute, body.expected, body.reason, body.department_id, user.login, stop),
+            stop)
     except catalog.NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except catalog.Conflict as exc:

@@ -45,6 +45,8 @@ ORDER = {MISMATCHED: 0, FAILED: 1, SKIPPED: 2}
 GIVE_UP_AFTER = 5
 BATCH_ID = "examples"
 
+# toStringOrNull — как в graph.RULE_EXAMPLES: число или список в text (правка
+# в обход API) иначе роняет trim() и с ним весь прогон.
 Q_EXAMPLES = f"""
 MATCH (o:Order)-[:CONTAINS]->(c:Clause)
       -[:DEFINES]->(r:Rule)
@@ -53,12 +55,12 @@ WHERE {ACTIVE.format('o')}
   AND {ACTIVE.format('c')}
   AND {ACTIVE.format('r')}
   AND {ACTIVE.format('e')}
-  AND trim(coalesce(e.text, '')) <> ''
+  AND trim(coalesce(toStringOrNull(e.text), '')) <> ''
 OPTIONAL MATCH (r)-[:APPLIES_TO]->(t:CheckTarget)
 WHERE {ACTIVE.format('t')}
 RETURN elementId(e)                   AS nodeId,
        e.exampleId                    AS example_id,
-       e.text                         AS text,
+       toStringOrNull(e.text)         AS text,
        coalesce(e.isViolation, false) AS is_violation,
        elementId(r)                   AS rule_node_id,
        r.ruleId                       AS rule_id,
@@ -204,7 +206,7 @@ def _check(login: Optional[str]) -> list[dict[str, Any]]:
             item.update(outcome=SKIPPED, reason=reason)
         else:
             # Один текст может быть примером нескольких правил: модель спрашиваем раз.
-            by_text.setdefault(row["text"].strip(), []).append(item)
+            by_text.setdefault(str(row["text"] or "").strip(), []).append(item)
     if not by_text:
         return items
 

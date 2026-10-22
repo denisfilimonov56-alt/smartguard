@@ -18,6 +18,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from neo4j.exceptions import ConstraintError
+
 from graph import get_driver
 
 log = logging.getLogger(__name__)
@@ -116,15 +118,20 @@ def create(login: str, role: str, display_name: Optional[str], created_by: str) 
         if not rows:
             raise Conflict(f"Пользователь {login!r} уже есть в реестре")
         return _public(rows[0]["props"])
-    rows = _run(
-        """
-        CREATE (u:User {login: $login, role: $role, status: $status,
-                        displayName: $display_name, createdAt: $now, createdBy: $created_by})
-        RETURN properties(u) AS props
-        """,
-        login=login, role=role, status=ACTIVE_STATUS,
-        display_name=(display_name or "").strip() or None, now=_now(), created_by=created_by,
-    )
+    try:
+        rows = _run(
+            """
+            CREATE (u:User {login: $login, role: $role, status: $status,
+                            displayName: $display_name, createdAt: $now, createdBy: $created_by})
+            RETURN properties(u) AS props
+            """,
+            login=login, role=role, status=ACTIVE_STATUS,
+            display_name=(display_name or "").strip() or None, now=_now(), created_by=created_by,
+        )
+    except ConstraintError as exc:
+        # Между get и CREATE запись с тем же логином завёл другой запрос:
+        # ограничение user_login в графе — это 409, а не 500 (N25).
+        raise Conflict(f"Пользователь {login!r} уже есть в реестре") from exc
     return _public(rows[0]["props"])
 
 
@@ -137,8 +144,17 @@ def update(login: str, changes: dict[str, Any]) -> dict[str, Any]:
     props = {k: changes[k] for k in ("role", "status") if k in changes}
     if "displayName" in changes:
         props["displayName"] = (changes["displayName"] or "").strip() or None
+    # Роль узлу без роли (отметки бывшего администратора) выдаётся заново, как в
+    # create: привязка к прежней учётной записи Keycloak снимается, иначе логин
+    # остался бы за прежним владельцем в обход перепривязки (N26).
     rows = _run(
-        "MATCH (u:User {login: $login}) SET u += $props RETURN properties(u) AS props",
+        """
+        MATCH (u:User {login: $login})
+        WITH u, u.role IS NULL AND $props.role IS NOT NULL AS revived
+        SET u += $props
+        FOREACH (_ IN CASE WHEN revived THEN [1] ELSE [] END | REMOVE u.sub)
+        RETURN properties(u) AS props
+        """,
         login=login, props=props,
     )
     if not rows:

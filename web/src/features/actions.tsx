@@ -1,7 +1,8 @@
-import { api, ApiError, type JobDescriptionNode } from "../api/client";
+import { api, ApiError, isStale, STALE_TEXT, type JobDescriptionNode } from "../api/client";
 import type {
   CheckTarget, Clause, Department, Example, JobDescriptionRef, Order, Rule, Status, TargetSource,
 } from "../api/types";
+import { limitOf } from "../api/limits";
 import { useAuth } from "../state/auth";
 import { useCatalog } from "../state/catalog";
 import { findOrderOf } from "../state/tree";
@@ -55,6 +56,30 @@ export function useActions() {
 
   /** Ошибки действий, не прошедших через форму, показываются уведомлением. */
   const run = (fn: () => Promise<unknown>) => () => { fn().catch((err) => toast(errorText(err), "err")); };
+
+  /** Правка отклонена, потому что данные успели изменить (409 по expected): объяснить и перечитать
+      каталог. Форма при этом закрывается — её исходные значения устарели, открыть её надо заново. */
+  const unlessStale = async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+    } catch (err) {
+      if (!isStale(err)) throw err;
+      toast(STALE_TEXT, "err");
+      await catalog.reload();
+    }
+  };
+
+  /** Сохранить из формы правки только изменённые поля, а вместе с ними — их прежние значения (expected):
+      если узел за это время изменили, API отклонит правку (409) и не затрёт чужое изменение.
+      before — значения, как их отдал API; поля из loose в expected не идут: каталог отдаёт их
+      нормализованными (false вместо отсутствующего, "" вместо null), и сверка дала бы ложный 409. */
+  const saveChanged = (nodeId: string, values: Record<string, unknown>, changed: string[],
+    before: Record<string, unknown>, success: string, loose: string[] = []) => {
+    if (!changed.length) return Promise.resolve();
+    const properties = Object.fromEntries(changed.map((k) => [k, values[k]]));
+    const expected = Object.fromEntries(changed.filter((k) => !loose.includes(k)).map((k) => [k, before[k] ?? null]));
+    return unlessStale(() => mutate(() => api.patch(nodeId, properties, expected), success));
+  };
 
   const targetOptions = (): Option[] => targets.filter((t) => t.status !== "archived")
     .map((t) => ({ value: t.name, label: t.name, description: t.description }));
@@ -127,10 +152,10 @@ export function useActions() {
   const addOrder = () => openForm({
     title: "Новый приказ", submitLabel: "Создать",
     fields: [
-      { name: "number", label: "Номер", required: true, placeholder: "ПР-01" },
-      { name: "title", label: "Заголовок", type: "textarea", required: true, placeholder: "О порядке постановки целей" },
+      { name: "number", maxLength: limitOf("Order", "number"), label: "Номер", required: true, placeholder: "ПР-01" },
+      { name: "title", maxLength: limitOf("Order", "title"), label: "Заголовок", type: "textarea", required: true, placeholder: "О порядке постановки целей" },
       { name: "date", label: "Дата", type: "date" },
-      { name: "orderId", label: "Идентификатор", placeholder: "необязательно",
+      { name: "orderId", maxLength: limitOf("Order", "orderId"), label: "Идентификатор", placeholder: "необязательно",
         hint: "Если не заполнить — будет построен из номера." },
     ],
     onSubmit: (v) => mutate(async () => {
@@ -144,15 +169,14 @@ export function useActions() {
   const editOrder = (o: Order) => () => openForm({
     title: "Приказ " + (o.number ?? ""),
     fields: [
-      { name: "number", label: "Номер", value: o.number, required: true },
-      { name: "title", label: "Заголовок", type: "textarea", value: o.title, required: true },
+      { name: "number", maxLength: limitOf("Order", "number"), label: "Номер", value: o.number, required: true },
+      { name: "title", maxLength: limitOf("Order", "title"), label: "Заголовок", type: "textarea", value: o.title, required: true },
       { name: "date", label: "Дата", type: "date", value: o.date ?? "" },
-      { name: "orderId", label: "Идентификатор (orderId)", value: o.orderId ?? "", required: true,
+      { name: "orderId", maxLength: limitOf("Order", "orderId"), label: "Идентификатор (orderId)", value: o.orderId ?? "", required: true,
         hint: "Ключ для выгрузки в seed.cypher. Должен быть уникален." },
     ],
-    onSubmit: (v) => mutate(() => api.patch(o.nodeId, {
-      number: v.number, title: v.title, date: str(v.date) || null, orderId: v.orderId,
-    }), "Приказ обновлён"),
+    onSubmit: (v, changed) => saveChanged(o.nodeId, { ...v, date: str(v.date) || null }, changed,
+      { number: o.number, title: o.title, date: o.date, orderId: o.orderId }, "Приказ обновлён"),
   });
 
   const orderMenu = (o: Order): MenuItem[] => [
@@ -167,8 +191,8 @@ export function useActions() {
   const addClause = (orderNodeId: string) => () => openForm({
     title: "Новый пункт", submitLabel: "Создать",
     fields: [
-      { name: "code", label: "Номер пункта", required: true, placeholder: "3.1" },
-      { name: "text", label: "Текст пункта", type: "textarea", required: true },
+      { name: "code", maxLength: limitOf("Clause", "code"), label: "Номер пункта", required: true, placeholder: "3.1" },
+      { name: "text", maxLength: limitOf("Clause", "text"), label: "Текст пункта", type: "textarea", required: true },
     ],
     onSubmit: (v) => mutate(async () => {
       await api.createClause({ orderNodeId, code: str(v.code), text: str(v.text) });
@@ -179,11 +203,12 @@ export function useActions() {
   const editClause = (c: Clause) => () => openForm({
     title: "Пункт " + (c.code ?? ""),
     fields: [
-      { name: "code", label: "Номер пункта", value: c.code, required: true },
-      { name: "text", label: "Текст пункта", type: "textarea", value: c.text, required: true },
-      { name: "clauseId", label: "Идентификатор (clauseId)", value: c.clauseId ?? "", required: true },
+      { name: "code", maxLength: limitOf("Clause", "code"), label: "Номер пункта", value: c.code, required: true },
+      { name: "text", maxLength: limitOf("Clause", "text"), label: "Текст пункта", type: "textarea", value: c.text, required: true },
+      { name: "clauseId", maxLength: limitOf("Clause", "clauseId"), label: "Идентификатор (clauseId)", value: c.clauseId ?? "", required: true },
     ],
-    onSubmit: (v) => mutate(() => api.patch(c.nodeId, v), "Пункт обновлён"),
+    onSubmit: (v, changed) => saveChanged(c.nodeId, v, changed,
+      { code: c.code, text: c.text, clauseId: c.clauseId }, "Пункт обновлён"),
   });
 
   const clauseRefs = (c: Clause) => () => openForm({
@@ -194,7 +219,8 @@ export function useActions() {
       emptyText: "Других пунктов пока нет.",
       hint: "Связь (:Clause)-[:REFERENCES]->(:Clause). На проверку не влияет, нужна для навигации по нормативке.",
     }],
-    onSubmit: (v) => mutate(() => api.setReferences(c.nodeId, v.references as string[]), "Ссылки обновлены"),
+    onSubmit: (v, changed) => !changed.length ? Promise.resolve() : unlessStale(() => mutate(() =>
+      api.setReferences(c.nodeId, v.references as string[], c.references.map((r) => r.nodeId)), "Ссылки обновлены")),
   });
 
   const moveClause = (c: Clause) => () => openForm({
@@ -228,13 +254,16 @@ export function useActions() {
     title: "Правило " + (r.ruleId ?? ""),
     fields: [
       { name: "type", label: "Тип", type: "select", value: r.type ?? "REQUIREMENT", options: RULE_TYPE_OPTIONS },
-      { name: "description", label: "Формулировка правила", type: "textarea", value: r.description, required: true },
-      { name: "checkInstruction", label: "Что подсказать автору цели", type: "textarea", value: r.checkInstruction },
+      { name: "description", maxLength: limitOf("Rule", "description"), label: "Формулировка правила", type: "textarea", value: r.description, required: true },
+      { name: "checkInstruction", maxLength: limitOf("Rule", "checkInstruction"), label: "Что подсказать автору цели", type: "textarea", value: r.checkInstruction },
       { name: "studentsOnly", label: "Только для целей студентов", type: "checkbox", value: !!r.studentsOnly,
         hint: "Правило проверяется, только если запрос проверки передал, что цель ставит студент." },
-      { name: "ruleId", label: "Идентификатор (ruleId)", value: r.ruleId ?? "", required: true },
+      { name: "ruleId", maxLength: limitOf("Rule", "ruleId"), label: "Идентификатор (ruleId)", value: r.ruleId ?? "", required: true },
     ],
-    onSubmit: (v) => mutate(() => api.patch(r.nodeId, v), "Правило обновлено"),
+    onSubmit: (v, changed) => saveChanged(r.nodeId, v, changed, {
+      type: r.type, description: r.description, checkInstruction: r.checkInstruction, ruleId: r.ruleId,
+      studentsOnly: r.studentsOnly,
+    }, "Правило обновлено", r.studentsOnly ? [] : ["studentsOnly"]),
   });
 
   const ruleTargets = (r: Rule) => () => openForm({
@@ -247,7 +276,8 @@ export function useActions() {
         ? "Запрет сработает, если хотя бы один из атрибутов найден в цели."
         : "Требование сработает по каждому атрибуту, которого в цели нет.",
     }],
-    onSubmit: (v) => mutate(() => api.setRuleTargets(r.nodeId, v.targets as string[]), "Привязка обновлена"),
+    onSubmit: (v, changed) => !changed.length ? Promise.resolve() : unlessStale(() => mutate(() =>
+      api.setRuleTargets(r.nodeId, v.targets as string[], r.targets), "Привязка обновлена")),
   });
 
   const moveRule = (r: Rule) => () => {
@@ -275,7 +305,7 @@ export function useActions() {
     title: "Пример к правилу " + (r.ruleId ?? ""),
     submitLabel: "Добавить",
     fields: [
-      { name: "text", label: "Формулировка", type: "textarea", required: true },
+      { name: "text", maxLength: limitOf("ViolationExample", "text"), label: "Формулировка", type: "textarea", required: true },
       { name: "isViolation", label: "Это пример нарушения", type: "checkbox", value: r.type === "PROHIBITION",
         hint: r.type === "PROHIBITION"
           ? "Запрет показывает в ответе именно примеры нарушений — галочку обычно оставляют."
@@ -289,11 +319,12 @@ export function useActions() {
   const editExample = (e: Example) => () => openForm({
     title: "Пример " + (e.exampleId ?? ""),
     fields: [
-      { name: "text", label: "Формулировка", type: "textarea", value: e.text, required: true },
+      { name: "text", maxLength: limitOf("ViolationExample", "text"), label: "Формулировка", type: "textarea", value: e.text, required: true },
       { name: "isViolation", label: "Это пример нарушения", type: "checkbox", value: !!e.isViolation },
-      { name: "exampleId", label: "Идентификатор (exampleId)", value: e.exampleId ?? "", required: true },
+      { name: "exampleId", maxLength: limitOf("ViolationExample", "exampleId"), label: "Идентификатор (exampleId)", value: e.exampleId ?? "", required: true },
     ],
-    onSubmit: (v) => mutate(() => api.patch(e.nodeId, v), "Пример обновлён"),
+    onSubmit: (v, changed) => saveChanged(e.nodeId, v, changed,
+      { text: e.text, isViolation: e.isViolation, exampleId: e.exampleId }, "Пример обновлён"),
   });
 
   const deleteExample = (e: Example) => run(async () => {
@@ -309,9 +340,9 @@ export function useActions() {
   const addTarget = () => openForm({
     title: "Новый атрибут", submitLabel: "Создать",
     fields: [
-      { name: "name", label: "Имя", required: true, placeholder: "срок_исполнения",
+      { name: "name", maxLength: limitOf("CheckTarget", "name"), label: "Имя", required: true, placeholder: "срок_исполнения",
         hint: "Написание с пробелом и с подчёркиванием считается одним атрибутом — двойник создать не получится." },
-      { name: "description", label: "Описание для модели", type: "textarea", required: true,
+      { name: "description", maxLength: limitOf("CheckTarget", "description"), label: "Описание для модели", type: "textarea", required: true,
         placeholder: "в цели указан проверяемый срок: конкретная дата, месяц, квартал или год",
         hint: "Это перечисление признаков, по которым модель решает, есть атрибут в цели или нет." },
       { name: "source", label: "Как определяется", type: "select", value: "", options: SOURCE_OPTIONS,
@@ -325,13 +356,15 @@ export function useActions() {
   const editTarget = (t: CheckTarget) => () => openForm({
     title: "Атрибут " + t.name,
     fields: [
-      { name: "name", label: "Имя", value: t.name, required: true,
+      { name: "name", maxLength: limitOf("CheckTarget", "name"), label: "Имя", value: t.name, required: true,
         hint: "Переименование не меняет привязку правил: связь идёт по узлу." },
-      { name: "description", label: "Описание для модели", type: "textarea", value: t.description, required: true },
+      { name: "description", maxLength: limitOf("CheckTarget", "description"), label: "Описание для модели", type: "textarea", value: t.description, required: true },
       { name: "source", label: "Как определяется", type: "select", value: t.source ?? "", options: SOURCE_OPTIONS,
         hint: SOURCE_HINT },
     ],
-    onSubmit: (v) => mutate(() => api.patch(t.nodeId, { ...v, source: str(v.source) || null }), "Атрибут обновлён"),
+    onSubmit: (v, changed) => saveChanged(t.nodeId, { ...v, source: str(v.source) || null }, changed,
+      { name: t.name, description: t.description, source: t.source }, "Атрибут обновлён",
+      t.description ? [] : ["description"]),
   });
 
   const targetMenu = (t: CheckTarget): MenuItem[] => [
@@ -345,9 +378,9 @@ export function useActions() {
   const addDepartment = () => openForm({
     title: "Новое подразделение", submitLabel: "Создать",
     fields: [
-      { name: "departmentId", label: "Идентификатор", required: true, placeholder: "UCT",
+      { name: "departmentId", maxLength: limitOf("Department", "departmentId"), label: "Идентификатор", required: true, placeholder: "UCT",
         hint: "Тот, что кадровая система передаёт в запросе проверки как department_id." },
-      { name: "name", label: "Название", required: true, placeholder: "УЦТ" },
+      { name: "name", maxLength: limitOf("Department", "name"), label: "Название", required: true, placeholder: "УЦТ" },
     ],
     onSubmit: (v) => mutate(() => api.createDepartment({
       departmentId: str(v.departmentId), name: str(v.name),
@@ -357,11 +390,14 @@ export function useActions() {
   const editDepartment = (d: Department) => () => openForm({
     title: "Подразделение " + (d.name || d.departmentId || ""),
     fields: [
-      { name: "departmentId", label: "Идентификатор", value: d.departmentId ?? "", required: true,
+      { name: "departmentId", maxLength: limitOf("Department", "departmentId"), label: "Идентификатор", value: d.departmentId ?? "", required: true,
         hint: "Смена идентификатора не рвёт связи с правилами, но запросы проверки должны передавать новый." },
-      { name: "name", label: "Название", value: d.name, required: true },
+      { name: "name", maxLength: limitOf("Department", "name"), label: "Название", value: d.name, required: true },
     ],
-    onSubmit: (v) => mutate(() => api.patch(d.nodeId, v), "Подразделение обновлено"),
+    onSubmit: (v, changed) => saveChanged(d.nodeId, v, changed,
+      { departmentId: d.departmentId, name: d.name }, "Подразделение обновлено",
+      // Подразделение без name каталог отдаёт с name: "" — сверка с отсутствующим свойством дала бы ложный 409.
+      d.name ? [] : ["name"]),
   });
 
   // С инструкциями сравнивается цель, если правило стоит на атрибуте,
@@ -369,7 +405,7 @@ export function useActions() {
   const addJobDescription = (d: Department) => () => openForm({
     title: "Должностная инструкция — " + (d.name || d.departmentId || ""), submitLabel: "Загрузить", wide: true,
     fields: [
-      { name: "title", label: "Должность", required: true, placeholder: "Ведущий аналитик" },
+      { name: "title", maxLength: limitOf("JobDescription", "title"), label: "Должность", required: true, placeholder: "Ведущий аналитик" },
       { name: "text", label: "Текст инструкции", type: "textarea", required: true, hint: JOB_TEXT_HINT },
     ],
     onSubmit: async (v) => {
@@ -386,7 +422,10 @@ export function useActions() {
     title: "Обязанности — " + title, wide: true, submitLabel: "Подтвердить список",
     fields: [{ name: "duties", label: "Обязанности", type: "textarea", value: duties.join("\n"), required: true,
       hint: DUTIES_HINT }],
-    onSubmit: (v) => mutate(() => api.setJobDuties(nodeId, parseDuties(str(v.duties))), "Список обязанностей сохранён"),
+    // expected — список, как его показали редактору: если его за это время выписали заново
+    // или поправил другой пользователь, API отклонит правку (409) и не затрёт чужой список.
+    onSubmit: (v) => unlessStale(() => mutate(() => api.setJobDuties(nodeId, parseDuties(str(v.duties)), duties),
+      "Список обязанностей сохранён")),
   });
 
   /** После загрузки или правки текста: показать выписанный список либо сказать, что его нет. */
@@ -448,15 +487,18 @@ export function useActions() {
     openForm({
       title: "Должностная инструкция", wide: true,
       fields: [
-        { name: "title", label: "Должность", value: j.title, required: true },
+        { name: "title", maxLength: limitOf("JobDescription", "title"), label: "Должность", value: j.title, required: true },
         { name: "text", label: "Текст инструкции", type: "textarea", value: str(node.text), required: true,
           hint: "Если текст изменится, список обязанностей будет выписан заново." },
       ],
       onSubmit: async (v) => {
-        let updated!: JobDescriptionNode;
-        await mutate(async () => {
-          updated = await api.updateJobDescription(j.nodeId, { title: str(v.title), text: str(v.text) });
-        }, "Инструкция обновлена");
+        let updated: JobDescriptionNode | undefined;
+        // expected — название и текст, как их прочитала форма: чужая правка за это время — 409, не затираем её.
+        await unlessStale(() => mutate(async () => {
+          updated = await api.updateJobDescription(j.nodeId, { title: str(v.title), text: str(v.text) },
+            { title: str(node.title), text: str(node.text) });
+        }, "Инструкция обновлена"));
+        if (!updated) return;
         // Текст сменился — API запустил выписку заново (202, pending).
         if (updated.dutiesStatus === "pending" || str(v.text) !== str(node.text).trim()) void followDuties(updated);
       },

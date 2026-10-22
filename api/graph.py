@@ -17,32 +17,40 @@ from neo4j import Driver, GraphDatabase
 log = logging.getLogger(__name__)
 
 _driver: Optional[Driver] = None
+# Создание и закрытие драйвера — под замком: без него два потока при первом
+# запросе создавали каждый свой драйвер, и лишний не закрывался никогда (N22).
+_driver_lock = threading.Lock()
 
 
 def get_driver() -> Driver:
-    """Ленивая инициализация драйвера (потокобезопасна на уровне neo4j-драйвера)."""
+    """Ленивая инициализация драйвера: один на процесс, создаётся под замком."""
     global _driver
-    if _driver is None:
-        uri = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
-        user = os.getenv("NEO4J_USER", "neo4j")
-        password = os.getenv("NEO4J_PASSWORD", "password123")
-        log.info("Инициализация драйвера Neo4j: %s", uri)
-        _driver = GraphDatabase.driver(
-            uri,
-            auth=(user, password),
-            max_connection_lifetime=3600,
-            connection_acquisition_timeout=30,
-        )
-    return _driver
+    driver = _driver
+    if driver is not None:
+        return driver
+    with _driver_lock:
+        if _driver is None:
+            uri = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+            user = os.getenv("NEO4J_USER", "neo4j")
+            password = os.getenv("NEO4J_PASSWORD", "password123")
+            log.info("Инициализация драйвера Neo4j: %s", uri)
+            _driver = GraphDatabase.driver(
+                uri,
+                auth=(user, password),
+                max_connection_lifetime=3600,
+                connection_acquisition_timeout=30,
+            )
+        return _driver
 
 
 def close_driver() -> None:
     """Закрывает драйвер. Вызывается при остановке приложения."""
     global _driver
-    if _driver is not None:
+    with _driver_lock:
+        driver, _driver = _driver, None
+    if driver is not None:
         log.info("Закрытие драйвера Neo4j")
-        _driver.close()
-        _driver = None
+        driver.close()
 
 
 def verify_connectivity() -> bool:
@@ -91,7 +99,9 @@ ORDER BY id
 ALL_CHECK_TARGETS = f"""
 MATCH (t:CheckTarget)
 WHERE {ACTIVE.format('t')}
-RETURN t.name AS name, coalesce(t.description, '') AS description, t.source AS source
+// toStringOrNull: описание, сохранённое числом или true/false в обход API,
+// не роняет сборку промпта (.strip() у числа); список даёт пустое описание.
+RETURN t.name AS name, coalesce(toStringOrNull(t.description), '') AS description, t.source AS source
 ORDER BY name
 """
 
@@ -105,7 +115,7 @@ DEPARTMENT_JOB_DESCRIPTIONS = f"""
 MATCH (:Department {{departmentId: $department_id}})-[:HAS_JOB_DESCRIPTION]->(j:JobDescription)
 WHERE {ACTIVE.format('j')}
   AND (trim(coalesce(j.text, '')) <> '' OR size(coalesce(j.duties, [])) > 0)
-RETURN j.jobDescriptionId AS id, coalesce(j.title, '') AS title,
+RETURN j.jobDescriptionId AS id, coalesce(toStringOrNull(j.title), '') AS title,
        coalesce(j.text, '') AS text, coalesce(j.duties, []) AS duties
 ORDER BY title, id
 """
@@ -122,7 +132,7 @@ WHERE t.name IN $attributes
   AND {ACTIVE.format('t')}
   AND {FOR_DEPARTMENT}
   AND {FOR_AUDIENCE}
-RETURN t.name AS attribute, r.ruleId AS rule_id
+RETURN t.name AS attribute, r.ruleId AS rule_id, elementId(r) AS rule_node_id
 """
 
 # Запрет нарушен, если атрибут ПРИСУТСТВУЕТ в цели.
@@ -194,12 +204,12 @@ WHERE {ACTIVE.format('o')}
   AND {ACTIVE.format('c')}
   AND {ACTIVE.format('r')}
   AND {ACTIVE.format('e')}
-  AND trim(coalesce(e.text, '')) <> ''
+  AND trim(coalesce(toStringOrNull(e.text), '')) <> ''
 MATCH (r)-[:APPLIES_TO]->(t:CheckTarget)
 WHERE {ACTIVE.format('t')}
 RETURN elementId(e)                   AS node_id,
        coalesce(e.exampleId, '')      AS example_id,
-       e.text                         AS text,
+       toStringOrNull(e.text)         AS text,
        coalesce(e.isViolation, false) AS is_violation,
        r.type                         AS rule_type,
        collect(DISTINCT t.name)       AS targets

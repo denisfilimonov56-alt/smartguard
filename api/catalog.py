@@ -19,7 +19,7 @@ import re
 from typing import Any, Callable, Optional
 
 from graph import ACTIVE, JOB_SOURCE, get_driver
-from naming import normalize_name
+from naming import has_template_mark, normalize_name
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +63,29 @@ PROPERTY_NAME = re.compile(r"[^\W\d_]\w{0,63}")
 MAX_DUTIES = 300
 INT64 = (-2 ** 63, 2 ** 63 - 1)
 
+# Текстовые свойства, которые проверка, промпт и диагностика читают как строки:
+# (метка, имя) -> предел длины. Те же пределы — в схемах создания (schemas.py),
+# чтобы правка через PATCH /properties не обходила их: длинное описание атрибута
+# целиком уходит в системный промпт и переполняет окно модели.
+TEXT_LIMITS: dict[tuple[str, str], int] = {
+    ("Order", "number"): 100,
+    ("Order", "title"): 500,
+    ("Clause", "code"): 50,
+    ("Clause", "text"): 8000,
+    ("Rule", "description"): 4000,
+    ("Rule", "checkInstruction"): 4000,
+    ("ViolationExample", "text"): 4000,
+    ("CheckTarget", "name"): 200,
+    ("CheckTarget", "description"): 4000,
+    ("Department", "departmentId"): 100,
+    ("Department", "name"): 500,
+    ("JobDescription", "title"): 500,
+}
+# Какие из них можно очистить или удалить (при создании они необязательны).
+OPTIONAL_TEXT = {("Rule", "checkInstruction"), ("CheckTarget", "description")}
+# Потолок длины прочих строковых свойств (и каждой строки в списке).
+PROPERTY_MAX_CHARS = 8000
+
 
 class CatalogError(RuntimeError):
     """Базовая ошибка каталога."""
@@ -74,6 +97,20 @@ class NotFound(CatalogError):
 
 class Conflict(CatalogError):
     """Операция противоречит текущему состоянию графа."""
+
+
+class Invalid(Conflict):
+    """Неверное значение в запросе (422): тип, длина, служебные метки.
+
+    Наследник Conflict: код, который ловит Conflict, ловит и эту ошибку.
+    """
+
+
+class Stale(Conflict):
+    """Узел изменён другим пользователем после того, как его прочитали (409)."""
+
+
+STALE_MESSAGE = "Узел изменён другим пользователем — обновите страницу и повторите правку"
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +575,67 @@ def _controlled_value(label: str, name: str, value: Any) -> Any:
     return value
 
 
+def _text_value(label: str, name: str, value: Any) -> Any:
+    """Тип и длина текстовых свойств; служебные метки шаблона чата — отказ.
+
+    Известные текстовые свойства (TEXT_LIMITS) — только строка: число или
+    true/false в описании роняли сборку промпта и диагностику (.strip() у
+    числа, склейка строки с булевым в Cypher). Удалить (null) можно только
+    необязательные. Пределы длины — те же, что при создании; прочие строки
+    ограничены общим потолком PROPERTY_MAX_CHARS.
+
+    Пробелы по краям срезаются, как при создании: " 5 " в departmentId
+    иначе не совпал бы с "5" из запроса проверки, и правила ONLY_IN
+    молча не применялись бы. Пустая после среза строка — как пустая.
+    """
+    key = (label, name)
+    if key in TEXT_LIMITS:
+        if value is None:
+            if key in OPTIONAL_TEXT:
+                return None
+            raise Invalid(f"Свойство {name!r} обязательно, его нельзя удалить")
+        if not isinstance(value, str):
+            raise Invalid(f"Свойство {name!r} — текст: значение должно быть строкой")
+        value = value.strip()
+        if not value and key not in OPTIONAL_TEXT:
+            raise Invalid(f"Свойство {name!r} не может быть пустым")
+        limit = TEXT_LIMITS[key]
+    else:
+        limit = PROPERTY_MAX_CHARS
+    for text in (value if isinstance(value, list) else [value]):
+        if not isinstance(text, str):
+            continue
+        if len(text) > limit:
+            raise Invalid(f"Свойство {name!r}: не длиннее {limit} символов, сейчас {len(text)}")
+        if has_template_mark(text):
+            raise Invalid(f"Свойство {name!r}: служебные метки шаблона модели "
+                          "(<|...|>, <think>, <tool_call>) в тексте каталога недопустимы")
+    return value
+
+
+def _same_value(current: Any, expected: Any) -> bool:
+    """Совпадает ли значение в базе с тем, что клиент видел (как его отдаёт API)."""
+    current = _serialize(current)
+    if isinstance(current, list) and isinstance(expected, list):
+        return len(current) == len(expected) and all(map(_same_value, current, expected))
+    # true и 1 в Python равны, а для свойства это разные значения.
+    if isinstance(current, bool) or isinstance(expected, bool):
+        return type(current) is type(expected) and current == expected
+    return current == expected
+
+
+def _assert_unchanged(node: dict[str, Any], expected: dict[str, Any]) -> None:
+    """Оптимистичная блокировка: свойства в базе — те же, что видел редактор.
+
+    Отсутствующее свойство равно null. Расхождение — Stale (409): иначе
+    форма из старого снимка молча затёрла бы чужую правку.
+    """
+    changed = sorted(str(name) for name, value in expected.items()
+                     if not _same_value(node.get(name), value))
+    if changed:
+        raise Stale(f"{STALE_MESSAGE}. Изменились: {', '.join(changed)}")
+
+
 def _assert_no_twin(run: Runner, name: str, exclude_node_id: str | None = None) -> None:
     """Не даёт завести второй атрибут, отличающийся только написанием."""
     normalized = normalize_name(name)
@@ -551,19 +649,31 @@ def _assert_no_twin(run: Runner, name: str, exclude_node_id: str | None = None) 
             )
 
 
-def update_properties(node_id: str, properties: dict[str, Any]) -> dict[str, Any]:
+def update_properties(node_id: str, properties: dict[str, Any],
+                      expected: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Пишет произвольные свойства узла. None удаляет свойство.
 
     Имена свойств ограничены буквами, цифрами и подчёркиванием: они попадают в
     текст выгрузки seed (export_graph.py). Управляющие свойства (Rule.type,
-    studentsOnly, isViolation, source, Order.date) проверяются по смыслу.
-    Бизнес-ключ (orderId, ruleId...) проверяется на уникальность — иначе
-    выгрузка склеит два разных узла в один MERGE. Всё пишется одним запросом.
+    studentsOnly, isViolation, source, Order.date) проверяются по смыслу,
+    текстовые (TEXT_LIMITS) — по типу и длине. Бизнес-ключ (orderId, ruleId...)
+    проверяется на уникальность — иначе выгрузка склеит два разных узла в один
+    MERGE. Всё пишется одним запросом.
+
+    expected — {свойство: значение, которое видел редактор}: если в базе любое
+    из них уже другое, запись отклоняется (Stale, 409). Сверка и запись — в
+    одной транзакции под блокировкой узла.
     """
     def work(run: Runner) -> None:
         # Копия на каждую попытку: драйвер может повторить транзакцию.
         props = dict(properties)
+        if expected:
+            # Блокировка до чтения: иначе две правки прочли бы одно и то же
+            # прежнее значение и обе прошли бы сверку.
+            _lock(run, node_id)
         node = _fetch_node(node_id, run=run)
+        if expected:
+            _assert_unchanged(node, expected)
         label = next((l for l in node["labels"] if l in BUSINESS_KEYS), None)
         business_key = BUSINESS_KEYS.get(label or "")
 
@@ -586,12 +696,16 @@ def update_properties(node_id: str, properties: dict[str, Any]) -> dict[str, Any
                 )
             _check_value(name, props[name])
             props[name] = _controlled_value(label or "", name, props[name])
+            props[name] = _text_value(label or "", name, props[name])
 
         if business_key and business_key in props:
             if label == "CheckTarget":
                 _lock_key(run, "CheckTarget.name")
             value = props[business_key]
-            if value is None or (isinstance(value, str) and not value.strip()):
+            if isinstance(value, str):
+                # Ключ сверяется и пишется без пробелов по краям (как при создании).
+                value = props[business_key] = value.strip()
+            if value is None or (isinstance(value, str) and not value):
                 raise Conflict(f"{business_key} — ключ узла, его нельзя очистить")
             if not isinstance(value, str):
                 raise Conflict(f"{business_key} — ключ узла, он задаётся строкой")
@@ -995,26 +1109,41 @@ def create_job_description(department_node_id: str, title: str, text: str,
     return _job_view({"nodeId": row["nodeId"], **_props(row["props"])})
 
 
-def update_job_description(node_id: str, title: str, text: str) -> tuple[dict[str, Any], bool]:
+Q_UPDATE_JOB_DESCRIPTION = """
+MATCH (j) WHERE elementId(j) = $node_id
+SET j.title = $title, j.text = $text,
+    j.duties = CASE WHEN $changed THEN [] ELSE j.duties END,
+    j.dutiesReviewed = CASE WHEN $changed THEN false ELSE j.dutiesReviewed END,
+    j.dutiesStatus = CASE WHEN $changed THEN 'pending' ELSE j.dutiesStatus END,
+    j.dutiesError = CASE WHEN $changed THEN null ELSE j.dutiesError END
+"""
+
+
+def update_job_description(node_id: str, title: str, text: str,
+                           expected: Optional[dict[str, str]] = None) -> tuple[dict[str, Any], bool]:
     """Правит должность и текст инструкции. Возвращает (узел, изменился ли текст).
 
     С новым текстом прежний список обязанностей уже не сверен — он
     сбрасывается, а узел переходит в pending; вызывающий запускает выписку.
+
+    expected — {title, text}, какими их видел редактор: если в базе любое
+    уже другое, запись отклоняется (Stale, 409) — форма из старого снимка
+    не откатит чужой текст и не перезапустит его выписку. Сверка, сравнение
+    текста и запись — одной транзакцией под блокировкой узла.
     """
-    node = _fetch_node(node_id, "JobDescription")
     title, text = title.strip(), text.strip()
-    changed = text != (node.get("text") or "").strip()
-    _run(
-        """
-        MATCH (j) WHERE elementId(j) = $node_id
-        SET j.title = $title, j.text = $text,
-            j.duties = CASE WHEN $changed THEN [] ELSE j.duties END,
-            j.dutiesReviewed = CASE WHEN $changed THEN false ELSE j.dutiesReviewed END,
-            j.dutiesStatus = CASE WHEN $changed THEN 'pending' ELSE j.dutiesStatus END,
-            j.dutiesError = CASE WHEN $changed THEN null ELSE j.dutiesError END
-        """,
-        node_id=node_id, title=title, text=text, changed=changed,
-    )
+
+    def work(run: Runner) -> bool:
+        if expected is not None:
+            _lock(run, node_id)
+        node = _fetch_node(node_id, "JobDescription", run)
+        if expected is not None:
+            _assert_unchanged(node, {"title": expected.get("title"), "text": expected.get("text")})
+        changed = text != (node.get("text") or "").strip()
+        run(Q_UPDATE_JOB_DESCRIPTION, node_id=node_id, title=title, text=text, changed=changed)
+        return changed
+
+    changed = _write(work)
     return get_job_description(node_id), changed
 
 
@@ -1116,22 +1245,38 @@ def fail_pending_duties() -> int:
     return int((row or {}).get("total") or 0)
 
 
-def set_job_duties(node_id: str, duties: list[str], reviewed: bool) -> dict[str, Any]:
+Q_SET_JOB_DUTIES = (
+    "MATCH (j) WHERE elementId(j) = $node_id "
+    "SET j.duties = $duties, j.dutiesReviewed = $reviewed, "
+    "j.dutiesStatus = 'ready', j.dutiesError = null"
+)
+
+
+def set_job_duties(node_id: str, duties: list[str], reviewed: bool,
+                   expected: Optional[list[str]] = None) -> dict[str, Any]:
     """Сохраняет список обязанностей — с ним сравнивается цель.
 
     reviewed = False — список выписала модель и редактор его ещё не смотрел.
     Список, сохранённый вручную, заменяет и идущую выписку: её итог не запишется.
+
+    expected — список, который видел редактор: если в базе уже другой
+    (сравнение как упорядоченных списков — порядок обязанностей виден в
+    редакторе), запись отклоняется (Stale, 409). Сверка и запись — одной
+    транзакцией под блокировкой узла.
     """
-    _fetch_node(node_id, "JobDescription")
     cleaned = _clean_duties(duties)
     if len(cleaned) > MAX_DUTIES:
         raise Conflict(f"Слишком длинный список обязанностей: {len(cleaned)}, допустимо {MAX_DUTIES}")
-    _run(
-        "MATCH (j) WHERE elementId(j) = $node_id "
-        "SET j.duties = $duties, j.dutiesReviewed = $reviewed, "
-        "j.dutiesStatus = 'ready', j.dutiesError = null",
-        node_id=node_id, duties=cleaned, reviewed=reviewed,
-    )
+
+    def work(run: Runner) -> None:
+        if expected is not None:
+            _lock(run, node_id)
+        node = _fetch_node(node_id, "JobDescription", run)
+        if expected is not None:
+            _assert_unchanged({"duties": node.get("duties") or []}, {"duties": list(expected)})
+        run(Q_SET_JOB_DUTIES, node_id=node_id, duties=cleaned, reviewed=reviewed)
+
+    _write(work)
     log.info("Инструкция %s: обязанностей %d, проверено редактором: %s", node_id, len(cleaned), reviewed)
     return get_job_description(node_id)
 
@@ -1209,11 +1354,42 @@ def _check_departments_known(run: Runner, only: list[str]) -> None:
         raise NotFound("Нет таких подразделений: " + ", ".join(unknown))
 
 
-def set_rule_targets(rule_node_id: str, targets: list[str]) -> list[str]:
-    """Полностью заменяет набор атрибутов правила."""
+# Текущие наборы связей — для сверки с ожидаемым (оптимистичная блокировка).
+# Формат значений тот же, что у основного списка в запросе PUT.
+Q_CURRENT_LINKS = {
+    "targets": "MATCH (r:Rule)-[:APPLIES_TO]->(t:CheckTarget) WHERE elementId(r) = $id "
+               "RETURN t.name AS value",
+    "only": "MATCH (r:Rule)-[:ONLY_IN]->(d:Department) WHERE elementId(r) = $id "
+            "RETURN d.departmentId AS value",
+    "references": "MATCH (a:Clause)-[:REFERENCES]->(b:Clause) WHERE elementId(a) = $id "
+                  "RETURN elementId(b) AS value",
+}
+
+
+def _assert_links_unchanged(run: Runner, node_id: str, kind: str,
+                            expected: Optional[list[str]]) -> None:
+    """Набор связей в базе — тот, что видел редактор; иначе Stale (409).
+
+    Сравнивается как множество: порядок и повторы не важны. Вызывается после
+    _lock — сверка и замена идут в одной транзакции.
+    """
+    if expected is None:
+        return
+    current = {row["value"] for row in run(Q_CURRENT_LINKS[kind], id=node_id)}
+    if current != set(expected):
+        raise Stale(STALE_MESSAGE)
+
+
+def set_rule_targets(rule_node_id: str, targets: list[str],
+                     expected: Optional[list[str]] = None) -> list[str]:
+    """Полностью заменяет набор атрибутов правила.
+
+    expected — прежний набор, который видел редактор; если в базе уже другой — Stale (409).
+    """
     def work(run: Runner) -> None:
         _fetch_node(rule_node_id, "Rule", run)
         _lock(run, rule_node_id)
+        _assert_links_unchanged(run, rule_node_id, "targets", expected)
         _check_targets_known(run, targets)
         _replace_links(run, rule_node_id, "targets", targets)
 
@@ -1222,14 +1398,17 @@ def set_rule_targets(rule_node_id: str, targets: list[str]) -> list[str]:
     return targets
 
 
-def set_rule_scope(rule_node_id: str, only: list[str]) -> dict[str, Any]:
+def set_rule_scope(rule_node_id: str, only: list[str],
+                   expected: Optional[list[str]] = None) -> dict[str, Any]:
     """Полностью заменяет область действия правила по подразделениям.
 
     only — departmentId, в которых правило действует; пусто — для всех.
+    expected — прежняя область, которую видел редактор; если в базе уже другая — Stale (409).
     """
     def work(run: Runner) -> None:
         _fetch_node(rule_node_id, "Rule", run)
         _lock(run, rule_node_id)
+        _assert_links_unchanged(run, rule_node_id, "only", expected)
         _check_departments_known(run, only)
         _replace_links(run, rule_node_id, "only", only)
 
@@ -1251,14 +1430,19 @@ def set_rule_audience(rule_node_id: str, students_only: bool) -> dict[str, Any]:
     return {"studentsOnly": bool(students_only)}
 
 
-def set_clause_references(clause_node_id: str, target_node_ids: list[str]) -> list[str]:
-    """Перекрёстные ссылки между пунктами: (:Clause)-[:REFERENCES]->(:Clause)."""
+def set_clause_references(clause_node_id: str, target_node_ids: list[str],
+                          expected: Optional[list[str]] = None) -> list[str]:
+    """Перекрёстные ссылки между пунктами: (:Clause)-[:REFERENCES]->(:Clause).
+
+    expected — прежний набор nodeId, который видел редактор; если в базе уже другой — Stale (409).
+    """
     if clause_node_id in target_node_ids:
         raise Conflict("Пункт не может ссылаться сам на себя")
 
     def work(run: Runner) -> None:
         _fetch_node(clause_node_id, "Clause", run)
         _lock(run, clause_node_id)
+        _assert_links_unchanged(run, clause_node_id, "references", expected)
         for target in target_node_ids:
             _fetch_node(target, "Clause", run)
         _replace_links(run, clause_node_id, "references", target_node_ids)
@@ -1494,6 +1678,6 @@ MATCH (t:CheckTarget)
 OPTIONAL MATCH (r:Rule)-[:APPLIES_TO]->(t)
 RETURN elementId(t) AS nodeId, t.name AS name,
        coalesce(t.status, 'active') AS status, t.source AS source,
-       trim(coalesce(t.description, '')) <> '' AS described,
+       trim(coalesce(toStringOrNull(t.description), '')) <> '' AS described,
        count(r) AS rules
 """

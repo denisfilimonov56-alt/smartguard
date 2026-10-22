@@ -898,7 +898,7 @@ def duties(monkeypatch):
     pool = SyncPool()
     finished = []
     monkeypatch.setattr(routes, "_duties_pool", pool)
-    monkeypatch.setattr(routes, "_duties_running", set())
+    monkeypatch.setattr(routes, "_duties_running", {})
     orphaned = []
     monkeypatch.setattr(catalog, "fail_orphaned_duties", lambda node_id: orphaned.append(node_id) or False)
     monkeypatch.setattr(catalog, "finish_duties",
@@ -967,7 +967,7 @@ def test_repeated_extraction_while_pending_is_409(api, duties, monkeypatch):
 
 def test_job_description_is_polled_by_get(api, monkeypatch):
     import routes
-    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID})  # выписка идёт в этом процессе
+    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID: 1})  # выписка идёт в этом процессе
     monkeypatch.setattr(catalog, "fail_orphaned_duties", lambda node_id: pytest.fail("идущая выписка"))
     monkeypatch.setattr(catalog, "get_job_description", lambda node_id: {**PENDING_JOB, "duties": []})
     main_body = api.get(f"/catalog/job-descriptions/{JOB_NODE_ID}").json()
@@ -1111,7 +1111,7 @@ def test_job_leaves_running_set_even_if_finish_failed(monkeypatch):
     import agent
     import routes
     monkeypatch.setattr(routes, "FINISH_RETRY_PAUSE", 0)
-    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID})
+    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID: 1})
     monkeypatch.setattr(agent, "extract_duties", lambda text: ["А"])
     monkeypatch.setattr(catalog, "finish_duties", lambda *a, **k: 1 / 0)
     routes._extract_duties_job(JOB_NODE_ID, "текст")
@@ -1121,7 +1121,7 @@ def test_job_leaves_running_set_even_if_finish_failed(monkeypatch):
 def test_orphaned_pending_is_reported_as_error_on_poll(api, monkeypatch):
     """pending без идущей выписки (итог не записался) — error без перезапуска API."""
     import routes
-    monkeypatch.setattr(routes, "_duties_running", set())
+    monkeypatch.setattr(routes, "_duties_running", {})
     state = {"status": "pending", "error": None}
     closed = []
 
@@ -1142,7 +1142,7 @@ def test_orphaned_pending_is_reported_as_error_on_poll(api, monkeypatch):
 def test_pending_is_not_closed_while_another_request_starts_extraction(api, monkeypatch):
     """Окно «уже pending, ещё не в очереди» — не обрыв."""
     import routes
-    monkeypatch.setattr(routes, "_duties_running", set())
+    monkeypatch.setattr(routes, "_duties_running", {})
     monkeypatch.setattr(routes, "_duties_starting", 1)
     monkeypatch.setattr(catalog, "fail_orphaned_duties", lambda node_id: pytest.fail("не обрыв"))
     monkeypatch.setattr(catalog, "get_job_description", lambda node_id: dict(PENDING_JOB))
@@ -1194,9 +1194,9 @@ def test_shutdown_forgets_cancelled_jobs(monkeypatch):
     pool._closed = False
     pool._queue.put((routes._extract_duties_job, ("4:db:77", "т")))  # в очереди, поток не заведён
     monkeypatch.setattr(routes, "_duties_pool", pool)
-    monkeypatch.setattr(routes, "_duties_running", {"4:db:77"})
+    monkeypatch.setattr(routes, "_duties_running", {"4:db:77": 1})
     routes.shutdown_duties_pool()
-    assert routes._duties_running == set()
+    assert routes._duties_running == {}
     assert isinstance(routes._duties_pool, routes.DaemonPool) and routes._duties_pool is not pool
 
 

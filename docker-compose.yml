@@ -19,6 +19,12 @@
 #
 # Релиз (обновление и запуск) на сервере: docs/release.md
 
+# Имя проекта задано явно, а не берётся из имени каталога: тома называются
+# goal-checker_neo4j_data, goal-checker_api_audit, … где бы ни лежал клон
+# (как и у прежней офлайн-установки в /opt/goal-checker). Клон в другой
+# каталог поднимается на тех же томах, а не на новых пустых.
+name: goal-checker
+
 # Ротация логов docker: без неё json-file растёт без предела и забивает
 # /var/lib/docker. Подключается в каждый сервис через *default-logging.
 x-logging: &default-logging
@@ -51,8 +57,11 @@ services:
   # Разовый сервис: создаёт схему графа из neo4j/init/seed.cypher (при каждом
   # подъёме стека, идемпотентно) и загружает данные из neo4j/init/data.cypher —
   # только в пустой каталог или по явному SEED_DATA=1, чтобы подъём стека не
-  # откатывал правки из интерфейса. Neo4j 5 не исполняет .cypher из /init сам,
-  # поэтому это делает seed.py.
+  # откатывал правки из интерфейса. data.cypher — выгрузка этого сервера, в git
+  # её нет (образец — data.example.cypher); нет файла — загружается только схема.
+  # Миграции (SEED_FILE=/init/migrations/…) отмечаются узлом :Migration, и
+  # применённая повторно не выполняется. Neo4j 5 не исполняет .cypher из /init
+  # сам, поэтому это делает seed.py.
   seeder:
     image: goal-checker-api:${APP_VERSION:-latest}
     build: ./api
@@ -61,13 +70,20 @@ services:
     logging: *default-logging
     command: ["python", "seed.py"]
     environment:
+      # Мимо прокси — см. комментарий у NO_PROXY сервиса api.
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
       SEED_FILE: /init/seed.cypher
       SEED_DATA_FILE: /init/data.cypher
-      # 1 — применить data.cypher и к непустому каталогу (вернуть каталог к файлу).
+      # 1 — восстановить каталог из data.cypher: в одной транзакции удалить узлы
+      # каталога и загрузить файл (:User, :ApiKey, :Setting, история не трогаются;
+      # нет файла или он пуст — каталог не трогается).
       SEED_DATA: ${SEED_DATA:-0}
+      # 1 — выполнить миграцию (SEED_FILE) повторно, даже если она уже применялась.
+      SEED_REAPPLY: ${SEED_REAPPLY:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./neo4j/init:/init:ro
@@ -82,7 +98,13 @@ services:
     pull_policy: ${PULL_POLICY:-never}
     restart: unless-stopped
     logging: *default-logging
+    labels:
+      # Зависший vLLM (healthcheck unhealthy) перезапускает сервис autoheal.
+      autoheal: "true"
     environment:
+      # Мимо прокси — см. комментарий у NO_PROXY сервиса api.
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
       # Запрет на любые обращения к Hugging Face и телеметрию.
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -134,10 +156,23 @@ services:
     # uvicorn дорабатывает идущие запросы до 45 с (api/Dockerfile) — запас,
     # чтобы docker не убил процесс раньше и история проверок успела записаться.
     stop_grace_period: 60s
+    labels:
+      # Зависший API (healthcheck /health в api/Dockerfile) перезапускает autoheal.
+      autoheal: "true"
     # Каждая переменная, которую читает API, перечислена здесь с тем же
     # значением по умолчанию, что в коде (сверяет tests/test_deploy.py):
     # переменная из .env, которой нет в этом списке, до контейнера не доходит.
     environment:
+      # Обращения между сервисами — мимо прокси. Docker подставляет в
+      # контейнеры HTTP_PROXY/HTTPS_PROXY из раздела proxies в
+      # ~/.docker/config.json, и без NO_PROXY запросы к vllm, keycloak и даже
+      # к 127.0.0.1 (healthcheck, /ready) ушли бы на корпоративный прокси,
+      # который этих имён не знает. Явное значение здесь перекрывает
+      # подстановку из config.json. Свои адреса, которые тоже надо исключить
+      # (внешний VLLM_URL, корпоративный Keycloak), — в NO_PROXY_EXTRA через
+      # запятую. Как дать сеть релизу — docs/release.md.
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
@@ -146,6 +181,9 @@ services:
       VLLM_URL: ${VLLM_URL:-http://vllm:8000/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:-dummy}
       VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
+      # Корневой сертификат модели по https://, если он выдан внутренним ЦС
+      # (LLM_CA_FILE=/certs/<файл>); пусто — системные сертификаты.
+      LLM_CA_FILE: ${LLM_CA_FILE:-}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
       LLM_CONNECT_TIMEOUT_SECONDS: ${LLM_CONNECT_TIMEOUT_SECONDS:-5}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
@@ -160,6 +198,11 @@ services:
       LLM_JSON_MODE: ${LLM_JSON_MODE:-1}
       BULK_MAX_WORKERS: ${BULK_MAX_WORKERS:-16}
       BULK_MAX_REQUESTS: ${BULK_MAX_REQUESTS:-4}
+      # Пакет отвечает не позже стольких секунд; пусто — 600 (таймаут nginx)
+      # минус таймаут модели (LLM_TIMEOUT_SECONDS + LLM_CONNECT_TIMEOUT_SECONDS) и 15 с запаса.
+      BULK_DEADLINE_SECONDS: ${BULK_DEADLINE_SECONDS:-}
+      # Предел ожидающих ручных проверок; пусто — вдвое больше ёмкости модели.
+      CHECK_MAX_PENDING: ${CHECK_MAX_PENDING:-}
       # Потоков обработчиков API; пусто — по ёмкости модели.
       API_THREADS: ${API_THREADS:-}
       LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-32}
@@ -188,6 +231,8 @@ services:
       AUDIT_LOG_DIR: /data/audit
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-365}
       AUDIT_MAX_FILE_MB: ${AUDIT_MAX_FILE_MB:-100}
+      # Предел объёма всех файлов журнала; пусто — значение по умолчанию в api/audit.py.
+      AUDIT_MAX_TOTAL_MB: ${AUDIT_MAX_TOTAL_MB:-}
       # Вход в интерфейс: кто пользователь — решает Keycloak, роли — реестр в Neo4j.
       KEYCLOAK_URL: ${KEYCLOAK_URL:-}
       KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_INTERNAL_URL:-}
@@ -205,7 +250,8 @@ services:
       # (процесс работает от uid 10001: нужна запись в файл, см. docs/data.md;
       # без неё выгрузка идёт через --stdout).
       - ./neo4j/init:/init
-      # Корневой сертификат Keycloak, если он не публичный (KEYCLOAK_CA_FILE=/certs/<файл>).
+      # Корневые сертификаты внутреннего ЦС для Keycloak и модели по https
+      # (KEYCLOAK_CA_FILE, LLM_CA_FILE = /certs/<файл>).
       - ./certs:/certs:ro
       # Журнал аудита переживает пересоздание контейнера и обновления.
       - api_audit:/data/audit
@@ -231,6 +277,9 @@ services:
     logging: *default-logging
     environment:
       TRUSTED_PROXY: ${TRUSTED_PROXY:-127.0.0.1}
+      # Предел запросов к API с одного адреса: в секунду и всплеск сверх него (nginx limit_req).
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-50}
+      API_RATE_BURST: ${API_RATE_BURST:-200}
       # Браузер ходит в Keycloak напрямую: его origin разрешается в Content-Security-Policy.
       KEYCLOAK_URL: ${KEYCLOAK_URL:-}
     ports:
@@ -268,6 +317,33 @@ services:
       # docker создал бы его от root, а Keycloak (uid 1000) не смог бы писать базу.
       - keycloak_data:/opt/keycloak/data
       - ./keycloak:/opt/keycloak/data/import:ro
+
+  # Автоперезапуск зависших контейнеров. Docker без Swarm по статусу
+  # unhealthy не перезапускает: restart: unless-stopped срабатывает, только
+  # когда процесс завершился, а зависший vLLM или API живы. autoheal раз в
+  # AUTOHEAL_INTERVAL секунд перезапускает контейнеры с меткой autoheal=true
+  # (vllm, api), у которых healthcheck в состоянии unhealthy; пока идёт
+  # start_period (у vLLM — 15 минут на загрузку весов), unhealthy не бывает.
+  # Образ скачивается при релизе вместе с остальными (шаг 2), тег закреплён.
+  # Нужен доступ к docker.sock — это права root на хосте; если так нельзя,
+  # AUTOHEAL_REPLICAS=0 и systemd-таймер (docs/deployment.md).
+  autoheal:
+    image: ${AUTOHEAL_IMAGE:-willfarrell/autoheal:1.2.0}
+    pull_policy: ${PULL_POLICY:-never}
+    restart: unless-stopped
+    logging: *default-logging
+    network_mode: none
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: ${AUTOHEAL_INTERVAL:-30}
+      AUTOHEAL_START_PERIOD: 0
+      # Сколько секунд docker ждёт остановки перед kill: API дорабатывает
+      # запросы до 45 с (stop_grace_period: 60s).
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      replicas: ${AUTOHEAL_REPLICAS:-1}
 
   # Разовый сервис релиза: скачивает (докачивает) веса модели с Hugging Face
   # в ${MODELS_DIR}/${VLLM_MODEL_DIR} и проверяет, что все шарды на месте.

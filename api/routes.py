@@ -78,6 +78,9 @@ def _handle(func, *args, **kwargs):
         return func(*args, **kwargs)
     except catalog.NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except catalog.Invalid as exc:
+        # Неверное значение (тип, длина, служебные метки) — как ошибка схемы.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except catalog.Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ConstraintError as exc:
@@ -136,8 +139,11 @@ def get_node(node_id: str):
 
 @router.patch("/nodes/{node_id}/properties", dependencies=EDITOR)
 def patch_node_properties(node_id: str, body: schemas.PropertiesRequest):
-    """Правка произвольных свойств. null в значении удаляет свойство."""
-    return _handle(catalog.update_properties, node_id, dict(body.properties))
+    """Правка произвольных свойств. null в значении удаляет свойство.
+
+    expected — значения, которые видел редактор: если узел с тех пор изменили, 409.
+    """
+    return _handle(catalog.update_properties, node_id, dict(body.properties), **_expected(body))
 
 
 @router.post("/nodes/{node_id}/status", dependencies=EDITOR)
@@ -271,13 +277,19 @@ class DaemonPool:
 
 
 _duties_pool = DaemonPool(DUTIES_WORKERS, "duties")
-# Инструкции, чью выписку ведёт этот процесс (в очереди или идёт). pending
-# вне этого набора — оборванная выписка: результат уже никто не запишет.
-_duties_running: set[str] = set()
+# Сколько выписок каждой инструкции ведёт этот процесс (в очереди или идёт).
+# Счётчик, а не множество: правка текста во время выписки ставит в очередь
+# вторую задачу на тот же узел, и конец первой не должен снимать отметку за
+# обе. pending без отметки — оборванная выписка: результат уже никто не запишет.
+_duties_running: dict[str, int] = {}
 # Сколько запросов сейчас переводят инструкцию в pending и ещё не поставили
 # выписку в очередь: в это окно pending «без задачи» — норма, а не обрыв.
 _duties_starting = 0
+# Инструкции, которые сейчас закрываются как оборванные (запрос к Neo4j идёт
+# без замка): старт выписки той же инструкции ждёт конца закрытия.
+_duties_closing: set[str] = set()
 _duties_lock = threading.Lock()
+_duties_changed = threading.Condition(_duties_lock)
 
 
 def _finish_duties(node_id: str, text: str, duties: Optional[list[str]] = None,
@@ -318,16 +330,25 @@ def _extract_duties_job(node_id: str, text: str) -> None:
             return
         _finish_duties(node_id, text, duties=duties)
     finally:
-        with _duties_lock:
-            _duties_running.discard(node_id)
+        _duties_done(node_id)
 
 
 class _Starting:
-    """Окно «инструкция уже pending, а выписка ещё не в очереди»."""
+    """Окно «инструкция уже pending, а выписка ещё не в очереди».
+
+    node_id — инструкция, которую запрос переводит в pending (у новой его
+    ещё нет). Если её как раз закрывают как оборванную (_close_orphaned_duties),
+    запрос дожидается конца закрытия: иначе запоздавший error затёр бы его pending.
+    """
+
+    def __init__(self, node_id: Optional[str] = None):
+        self._node_id = node_id
 
     def __enter__(self):
         global _duties_starting
-        with _duties_lock:
+        with _duties_changed:
+            while self._node_id is not None and self._node_id in _duties_closing:
+                _duties_changed.wait()
             _duties_starting += 1
 
     def __exit__(self, *exc):
@@ -336,14 +357,23 @@ class _Starting:
             _duties_starting -= 1
 
 
+def _duties_done(node_id: str) -> None:
+    """Задача выписки узла закончилась или отменена: минус одна в счётчике."""
+    with _duties_lock:
+        left = _duties_running.get(node_id, 0) - 1
+        if left > 0:
+            _duties_running[node_id] = left
+        else:
+            _duties_running.pop(node_id, None)
+
+
 def _start_duties(node: dict) -> dict:
     with _duties_lock:
-        _duties_running.add(node["nodeId"])
+        _duties_running[node["nodeId"]] = _duties_running.get(node["nodeId"], 0) + 1
     try:
         _duties_pool.submit(_extract_duties_job, node["nodeId"], node.get("text") or "")
     except Exception:
-        with _duties_lock:
-            _duties_running.discard(node["nodeId"])
+        _duties_done(node["nodeId"])
         raise
     return node
 
@@ -355,12 +385,23 @@ def _close_orphaned_duties(node_id: str) -> bool:
     перезапуска API, и её можно запустить заново. API — один процесс
     (uvicorn без --workers), поэтому «чужих» идущих выписок не бывает.
     Запись — под замком: запрос, который в это время переводит инструкцию
-    в pending (_Starting), дождётся её и не потеряет свою выписку.
+    в pending (_Starting), не пересекается с ней.
+
+    Запрос к Neo4j идёт вне _duties_lock: при медленной базе замок держал бы
+    завершение и старт всех выписок. Под замком — только решение «выписки
+    нет» и отметка узла в _duties_closing; старт выписки этого же узла ждёт
+    снятия отметки, а старт другого, завершения и опросы не ждут.
     """
     with _duties_lock:
-        if node_id in _duties_running or _duties_starting:
+        if node_id in _duties_running or _duties_starting or node_id in _duties_closing:
             return False
+        _duties_closing.add(node_id)
+    try:
         return catalog.fail_orphaned_duties(node_id)
+    finally:
+        with _duties_changed:
+            _duties_closing.discard(node_id)
+            _duties_changed.notify_all()
 
 
 def shutdown_duties_pool() -> None:
@@ -373,8 +414,7 @@ def shutdown_duties_pool() -> None:
         return  # подменён в тестах
     old, _duties_pool = _duties_pool, DaemonPool(DUTIES_WORKERS, "duties")
     for args in old.shutdown():
-        with _duties_lock:
-            _duties_running.discard(args[0])
+        _duties_done(args[0])
 
 
 def recover_duties_jobs() -> int:
@@ -420,8 +460,10 @@ def get_job_description(node_id: str):
 @router.put("/job-descriptions/{node_id}", dependencies=EDITOR)
 def put_job_description(node_id: str, body: schemas.JobDescriptionUpdate, response: Response):
     """Правка должности и текста; при новом тексте обязанности выписываются заново (202)."""
-    with _Starting():
-        node, changed = _handle(catalog.update_job_description, node_id, body.title, body.text)
+    expected = {} if body.expected is None else {"expected": body.expected.model_dump()}
+    with _Starting(node_id):
+        node, changed = _handle(catalog.update_job_description, node_id, body.title, body.text,
+                                **expected)
         if not changed:
             return node
         response.status_code = 202
@@ -437,28 +479,36 @@ def post_extract_duties(node_id: str):
     запускается заново без перезапуска API.
     """
     _close_orphaned_duties(node_id)
-    with _Starting():
+    with _Starting(node_id):
         return _start_duties(_handle(catalog.start_duties_extraction, node_id))
 
 
 @router.put("/job-descriptions/{node_id}/duties", dependencies=EDITOR)
 def put_job_duties(node_id: str, body: schemas.JobDuties):
-    """Список обязанностей, проверенный и поправленный редактором."""
-    return _handle(catalog.set_job_duties, node_id, body.duties, True)
+    """Список обязанностей, проверенный и поправленный редактором.
+
+    expected — прежний список (как упорядоченный); если в базе уже другой — 409.
+    """
+    return _handle(catalog.set_job_duties, node_id, body.duties, True, **_expected(body))
 
 
 # -------------------------------- связи -------------------------------------
 
 
+def _expected(body) -> dict:
+    """expected передаётся слою данных, только если клиент его прислал."""
+    return {} if body.expected is None else {"expected": body.expected}
+
+
 @router.put("/rules/{node_id}/targets", dependencies=EDITOR)
 def put_rule_targets(node_id: str, body: schemas.RuleTargets):
-    return {"targets": _handle(catalog.set_rule_targets, node_id, body.targets)}
+    return {"targets": _handle(catalog.set_rule_targets, node_id, body.targets, **_expected(body))}
 
 
 @router.put("/rules/{node_id}/departments", dependencies=EDITOR)
 def put_rule_departments(node_id: str, body: schemas.RuleScope):
     """Область действия правила: в каких подразделениях оно действует."""
-    return _handle(catalog.set_rule_scope, node_id, body.only)
+    return _handle(catalog.set_rule_scope, node_id, body.only, **_expected(body))
 
 
 @router.put("/rules/{node_id}/audience", dependencies=EDITOR)
@@ -469,7 +519,8 @@ def put_rule_audience(node_id: str, body: schemas.RuleAudience):
 
 @router.put("/clauses/{node_id}/references", dependencies=EDITOR)
 def put_clause_references(node_id: str, body: schemas.ClauseReferences):
-    return {"references": _handle(catalog.set_clause_references, node_id, body.references)}
+    return {"references": _handle(catalog.set_clause_references, node_id, body.references,
+                                  **_expected(body))}
 
 
 @router.post("/clauses/{node_id}/move", dependencies=EDITOR)

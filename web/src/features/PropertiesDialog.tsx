@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 
-import { api } from "../api/client";
+import { api, isStale, STALE_TEXT } from "../api/client";
+import { PROPERTY_MAX_CHARS, textLimit } from "../api/limits";
 import type { NodeProps } from "../api/types";
 import { useCatalog } from "../state/catalog";
 import { registerDraft } from "../state/drafts";
@@ -23,6 +24,11 @@ const PROP_TYPES: { value: PropType; label: string }[] = [
 
 const SKIP = new Set(["nodeId", "labels", "status"]);
 
+/* Текстовые свойства из catalog.TEXT_LIMITS (описание атрибута и правила, подсказка, номер и текст
+   пункта, номер и заголовок приказа, текст примера, названия) проверка, промпт и «Замечания» читают
+   как строки: число или да/нет в них API отклоняет (422), поэтому тип у них не меняется — только строка.
+   Длина значения ограничена тем же пределом, что у API. */
+
 interface Row {
   id: number;
   key: string;
@@ -42,17 +48,24 @@ function guessType(value: unknown): PropType {
 }
 
 let rowId = 0;
-function toRow(key: string, value: unknown, isNew = false): Row {
+function toRow(labels: string[], key: string, value: unknown, isNew = false): Row {
+  const textOnly = (k: string) => textLimit(labels, k.trim()) !== undefined;
   const type = guessType(value);
   const text = value === null || value === undefined ? "" : String(value);
-  return { id: ++rowId, key, type, isNew, removed: false, value: text, initial: { type, value: text } };
+  // Текстовое свойство всегда строка; если в базе оно уже не строка, сохранение вернёт ему строку.
+  return { id: ++rowId, key, type: textOnly(key) ? "string" : type, isNew, removed: false, value: text,
+    initial: { type, value: text } };
 }
+
+/** Как тип хранится в базе: дата — та же строка вида YYYY-MM-DD. Текстовое свойство с такой строкой
+    показывается строкой, а угадано датой — по одному типу строки оно не должно считаться изменённым. */
+const storedAs = (type: PropType) => (type === "date" ? "string" : type);
 
 /* Свойство, которого не касались, не отправляется: иначе снимок на момент
    открытия затёр бы правки, сделанные за это время в другом окне, а строки
    с пробелами по краям обрезались бы без ведома редактора. */
-const touched = (row: Row) =>
-  row.isNew || row.removed || row.type !== row.initial.type || row.value !== row.initial.value;
+const touched = (row: Row) => row.isNew || row.removed
+  || storedAs(row.type) !== storedAs(row.initial.type) || row.value !== row.initial.value;
 
 /** Черновик редактора свойств на время повторного входа (state/drafts.ts): узел и строки. */
 export interface PropertiesDraft {
@@ -83,7 +96,8 @@ function PropertiesDialog({ node, restored, close }: { node: NodeProps; restored
   const toast = useToast();
   const { reload } = useCatalog();
   const [rows, setRows] = useState<Row[]>(() => restored
-    ?? Object.entries(node).filter(([k]) => !SKIP.has(k)).map(([k, v]) => toRow(k, v)));
+    ?? Object.entries(node).filter(([k]) => !SKIP.has(k)).map(([k, v]) => toRow(node.labels, k, v)));
+  const textOnly = (key: string) => textLimit(node.labels, key.trim()) !== undefined;
   // Сессия кончилась посреди правки — после повторного входа окно откроется с тем же вводом.
   const latest = useRef(rows);
   latest.current = rows;
@@ -103,7 +117,9 @@ function PropertiesDialog({ node, restored, close }: { node: NodeProps; restored
       if (row.isNew && row.removed) continue;
       if (row.removed) { properties[key] = null; continue; }
       const raw = row.value.trim();
-      if (row.type === "number") {
+      if (textOnly(key)) {
+        properties[key] = raw;
+      } else if (row.type === "number") {
         const n = Number(raw);
         if (raw !== "" && Number.isNaN(n)) { toast(`«${key}»: не число`, "err"); return; }
         properties[key] = raw === "" ? null : n;
@@ -116,11 +132,21 @@ function PropertiesDialog({ node, restored, close }: { node: NodeProps; restored
     if (!Object.keys(properties).length) { close(); return; }
     setBusy(true);
     try {
-      await api.patch(node.nodeId, properties);
+      // expected — прежние значения только отправляемых свойств, как их отдал API при открытии
+      // (отсутствующее — null): если узел за это время изменили, API отклонит правку (409).
+      const expected = Object.fromEntries(Object.keys(properties).map((k) => [k, node[k] ?? null]));
+      await api.patch(node.nodeId, properties, expected);
       close();
       toast("Свойства сохранены", "ok");
       await reload();
     } catch (err) {
+      if (isStale(err)) {
+        // Исходные значения окна устарели: закрыть его и перечитать каталог, как остальные формы.
+        close();
+        toast(STALE_TEXT, "err");
+        await reload();
+        return;
+      }
       toast(errorText(err), "err");
       setBusy(false);
     }
@@ -141,16 +167,19 @@ function PropertiesDialog({ node, restored, close }: { node: NodeProps; restored
               <div key={row.id} className={`prop-row ${row.removed ? "removed" : ""}`} data-prop={row.key}>
                 <input type="text" aria-label="Имя свойства" value={row.key} placeholder="имя свойства"
                   readOnly={!row.isNew} onChange={(e) => update(row.id, { key: e.target.value })} />
-                <Select ariaLabel="Тип свойства" value={row.type} options={PROP_TYPES}
+                <Select ariaLabel="Тип свойства" value={textOnly(row.key) ? "string" : row.type} options={PROP_TYPES}
+                  disabled={textOnly(row.key)}
+                  title={textOnly(row.key) ? "Текстовое свойство: проверка читает его как строку, тип не меняется" : undefined}
                   onChange={(type) => update(row.id, { type: type as PropType })} />
                 <input type="text" aria-label="Значение свойства" value={row.value} placeholder="значение"
+                  maxLength={row.type === "string" || textOnly(row.key) ? textLimit(node.labels, row.key.trim()) ?? PROPERTY_MAX_CHARS : undefined}
                   onChange={(e) => update(row.id, { value: e.target.value })} />
                 <button type="button" className="btn sm ghost" title="Удалить свойство"
                   onClick={() => update(row.id, { removed: !row.removed })}>✕</button>
               </div>
             ))}
           </div>
-          <button type="button" className="btn sm" onClick={() => setRows((l) => [...l, toRow("", "", true)])}>
+          <button type="button" className="btn sm" onClick={() => setRows((l) => [...l, toRow(node.labels, "", "", true)])}>
             + Свойство
           </button>
           <div className="hint" style={{ marginTop: 12 }}>

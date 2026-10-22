@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
+import time
+import urllib.error
 import urllib.request
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import agent
 import auth
 import graph
 import history
@@ -43,26 +48,86 @@ def parse_vllm_metrics(text: str) -> dict[str, float]:
 
 
 def _vllm_url(path: str) -> str:
-    """Служебный адрес vLLM (/metrics, /health): VLLM_URL без суффикса /v1."""
-    base = os.getenv("VLLM_URL", "http://vllm:8000/v1").rstrip("/")
+    """Служебный адрес vLLM (/metrics): VLLM_URL без суффикса /v1."""
+    base = agent.llm_url().rstrip("/")
     return (base[:-3] if base.endswith("/v1") else base) + path
 
 
-def vllm_alive(timeout: float = 2.0) -> bool:
-    """Отвечает ли vLLM на GET /health (для /ready). Не бросает исключений."""
+def _open(request: urllib.request.Request | str, timeout: float):
+    """Запрос к модели так же, как её клиент (agent.get_client): с корневым
+    сертификатом LLM_CA_FILE и без прокси из окружения для внутреннего адреса."""
+    handlers: list[urllib.request.BaseHandler] = []
+    if agent.internal_url(agent.llm_url()):
+        handlers.append(urllib.request.ProxyHandler({}))
+    context = agent.llm_ssl_context()
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)  # noqa: S310
+
+
+# Готовность модели для /ready: сколько секунд помнить удачный ответ /v1/models.
+VLLM_READY_CACHE_SECONDS = 45.0
+_ready_lock = threading.Lock()
+_ready_until = 0.0
+_problem: Optional[str] = None
+
+
+def vllm_problem() -> Optional[str]:
+    """Почему последняя проверка vllm_alive не прошла; None — прошла."""
+    return _problem
+
+
+def _models_problem(timeout: float) -> Optional[str]:
+    request = urllib.request.Request(
+        agent.llm_url().rstrip("/") + "/models",
+        headers={"Authorization": f"Bearer {os.getenv('VLLM_API_KEY', 'dummy')}"})
     try:
-        with urllib.request.urlopen(_vllm_url("/health"), timeout=timeout) as response:  # noqa: S310
-            return 200 <= response.status < 300
+        with _open(request, timeout) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return f"модель отклонила ключ (HTTP {exc.code}): проверьте VLLM_API_KEY"
+        return f"GET /v1/models ответил HTTP {exc.code}"
     except Exception as exc:  # noqa: BLE001
-        log.warning("vLLM не отвечает: %s", exc)
-        return False
+        return f"не ответила на GET /v1/models: {exc}"
+    models = data.get("data") if isinstance(data, dict) else None
+    ids = [m.get("id") for m in models if isinstance(m, dict)] if isinstance(models, list) else []
+    if agent.MODEL not in ids:
+        return f'модели "{agent.MODEL}" (VLLM_MODEL) нет в списке /v1/models'
+    return None
+
+
+def vllm_alive(timeout: float = 2.0) -> bool:
+    """Готова ли модель (для /ready): GET /v1/models с ключом VLLM_API_KEY отвечает
+    и в списке есть VLLM_MODEL. Так видны неверный ключ и имя модели, а не только
+    живой процесс. Удачный ответ помнится VLLM_READY_CACHE_SECONDS, неудачный —
+    нет. Причина отказа — vllm_problem(). Не бросает исключений.
+    """
+    global _ready_until, _problem
+    with _ready_lock:
+        if time.monotonic() < _ready_until:
+            return True
+    problem = _models_problem(timeout)
+    with _ready_lock:
+        _problem = problem
+        _ready_until = time.monotonic() + VLLM_READY_CACHE_SECONDS if problem is None else 0.0
+    if problem is not None:
+        log.warning("Модель не готова: %s", problem)
+    return problem is None
+
+
+def reset_ready_cache() -> None:
+    """Для тестов: забыть удачную проверку модели."""
+    global _ready_until, _problem
+    with _ready_lock:
+        _ready_until, _problem = 0.0, None
 
 
 def vllm_state() -> Optional[dict[str, float]]:
     """Состояние vLLM или None, если он не ответил: мониторинг от него не зависит."""
     url = _vllm_url("/metrics")
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310 — адрес из настроек
+        with _open(url, timeout=2) as response:
             return parse_vllm_metrics(response.read().decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001
         log.debug("Показатели vLLM недоступны: %s", exc)

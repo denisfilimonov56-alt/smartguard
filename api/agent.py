@@ -57,10 +57,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
+import math
 import os
 import re
+import ssl
 import threading
 import time
 import uuid
@@ -68,15 +71,20 @@ from collections import defaultdict
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
+from urllib.parse import urlsplit
 
 import httpx
 from openai import (
     APIConnectionError,
     APITimeoutError,
+    AuthenticationError,
     BadRequestError,
     InternalServerError,
+    NotFoundError,
     OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
 )
 
 import metrics
@@ -181,18 +189,72 @@ class Extraction:
     unquoted: list[str] = field(default_factory=list)
 
 
+def llm_url() -> str:
+    return os.getenv("VLLM_URL", "http://vllm:8000/v1")
+
+
+def llm_ssl_context() -> Optional[ssl.SSLContext]:
+    """Корневой сертификат модели по https (LLM_CA_FILE) — по образцу KEYCLOAK_CA_FILE.
+
+    None — проверять сертификат по набору по умолчанию. Файла нет — ошибка
+    в лог и тоже набор по умолчанию: проверка сертификата всё равно не пройдёт,
+    но причина будет видна (см. check_config).
+    """
+    ca_file = os.getenv("LLM_CA_FILE", "").strip()
+    if not ca_file or not llm_url().lower().startswith("https://"):
+        return None
+    try:
+        return ssl.create_default_context(cafile=ca_file)
+    except (OSError, ssl.SSLError) as exc:
+        log.error("LLM_CA_FILE=%s не прочитан (%s) — модель по https не ответит", ca_file, exc)
+        return None
+
+
+def internal_url(url: str) -> bool:
+    """Адрес внутри сети: имя сервиса docker, localhost или частный IP.
+
+    Прокси из окружения (HTTP_PROXY, который docker берёт из ~/.docker/config.json)
+    к таким адресам не применяется: прокси не знает имени vllm и отвечает 502.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if not host or host == "localhost" or ("." not in host and ":" not in host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback
+
+
+def check_config() -> None:
+    """Проверка настроек модели при старте: файл корневого сертификата на месте."""
+    ca_file = os.getenv("LLM_CA_FILE", "").strip()
+    if ca_file and not os.path.isfile(ca_file):
+        log.error("LLM_CA_FILE=%s не найден — модель по https не ответит", ca_file)
+    elif ca_file and not llm_url().lower().startswith("https://"):
+        log.warning("LLM_CA_FILE задан, но VLLM_URL не https (%s): сертификат не используется", llm_url())
+
+
 def get_client() -> OpenAI:
     """Ленивая инициализация клиента vLLM (OpenAI-совместимый API)."""
     global _client
     if _client is None:
-        base_url = os.getenv("VLLM_URL", "http://vllm:8000/v1")
+        base_url = llm_url()
         log.info("Инициализация клиента LLM: %s (модель %s)", base_url, MODEL)
+        context = llm_ssl_context()
         _client = OpenAI(
             base_url=base_url,
             api_key=os.getenv("VLLM_API_KEY", "dummy"),
             timeout=httpx.Timeout(LLM_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
             # Повторяет ask_model сам и не после таймаута, см. LLM_MAX_RETRIES.
             max_retries=0,
+            # Свой клиент: корневой сертификат LLM_CA_FILE и без прокси из
+            # окружения для внутреннего адреса.
+            http_client=httpx.Client(
+                verify=context if context is not None else True,
+                trust_env=not internal_url(base_url),
+                timeout=httpx.Timeout(LLM_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
+            ),
         )
     return _client
 
@@ -210,6 +272,10 @@ REASON_BREAKER = "модель не отвечает, проверка повт�
 REASON_TOO_LONG = "цель вместе с инструкциями не помещается в окно модели"
 REASON_REJECTED = "модель отклонила запрос"
 REASON_MALFORMED = "ответ модели не по форме"
+REASON_CONFIG = "модель отклонила ключ или имя модели — проверьте VLLM_URL, VLLM_MODEL и VLLM_API_KEY"
+REASON_RATE_LIMIT = "модель перегружена: превышен лимит запросов"
+# Пауза перед повтором после 429; Retry-After дольше этого не ждём.
+LLM_RATE_LIMIT_MAX_DELAY = 5.0
 
 # 400 от vLLM бывает не только из-за схемы: прежде всего это переполнение окна.
 # Режим JSON-схемы выключается, только если сервер прямо говорит, что параметр
@@ -270,6 +336,8 @@ class _Breaker:
                 if now >= self.until and not self.probing:
                     self.probing = True
                     return True
+                if wait and metrics.cancelled():
+                    raise metrics.Cancelled()  # пакет остановлен, ждать закрытия незачем
                 if not wait or self.opened_at is None or now - self.opened_at >= LLM_BREAKER_BULK_WAIT:
                     raise ExtractionError(REASON_BREAKER)
                 left = self.opened_at + LLM_BREAKER_BULK_WAIT - now
@@ -325,6 +393,18 @@ def _bad_request_reason(exc: BadRequestError) -> str:
     return "schema" if _SCHEMA_UNSUPPORTED.search(text) else "other"
 
 
+def _pause(seconds: float) -> None:
+    """Пауза перед повтором запроса к модели. Остановленная работа (срок пакета,
+    обрыв соединения, советчик) не повторяет запрос: metrics.Cancelled до паузы
+    и после неё. Так после остановки к модели уходит не больше одного запроса,
+    уже бывшего в полёте, — на этом держится срок пакета (main.BULK_DEADLINE_SECONDS)."""
+    if metrics.cancelled():
+        raise metrics.Cancelled()
+    time.sleep(seconds)
+    if metrics.cancelled():
+        raise metrics.Cancelled()
+
+
 def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
               max_tokens: int, timeout: float | None,
               breaker: Optional[_Breaker] = None, probe: bool = False, count_timeouts: bool = True) -> Any:
@@ -367,11 +447,39 @@ def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
                 breaker.timed_out(probe)
             log.error("Модель не ответила за отведённое время: %s", exc)
             raise ExtractionError(REASON_TIMEOUT) from exc
+        except (AuthenticationError, PermissionDeniedError, NotFoundError) as exc:
+            # 401/403/404 — не сбой модели, а ошибка настройки (ключ, имя модели,
+            # адрес): повтор не поможет, traceback в лог ни к чему.
+            if breaker is not None:
+                breaker.answered()
+            log.error("Ошибка настройки модели (HTTP %s): %s", exc.status_code, exc.message)
+            raise ExtractionError(REASON_CONFIG) from exc
+        except RateLimitError as exc:
+            # 429 внешнего шлюза: повтор с паузой (Retry-After, если он короткий).
+            if breaker is not None:
+                breaker.answered()
+            if attempt < LLM_MAX_RETRIES:
+                attempt += 1
+                delay = LLM_RETRY_DELAY * 2 ** (attempt - 1)
+                default = delay
+                try:
+                    delay = float(exc.response.headers.get("retry-after") or delay)
+                except ValueError:
+                    pass
+                if not math.isfinite(delay):
+                    delay = default  # «Retry-After: nan» или «inf»: time.sleep(nan) падает ValueError
+                delay = min(max(delay, 0.0), LLM_RATE_LIMIT_MAX_DELAY)
+                log.warning("Лимит запросов модели, повтор %d из %d через %.1f с",
+                            attempt, LLM_MAX_RETRIES, delay)
+                _pause(delay)
+                continue
+            log.error("Лимит запросов модели исчерпан: %s", exc.message)
+            raise ExtractionError(REASON_RATE_LIMIT) from exc
         except (APIConnectionError, InternalServerError) as exc:
             if attempt < LLM_MAX_RETRIES:
                 attempt += 1
                 log.warning("Сбой связи с моделью, повтор %d из %d: %s", attempt, LLM_MAX_RETRIES, exc)
-                time.sleep(LLM_RETRY_DELAY * 2 ** (attempt - 1))
+                _pause(LLM_RETRY_DELAY * 2 ** (attempt - 1))
                 continue
             log.error("Модель недоступна: %s", exc)
             raise ExtractionError(REASON_UNAVAILABLE) from exc
@@ -410,13 +518,16 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
     messages.append({"role": "user", "content": prompt})
     if bulk is None:
         bulk = metrics.current_batch() is not None or getattr(_background, "on", False)
+    # Проверка по ключу внешней системы — ручная (предохранитель и предел ожидания
+    # те же), но резерв ручных проверок ей не положен: слот — пакетный.
+    shared = bulk or not metrics.uses_reserve()
     # Выписка обязанностей идёт в фоне со своим долгим таймаутом: предохранитель
     # проверок ей не указ и её таймауты не считает.
     guard = None if timeout is not None and not breaker else _breakers["bulk" if bulk else "single"]
     while True:
         probe = guard.admit(wait=bulk) if guard is not None else False
         try:
-            with metrics.gate.slot(bulk=bulk) as waited:
+            with metrics.gate.slot(bulk=shared, limited=not bulk) as waited:
                 # Пока запрос ждал очереди, предохранитель мог разомкнуться.
                 if guard is not None and not probe and guard.is_open():
                     if not bulk:
@@ -500,9 +611,19 @@ INJECTION_SIGNS = [re.compile(pattern, re.IGNORECASE) for pattern in (
 )]
 
 
+def sanitize_prompt_text(text: Any) -> str:
+    """Любой текст для промпта — цель, описание атрибута, пример, инструкция,
+    обязанность: строкой и без служебных меток шаблона чата. Текст каталога
+    идёт в системное сообщение, и метка в нём «закрыла» бы его для всех проверок.
+    Не-строку (число из «Свойств») читает через str(); None и да/нет — пустая строка."""
+    if text is None or isinstance(text, bool):
+        return ""
+    return SPECIAL_TOKEN.sub(" ", str(text)).strip()
+
+
 def clean_goal(goal: str) -> str:
     """Текст цели для сообщения модели: без служебных меток шаблона чата."""
-    return SPECIAL_TOKEN.sub(" ", goal).strip()
+    return sanitize_prompt_text(goal)
 
 
 def looks_like_injection(goal: str) -> bool:
@@ -563,6 +684,9 @@ def _example_lines(examples: dict[str, list[str]] | None, skip: str | None) -> l
     for kind, label in (("present", "есть"), ("absent", "нет")):
         texts = [t for t in (examples or {}).get(kind, []) if t != skip][:per_kind]
         for text in texts:
+            text = sanitize_prompt_text(text)
+            if not text:
+                continue
             if len(text) > PROMPT_EXAMPLE_MAX_CHARS:
                 text = text[:PROMPT_EXAMPLE_MAX_CHARS].rstrip() + "…"
             lines.append(f"    {label}: «{text}»")
@@ -589,7 +713,7 @@ def extract_messages(
         if key in seen:
             continue
         seen.add(key)
-        description = (target.get("description") or "").strip()
+        description = sanitize_prompt_text(target.get("description"))
         lines.append(
             f'- "{target["name"]}" — {description}' if description else f'- "{target["name"]}"'
         )
@@ -827,27 +951,40 @@ def extract_duties(text: str) -> list[str]:
     повторяется. Выписка идёт в фоне, поэтому занимает пакетный слот очереди
     и не съедает резерв ручных проверок.
     """
-    text = text.strip()
+    text = sanitize_prompt_text(text)
     duties: list[str] = []
-    for start in range(0, len(text), DUTIES_CHUNK_CHARS):
-        answer = ask_model(DUTIES_PROMPT.format(text=text[start:start + DUTIES_CHUNK_CHARS]),
+    seen: set[str] = set()
+    # Части — по границам абзацев и с перекрытием (split_long_text): обязанность
+    # на стыке целиком попадает хотя бы в одну часть, а не теряется разрезом (N21).
+    parts = split_long_text(text, DUTIES_CHUNK_CHARS) if len(text) > DUTIES_CHUNK_CHARS else [text]
+    for part in parts:
+        answer = ask_model(DUTIES_PROMPT.format(text=part),
                            DUTIES_SCHEMA, DUTIES_MAX_TOKENS, timeout=DUTIES_TIMEOUT, bulk=True,
                            breaker=False)
         raw = parse_attributes_json(answer).get("duties")
         if not isinstance(raw, list):
             raise ExtractionError("поле duties отсутствует или не является списком")
         for item in raw:
-            duty = item.strip() if isinstance(item, str) else ""
-            if duty and duty not in duties:
+            duty = sanitize_prompt_text(item) if isinstance(item, str) else ""
+            # Перекрытие частей читается дважды: та же обязанность (с точностью
+            # до регистра, пробелов и точки в конце) в список не идёт второй раз.
+            key = _duty_key(duty)
+            if key and key not in seen:
+                seen.add(key)
                 duties.append(duty)
     return duties
+
+
+def _duty_key(duty: str) -> str:
+    """Ключ сравнения обязанностей: без регистра, лишних пробелов и знаков в конце."""
+    return " ".join(duty.lower().split()).rstrip(" .;,")
 
 
 def comparable(descriptions: list[dict[str, Any]]) -> list[dict[str, str]]:
     """С чем сравнивать цель: со списком обязанностей, а пока его нет — с полным текстом."""
     return [
-        {"id": d.get("id") or "", "title": d.get("title") or "",
-         "text": "\n".join(f"- {duty}" for duty in d["duties"]) if d.get("duties") else d.get("text") or ""}
+        {"id": d.get("id") or "", "title": str(d.get("title") or ""),
+         "text": "\n".join(f"- {duty}" for duty in d["duties"]) if d.get("duties") else str(d.get("text") or "")}
         for d in descriptions
     ]
 
@@ -865,6 +1002,8 @@ class JobCheck:
     # Атрибуты, по которым сравнить не удалось: требование на них не считается
     # ни выполненным, ни нарушенным — его проверяют вручную.
     unverified_attributes: list[str] = field(default_factory=list)
+    # nodeId правил на этих атрибутах (если граф их отдаёт) — для unverified_rule_node_ids.
+    unverified_rules: list[str] = field(default_factory=list)
 
 
 def job_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -872,36 +1011,65 @@ def job_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [t for t in targets if t.get("source") == JOB_SOURCE]
 
 
+def split_long_text(text: str, limit: int) -> list[str]:
+    """Части текста не длиннее limit: по границе абзаца (строки, слова) и с
+    перекрытием — обязанность на стыке частей целиком попадает хотя бы в одну."""
+    overlap = min(1000, limit // 10)
+    parts: list[str] = []
+    start = 0
+    while len(text) - start > limit:
+        end = start + limit
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            cut = text.rfind(sep, start + limit // 2, end)
+            if cut > start:
+                break
+        if cut <= start:
+            cut = end
+        parts.append(text[start:cut].strip())
+        # Следующая часть начинается чуть раньше конца этой — с начала строки, если она есть.
+        back = cut - overlap
+        line = text.find("\n", back, cut)
+        start = line + 1 if line != -1 else back
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
 def split_job_descriptions(
     descriptions: list[dict[str, str]], limit: int = JOB_TEXT_MAX_CHARS
 ) -> tuple[list[list[dict[str, str]]], list[str]]:
     """Раскладывает инструкции по запросам к модели, чтобы каждый влез в её окно.
 
-    Возвращает (группы, названия инструкций, обрезанных до limit).
+    Инструкция длиннее limit не обрезается, а делится на части (split_long_text):
+    каждая — отдельный элемент с теми же id и title, так что обязанность из любой
+    части подтверждается (duty_confirmed). Возвращает (группы, названия
+    инструкций, поделённых на части).
     """
     groups: list[list[dict[str, str]]] = []
-    truncated: list[str] = []
+    split: list[str] = []
     size = 0
     for item in descriptions:
-        text = item["text"].strip()
-        if len(text) > limit:
-            truncated.append(item.get("title") or item.get("id") or "?")
-            text = text[:limit]
-        if not groups or size + len(text) > limit:
-            groups.append([])
-            size = 0
-        groups[-1].append({**item, "text": text})
-        size += len(text)
-    return groups, truncated
+        text = str(item.get("text") or "").strip()
+        parts = split_long_text(text, limit) if len(text) > limit else [text]
+        if len(parts) > 1:
+            split.append(item.get("title") or item.get("id") or "?")
+        for part in parts:
+            if not groups or size + len(part) > limit:
+                groups.append([])
+                size = 0
+            groups[-1].append({**item, "text": part})
+            size += len(part)
+    return groups, split
 
 
 def job_messages(goal: str, criterion: str, descriptions: list[dict[str, str]]) -> tuple[str, str]:
     """Системное сообщение с критерием и инструкциями и пользовательское с целью."""
     blocks = [
-        f'Инструкция {i} — {item.get("title") or "без названия"}:\n{item["text"]}'
+        f'Инструкция {i} — {sanitize_prompt_text(item.get("title")) or "без названия"}:\n'
+        + sanitize_prompt_text(item["text"])
         for i, item in enumerate(descriptions, 1)
     ]
-    system = JOB_SYSTEM.format(criterion=criterion, descriptions="\n\n".join(blocks),
+    system = JOB_SYSTEM.format(criterion=sanitize_prompt_text(criterion), descriptions="\n\n".join(blocks),
                                goal_is_data=GOAL_IS_DATA)
     return system, GOAL_MESSAGE.format(goal=clean_goal(goal))
 
@@ -968,6 +1136,10 @@ def check_job_targets(
         )
         result.unverified = True
         result.unverified_attributes.extend(n for n in names if n not in result.unverified_attributes)
+        for rule in rules:
+            node_id = rule.get("rule_node_id")
+            if rule["attribute"] in names and node_id and node_id not in result.unverified_rules:
+                result.unverified_rules.append(node_id)
 
     if department is None:
         unverified("подразделение не определено.", [t["name"] for t in checked])
@@ -979,28 +1151,18 @@ def check_job_targets(
                    "они не загружены.", [t["name"] for t in checked])
         return result
 
-    groups, truncated = split_job_descriptions(comparable(descriptions))
-    if truncated:
-        result.notes.append(
-            f"Должностные инструкции длиннее {JOB_TEXT_MAX_CHARS} символов сравнивались "
-            "не целиком: " + ", ".join(f'"{t}"' for t in truncated)
-            + ". Извлеките из них список обязанностей или оставьте только раздел с обязанностями."
-        )
+    # Длинная инструкция сравнивается по частям, а не по началу (см. split_job_descriptions).
+    groups, _ = split_job_descriptions(comparable(descriptions))
 
-    tasks = [(target, (target.get("description") or "").strip() or target["name"], group)
+    tasks = [(target, sanitize_prompt_text(target.get("description")) or target["name"], group)
              for target in checked for group in groups]
     answers = _compare_all(goal, tasks)
     for target in checked:
         name = target["name"]
-        found: list[dict[str, Any]] | None = None
-        failure: ExtractionError | None = None
-        for (task_target, _, group), answer in zip(tasks, answers):
-            if task_target is not target:
-                continue
-            if isinstance(answer, ExtractionError):
-                failure = failure or answer
-            elif answer is not None:
-                found = (found or []) + [m for m in answer if duty_confirmed(m, group)]
+        own = [(group, answer) for (task_target, _, group), answer in zip(tasks, answers)
+               if task_target is target]
+        failure = next((a for _, a in own if isinstance(a, ExtractionError)), None)
+        found = confirmed_matches((g, a) for g, a in own if not isinstance(a, ExtractionError))
         if failure is not None:
             log.error("Сравнение с должностными инструкциями не удалось: %s", failure)
             unverified(f"{failure}.", [name])
@@ -1015,21 +1177,44 @@ def check_job_targets(
     return result
 
 
+def confirmed_matches(
+    answers: Iterable[tuple[list[dict[str, str]], list[dict[str, Any]] | None]]
+) -> list[dict[str, Any]] | None:
+    """Разбор ответов сравнения одной цели по группам инструкций — общий для
+    проверки (check_job_targets) и советчика.
+
+    None — критерий не выполняется ни в одной группе; [] — модель сказала
+    «совпадает», но ни одной обязанности из инструкции не привела (ответу
+    верить нельзя); иначе — подтверждённые обязанности без повторов (части
+    длинной инструкции перекрываются).
+    """
+    found: list[dict[str, Any]] | None = None
+    for group, answer in answers:
+        if answer is None:
+            continue
+        found = found if found is not None else []
+        for match in answer:
+            if duty_confirmed(match, group) and match not in found:
+                found.append(match)
+    return found
+
+
 def duty_confirmed(match: dict[str, Any], group: list[dict[str, str]]) -> bool:
     """Есть ли приведённая моделью обязанность в тексте названной ею инструкции."""
     duty = match.get("duty")
     # Инструкция ищется по идентификатору, а у старых узлов без jobDescriptionId —
     # по названию: иначе совпадение с ними не подтвердилось бы никогда.
+    # Частей одной длинной инструкции в группе может быть несколько: годится любая.
     wanted_id, wanted_title = match.get("job_description_id"), match.get("title")
     if wanted_id:
-        source = next((d for d in group if d.get("id") == wanted_id), None)
+        sources = [d for d in group if d.get("id") == wanted_id]
     else:
-        source = next((d for d in group if not d.get("id") and wanted_title is not None
-                       and d.get("title") == wanted_title), None)
-    if not isinstance(duty, str) or source is None:
+        sources = [d for d in group if not d.get("id") and wanted_title is not None
+                   and d.get("title") == wanted_title]
+    if not isinstance(duty, str) or not sources:
         return False
     needle = _comparable_text(duty.strip(" \t\n\"'«»“”„….,;:-•"))
-    return len(needle) >= 5 and needle in _comparable_text(source.get("text") or "")
+    return len(needle) >= 5 and any(needle in _comparable_text(str(d.get("text") or "")) for d in sources)
 
 
 def _compare_all(goal: str, tasks: list[tuple[dict[str, Any], str, list[dict[str, str]]]]
@@ -1215,16 +1400,24 @@ def _smart_wanted() -> bool:
     return True
 
 
-def _with_smart(verdict: dict[str, Any], future) -> dict[str, Any]:
-    """Ответ проверки с оценкой SMART. Сбой оценки вердикт не меняет — только заметка."""
+def _with_smart(verdict: dict[str, Any], future, wait: float | None = None) -> dict[str, Any]:
+    """Ответ проверки с оценкой SMART. Сбой оценки вердикт не меняет — только заметка.
+
+    wait — сколько ждать оценку после готового вердикта (ручная проверка): оценку
+    той же формулировки может считать пакет или фоновая задача, и ждать её очереди
+    без предела ручной проверке нельзя. Не дождалась — SMART_LATER_NOTE, а оценка
+    досчитается в своём потоке и попадёт в кэш.
+    """
     smart: dict[str, dict[str, Any]] | None = None
     notes: list[str] = []
     if future is not None:
         try:
-            smart = future.result()
+            smart = future.result() if wait is None else future.result(timeout=wait)
+        except FutureTimeout:
+            notes.append(SMART_LATER_NOTE)
         except Exception as exc:  # noqa: BLE001 — справка автору проверку не ломает
             log.error("Оценка по SMART не удалась: %s", exc)
-            reason = str(exc) if isinstance(exc, ExtractionError) else REASON_UNAVAILABLE
+            reason = str(exc) if isinstance(exc, (ExtractionError, metrics.Cancelled)) else REASON_UNAVAILABLE
             notes.append(f"Оценка по SMART не получена: {reason}. На результат проверки это не влияет.")
     return {**verdict, "smart": smart, "notes": list(verdict["notes"]) + notes}
 
@@ -1234,6 +1427,8 @@ def _with_smart(verdict: dict[str, Any], future) -> dict[str, Any]:
 # (успела — в ответе, нет — smart: null и заметка). Задач в фоне не больше
 # SMART_BACKGROUND_MAX: сверх этого оценка не заказывается до следующей выдачи.
 SMART_CACHED_WAIT_SECONDS = 1.0
+# Сколько ручная проверка ждёт оценку SMART после готового вердикта (см. _with_smart).
+SMART_WAIT_SECONDS = 10.0
 SMART_BACKGROUND_MAX = 256
 SMART_LATER_NOTE = ("Оценка по SMART ещё считается и появится при следующей проверке этой цели. "
                     "На результат проверки это не влияет.")
@@ -1292,8 +1487,27 @@ def _departments() -> dict[str, dict[str, str]]:
     return metrics.lookups.load(("departments",), lambda: get_departments())
 
 
+# Цель пакета, до которой не дошли: срок пакета вышел или клиент закрыл соединение
+# (main.py ставит флаг остановки, см. check_goals(cancel=...)).
+BULK_UNCHECKED_NOTE = ("Цель не проверена: пакет не уложился в отведённое время или запрос был прерван. "
+                       "Отправьте её на проверку повторно.")
+
 FAILURE_NOTE = ("Проверку не удалось завершить из-за временного сбоя сервиса. "
                 "Требуется ручная проверка.")
+
+
+def unchecked_review(goal: str, is_student: Optional[bool]) -> dict[str, Any]:
+    """Цель пакета, которую не проверили (пакет остановлен): ручная проверка
+    с BULK_UNCHECKED_NOTE и машиночитаемой пометкой unchecked — клиент
+    отправляет такие цели снова, квота за них возвращается (main.check_many)."""
+    return {**_manual_review(goal, is_student, [BULK_UNCHECKED_NOTE]), "unchecked": True}
+
+
+def failure_review(goal: str, is_student: Optional[bool]) -> dict[str, Any]:
+    """Проверка цели сорвалась из-за временного сбоя (модель, база): ручная
+    проверка с FAILURE_NOTE и машиночитаемой пометкой retryable — клиент
+    может отправить такую цель снова, в отличие от настоящей ручной проверки."""
+    return {**_manual_review(goal, is_student, [FAILURE_NOTE]), "retryable": True}
 
 
 def _manual_review(goal: str, is_student: Optional[bool], notes: list[str]) -> dict[str, Any]:
@@ -1308,6 +1522,8 @@ def _manual_review(goal: str, is_student: Optional[bool], notes: list[str]) -> d
         "attribute_quotes": {},
         "smart": None,
         "violations": [],
+        # Сбой модели или извлечения: не проверено ничего, это видно по статусу.
+        "unverified_rule_node_ids": [],
         "notes": notes,
     }
 
@@ -1320,10 +1536,14 @@ class _Flight:
         self.result: dict[str, Any] | None = None
 
 
-# Ключ идущей проверки — ключ ответа и вид проверки (ручная или пакетная):
-# ручная проверка не ждёт пакетную (та ждёт очереди без предела и, возможно,
-# без оценки SMART), а считает сама в пределах своего LLM_QUEUE_TIMEOUT.
-_flights: dict[tuple[tuple[str, str, Optional[bool]], bool], _Flight] = {}
+# Ключ идущей проверки — ключ ответа, вид проверки (ручная или пакетная), положен
+# ли ей резерв очереди к модели и поколение кэша ответов. Ручная проверка не ждёт
+# пакетную (та ждёт очереди без предела и, возможно, без оценки SMART), человек —
+# проверку по ключу внешней системы (та без резерва ждёт общей очереди) (N4), а
+# запрос после правки каталога — проверку, начатую по старому каталогу (N18).
+_flights: dict[tuple[tuple[str, str, Optional[bool]], bool, bool, int], _Flight] = {}
+# Как часто ждущий чужой проверки смотрит на флаг остановки своего пакета.
+FLIGHT_POLL_SECONDS = 0.5
 _flights_lock = threading.Lock()
 
 
@@ -1369,6 +1589,9 @@ def resolve_student(is_student: Optional[bool]) -> tuple[Optional[bool], list[st
     return bool(is_student), []
 
 
+DEPARTMENT_NOTE_MAX_CHARS = 100
+
+
 def resolve_department(
     department_id: Optional[str], departments: dict[str, dict[str, str]]
 ) -> tuple[Optional[dict[str, str]], list[str]]:
@@ -1383,10 +1606,12 @@ def resolve_department(
     if not key:
         return None, ["Подразделение не передано: " + ALL_RULES_APPLIED]
     found = departments.get(key)
+    # В заметку (она кэшируется вместе с ответом) — не больше DEPARTMENT_NOTE_MAX_CHARS.
+    shown = key if len(key) <= DEPARTMENT_NOTE_MAX_CHARS else key[:DEPARTMENT_NOTE_MAX_CHARS] + "…"
     if not found:
-        return None, [f'Подразделения "{key}" нет в графе (:Department): ' + ALL_RULES_APPLIED]
+        return None, [f'Подразделения "{shown}" нет в графе (:Department): ' + ALL_RULES_APPLIED]
     if found.get("status") != "active":
-        return None, [f'Подразделение "{key}" находится в архиве: ' + ALL_RULES_APPLIED]
+        return None, [f'Подразделение "{shown}" находится в архиве: ' + ALL_RULES_APPLIED]
     return {"id": found["id"], "name": found.get("name") or ""}, []
 
 
@@ -1398,9 +1623,16 @@ def check_goal(
     departments: dict[str, dict[str, str]] | None = None,
     is_student: Optional[bool] = None,
     generation: Optional[int] = None,
+    reserve: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Проверяет цель. Всегда возвращает словарь; исключение одно — QueueTimeout
     ручной проверки (очередь к модели не подошла), в API это 503.
+
+    reserve — положен ли проверке резерв ручных проверок в очереди к модели;
+    None — по тому, кто проверяет (metrics.uses_reserve: у ключа внешней
+    системы — нет). Остановленная проверка пакета (metrics.Cancelled) даёт
+    ручную проверку с BULK_UNCHECKED_NOTE и "unchecked": true (unchecked_review);
+    в историю она не пишется.
 
     targets, notes_prefix и departments можно передать снаружи, чтобы не
     перечитывать словари графа на каждую цель пакета; generation — поколение
@@ -1424,12 +1656,54 @@ def check_goal(
     Сбой графа или любой другой непредвиденный сбой даёт ручную проверку
     с нейтральной заметкой (подробности — в логе), а не исключение.
     """
+    if reserve is None:
+        return _check_goal_cached(goal, targets, notes_prefix, department_id, departments, is_student,
+                                  generation)
+    metrics.set_reserve(reserve)
+    try:
+        return _check_goal_cached(goal, targets, notes_prefix, department_id, departments, is_student,
+                                  generation)
+    finally:
+        metrics.set_reserve(None)
+
+
+def _join_flight(flight_key: tuple) -> tuple[Optional[_Flight], bool]:
+    """Встаёт в идущую проверку того же ключа или начинает свою.
+
+    Возвращает (полёт, ведущий ли). Ведущий считает сам и обязан снять полёт.
+    Ждущий получает завершённый полёт с result; если ведущий ничего не дал
+    (сбой очереди, остановка его пакета), первый проснувшийся становится новым
+    ведущим, остальные ждут уже его — а не идут к модели все сразу (N5).
+    Ожидание прерывается флагом остановки своего пакета (тогда полёт None) и
+    у ручной проверки ограничено LLM_QUEUE_TIMEOUT_SECONDS — столько же она
+    ждала бы очереди сама; по истечении — (None, False): считать без полёта.
+    """
+    limit = None if metrics.current_batch() is not None else (metrics.LLM_QUEUE_TIMEOUT or None)
+    deadline = None if limit is None else time.monotonic() + limit
+    while True:
+        with _flights_lock:
+            flight = _flights.get(flight_key)
+            if flight is None:
+                flight = _flights[flight_key] = _Flight()
+                return flight, True
+        while not flight.done.wait(FLIGHT_POLL_SECONDS):
+            if metrics.cancelled():
+                return None, False
+            if deadline is not None and time.monotonic() >= deadline:
+                return None, False
+        if flight.result is not None:
+            return flight, False
+        if metrics.cancelled():
+            return None, False
+
+
+def _check_goal_cached(goal, targets, notes_prefix, department_id, departments, is_student,
+                       generation) -> dict[str, Any]:
     is_student, student_notes = resolve_student(is_student)
     key = _cache_key(goal, department_id, is_student)
     bulk = metrics.current_batch() is not None
     with metrics.check() as done:
-        cached = metrics.results.get(key)
-        if cached is not None:
+        def from_cache(cached: dict[str, Any]) -> dict[str, Any]:
             if not _smart_wanted():
                 smart, smart_notes = None, []
             elif bulk:
@@ -1442,23 +1716,38 @@ def check_goal(
             done(result, True)
             return result
 
-        flight_key = (key, bulk)
-        with _flights_lock:
-            flight = _flights.get(flight_key)
-            leader = flight is None
-            if leader:
-                flight = _flights[flight_key] = _Flight()
+        cached = metrics.results.get(key)
+        if cached is not None:
+            return from_cache(cached)
+
+        if generation is None:
+            generation = metrics.results.generation
+        flight_key = (key, bulk, metrics.uses_reserve(), generation)
+        flight, leader = _join_flight(flight_key)
         if not leader:
-            flight.done.wait()
-            if flight.result is not None:
+            if metrics.cancelled():
+                # Пакет ждущего остановили: цель не проверена, в историю не пишется.
+                return unchecked_review(goal, is_student)
+            if flight is not None and flight.result is not None:
                 result = {**flight.result, "goal": goal}
                 done(result, True)
                 return result
+            # Чужая проверка не уложилась в срок ожидания: считаем сами, без полёта.
+        else:
+            # Прежний ведущий мог положить ответ в кэш и снять полёт между
+            # проверкой кэша выше и _join_flight — тогда к модели не идём.
+            cached = metrics.results.get(key)
+            if cached is not None:
+                result = from_cache(cached)
+                flight.result = result
+                with _flights_lock:
+                    _flights.pop(flight_key, None)
+                flight.done.set()
+                return result
 
         result: dict[str, Any] | None = None
+        stopped = False
         try:
-            if generation is None:
-                generation = metrics.results.generation
             try:
                 verdict, cacheable, smart_future = _check_goal(
                     goal, targets, notes_prefix, department_id, departments, is_student, student_notes)
@@ -1466,21 +1755,30 @@ def check_goal(
                 # Ручная проверка не дождалась очереди к модели: это 503 с Retry-After
                 # (обработчик в main.py), а не «ручная проверка» в ответе.
                 raise
+            except metrics.Cancelled:
+                stopped = True
+                verdict, cacheable, smart_future = unchecked_review(goal, is_student), False, None
             except Exception:  # noqa: BLE001 — сбой одной цели не роняет пакет и не даёт 500
                 log.exception("Проверка цели завершилась сбоем")
-                verdict, cacheable, smart_future = _manual_review(goal, is_student, [FAILURE_NOTE]), False, None
+                verdict, cacheable, smart_future = failure_review(goal, is_student), False, None
             if cacheable:
                 # Текст цели и оценка SMART в кэш не идут: цель подставляется
                 # при выдаче, оценка живёт в своём кэше.
                 stored = {k: v for k, v in verdict.items() if k not in ("goal", "smart")}
                 metrics.results.put(key, stored, generation)
-            result = _with_smart(verdict, smart_future)
+            result = _with_smart(verdict, smart_future, None if bulk else SMART_WAIT_SECONDS)
         finally:
             if leader:
-                flight.result = result
+                # Остановили этот пакет, а не цель: ждущие той же цели из других
+                # пакетов получают result None и один из них становится новым
+                # ведущим (_join_flight), а не получают «не проверено».
+                flight.result = None if stopped else result
                 with _flights_lock:
                     _flights.pop(flight_key, None)
                 flight.done.set()
+        if stopped:
+            # Цель не проверена: в историю и показатели ручных проверок её не пишем.
+            return result
         done(result, False)
         return result
 
@@ -1550,10 +1848,20 @@ def _check_goal(
         _drop(smart_future)
         raise
     # Требование на атрибуте, который не удалось сравнить с инструкциями,
-    # не нарушено и не выполнено: его проверяют вручную (статус ниже).
-    violations = [row for row in violations
-                  if not (row.get("violation_type") == "MISSING_REQUIREMENT"
-                          and row.get("attribute") in job.unverified_attributes)]
+    # не нарушено и не выполнено: его проверяют вручную (статус ниже). Его nodeId,
+    # как и прочих правил на этих атрибутах, — в unverified_rule_node_ids:
+    # интерфейс не ставит им ✓.
+    unverified_rules = list(job.unverified_rules)
+    kept = []
+    for row in violations:
+        if (row.get("violation_type") == "MISSING_REQUIREMENT"
+                and row.get("attribute") in job.unverified_attributes):
+            node_id = row.get("rule_node_id")
+            if node_id and node_id not in unverified_rules:
+                unverified_rules.append(node_id)
+        else:
+            kept.append(row)
+    violations = kept
     for row in violations:
         if row.get("attribute") in job.matches:
             row["matched_duties"] = job.matches[row["attribute"]]
@@ -1597,6 +1905,7 @@ def _check_goal(
         "attribute_quotes": extraction.quotes,
         "smart": None,
         "violations": violations,
+        "unverified_rule_node_ids": unverified_rules,
         "notes": notes,
     }
     # Непроверенное правило на инструкциях — разовый сбой: закреплять его
@@ -1604,8 +1913,13 @@ def _check_goal(
     return verdict, status != STATUS_MANUAL_REVIEW and not job.unverified, smart_future
 
 
-def check_goals(items: list[dict[str, Any]]) -> dict[str, Any]:
+def check_goals(items: list[dict[str, Any]], cancel: Optional[threading.Event] = None) -> dict[str, Any]:
     """Пакетная проверка.
+
+    cancel — флаг остановки (срок пакета, обрыв соединения клиентом): поднят —
+    цели, до которых не дошли, и те, что ждут очереди к модели или закрытия
+    предохранителя, возвращаются ручной проверкой с BULK_UNCHECKED_NOTE и
+    пометкой "unchecked": true (unchecked_review).
 
     На вход [{"goal": "...", "id": "...", "department_id": "...", "is_student": true}, ...].
 
@@ -1634,19 +1948,23 @@ def check_goals(items: list[dict[str, Any]]) -> dict[str, Any]:
     log.info("Пакетная проверка: целей=%d, различных=%d, потоков=%d",
              len(items), len(groups), BULK_MAX_WORKERS)
     login = metrics.actor()
-    batch = metrics.start_batch(uuid.uuid4().hex[:12], len(items))
+    batch = metrics.start_batch(uuid.uuid4().hex[:12], len(items), cancel=cancel)
 
     def one(indices: list[int]) -> tuple[list[int], dict[str, Any]]:
         metrics.set_actor(login, batch)  # поток пула: контекст вызвавшего сюда не доходит
         item = items[indices[0]]
+        if cancel is not None and cancel.is_set():
+            # Не начатая цель в историю не пишется: её не проверяли.
+            return indices, unchecked_review(item["goal"], resolve_student(item.get("is_student"))[0])
         try:
             result = check_goal(item["goal"], targets, notes, item.get("department_id"), departments,
                                 item.get("is_student"), generation)
         except Exception:  # noqa: BLE001 — check_goal не бросает; это последний рубеж
             log.exception("Проверка цели в пакете завершилась сбоем")
-            result = _manual_review(item["goal"], resolve_student(item.get("is_student"))[0],
-                                    [FAILURE_NOTE])
+            result = failure_review(item["goal"], resolve_student(item.get("is_student"))[0])
         for index in indices[1:]:
+            if result.get("unchecked"):
+                break  # двойники непроверенной цели тоже не проверены: в историю не идут
             with metrics.check() as done:
                 done({**result, "goal": items[index]["goal"]}, True)
         return indices, result

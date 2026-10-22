@@ -216,21 +216,8 @@ def llm_limits() -> tuple[int, int]:
     return capacity, min(int(number("llmInteractiveReserve")), capacity - 1)
 
 
-def update(changes: dict[str, bool | int], login: str) -> dict[str, bool | int]:
-    """Сохраняет настройки. Ключи вне DEFAULTS и значения вне границ игнорируются."""
-    global _last_good, _failed_until
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    saved = set()
-    for key, value in changes.items():
-        if key in DEFAULTS and _valid(key, value):
-            _run(
-                """
-                MERGE (s:Setting {key: $key})
-                SET s.value = $value, s.updatedAt = $now, s.updatedBy = $login
-                """,
-                key=key, value=value, now=now, login=login,
-            )
-            saved.add(key)
+def _drop_caches(saved: set[str]) -> None:
+    """Сбрасывает то, что зависит от сохранённых ключей."""
     if saved & PROMPT_KEYS:
         # Промпт стал другим — готовые ответы проверок больше не годятся.
         metrics.catalog_changed()
@@ -242,6 +229,34 @@ def update(changes: dict[str, bool | int], login: str) -> dict[str, bool | int]:
     if saved & LLM_KEYS:
         # Ждущие в очереди к модели перечитывают предел сразу, без перезапуска.
         metrics.gate.reconfigure()
+
+
+# Все ключи — одним запросом, то есть одной транзакцией: сбой посередине
+# не оставляет половину настроек записанной.
+Q_SAVE_SETTINGS = """
+UNWIND $rows AS row
+MERGE (s:Setting {key: row.key})
+SET s.value = row.value, s.updatedAt = $now, s.updatedBy = $login
+"""
+
+
+def update(changes: dict[str, bool | int], login: str) -> dict[str, bool | int]:
+    """Сохраняет настройки. Ключи вне DEFAULTS и значения вне границ игнорируются.
+
+    Ключи пишутся одной транзакцией. Кэши сбрасываются и при сбое записи:
+    если ответ от базы потерялся уже после фиксации, ответы со старым
+    промптом и старые пределы иначе прожили бы до истечения кэша.
+    """
+    global _last_good, _failed_until
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = [{"key": key, "value": value} for key, value in changes.items()
+            if key in DEFAULTS and _valid(key, value)]
+    saved = {row["key"] for row in rows}
+    try:
+        if rows:
+            _run(Q_SAVE_SETTINGS, rows=rows, now=now, login=login)
+    finally:
+        _drop_caches(saved)
     values = read_all()
     with _state_lock:
         _last_good, _failed_until = values, float("-inf")

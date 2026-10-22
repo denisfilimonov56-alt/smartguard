@@ -81,6 +81,14 @@ class QueueTimeout(RuntimeError):
         self.waited = waited
 
 
+class Cancelled(RuntimeError):
+    """Проверку остановили (срок пакета или советчика вышел, клиент закрыл соединение),
+    пока запрос ждал очереди к модели."""
+
+    def __init__(self) -> None:
+        super().__init__("проверка остановлена")
+
+
 class LlmGate:
     """Ограничитель одновременных запросов к модели с резервом для ручных проверок.
 
@@ -153,8 +161,10 @@ class LlmGate:
             self._cached, self._cached_at, self._cached_generation = value, time.monotonic(), generation
         return value
 
-    def acquire(self, bulk: bool, timeout: Optional[float] = None) -> None:
+    def acquire(self, bulk: bool, timeout: Optional[float] = None,
+                cancel: Optional[threading.Event] = None) -> None:
         """Ждёт места. timeout — сколько ждать, сек (None — без предела); вышел — QueueTimeout.
+        cancel — флаг остановки: поднят — Cancelled (проверяется не реже RECHECK_SECONDS).
 
         Ожидание идёт по настоящим часам (time.monotonic), а не по metrics._now:
         его отмеряет Condition.wait.
@@ -170,6 +180,8 @@ class LlmGate:
                 capacity, reserve = self.limits()
                 with self._cond:
                     while True:
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
                         if self._fits(bulk, self.running, self.running_bulk, capacity, reserve):
                             self.running += 1
                             if bulk:
@@ -221,16 +233,25 @@ class LlmGate:
                 self._listeners.remove(listener)
 
     @contextmanager
-    def slot(self, bulk: bool) -> Iterator[float]:
+    def slot(self, bulk: bool, limited: Optional[bool] = None) -> Iterator[float]:
         """Занимает слот; отдаёт время ожидания в очереди, сек.
 
         Ручная проверка ждёт не дольше LLM_QUEUE_TIMEOUT_SECONDS (QueueTimeout,
         в API — 503): пользователь ждёт ответа, а поток API занят всё ожидание.
         Пакет ждёт без предела — его цели уже приняты, и поток API на весь
-        пакет один.
+        пакет один. limited — ограничить ли ожидание (по умолчанию — не у пакета):
+        проверка по ключу внешней системы занимает пакетный слот, но ждёт с пределом.
+        Флаг остановки потока (current_cancel) прерывает ожидание — Cancelled.
         """
         started = time.monotonic()
-        self.acquire(bulk, None if bulk else (LLM_QUEUE_TIMEOUT or None))
+        if limited is None:
+            limited = not bulk
+        timeout = (LLM_QUEUE_TIMEOUT or None) if limited else None
+        cancel = current_cancel()
+        if cancel is None:
+            self.acquire(bulk, timeout)
+        else:
+            self.acquire(bulk, timeout, cancel)
         try:
             yield time.monotonic() - started
         finally:
@@ -319,17 +340,21 @@ class TtlCache:
         if not (ttl is None or ttl > 0):
             return
         with self._lock:
-            if generation != self.generation:
-                return
-            now = _now()
-            if ttl is not None and now - self._purged_at >= self.PURGE_SECONDS:
-                self._purged_at = now
-                for stale in [k for k, (at, _) in self._items.items() if at + ttl <= now]:
-                    del self._items[stale]
-            self._items[key] = (now, value)
-            self._items.move_to_end(key)
-            while len(self._items) > self.max_entries:
-                self._items.popitem(last=False)
+            self._put_locked(key, value, generation, ttl)
+
+    def _put_locked(self, key: Hashable, value: Any, generation: int, ttl: float | None) -> None:
+        """put под уже взятым self._lock."""
+        if generation != self.generation:
+            return
+        now = _now()
+        if ttl is not None and now - self._purged_at >= self.PURGE_SECONDS:
+            self._purged_at = now
+            for stale in [k for k, (at, _) in self._items.items() if at + ttl <= now]:
+                del self._items[stale]
+        self._items[key] = (now, value)
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_entries:
+            self._items.popitem(last=False)
 
     def load(self, key: Hashable, loader: Callable[[], Any]) -> Any:
         """Значение из кэша либо результат loader (пустой результат тоже кэшируется).
@@ -355,13 +380,21 @@ class TtlCache:
                 if self._fresh(entry, self.ttl):
                     return entry[1]
                 generation = self.generation
+            loaded = False
             try:
                 value = loader()
+                loaded = True
             finally:
+                # Ключ снимается из _loading под тем же замком, что и запись
+                # значения: иначе между ними новый поток не нашёл бы ни
+                # значения, ни идущего вычисления и пошёл бы к модели второй раз (N20).
                 with self._lock:
+                    if loaded:
+                        ttl = self.ttl
+                        if ttl is None or ttl > 0:
+                            self._put_locked(key, value, generation, ttl)
                     if self._loading.get(key) is guard:
                         del self._loading[key]
-            self.put(key, value, generation)
             return value
 
     def clear(self) -> int:
@@ -599,6 +632,8 @@ class Batch:
     done: int = 0
     # Цели пакета, которые проверяются прямо сейчас (остальные ждут в пакете).
     running: int = 0
+    # Флаг остановки пакета: поднят — оставшиеся цели не проверяются (см. current_cancel).
+    cancel: Optional[threading.Event] = field(default=None, repr=False, compare=False)
 
 
 _local = threading.local()
@@ -623,6 +658,40 @@ def current_batch() -> Optional[Batch]:
     return getattr(_local, "batch", None)
 
 
+def set_cancel(cancel: Optional[threading.Event]) -> None:
+    """Флаг остановки работы этого потока (советчик); у пакета он — в самом пакете."""
+    _local.cancel = cancel
+
+
+def current_cancel() -> Optional[threading.Event]:
+    """Флаг остановки текущей работы: свой у потока или пакета; None — не останавливается."""
+    cancel = getattr(_local, "cancel", None)
+    if cancel is not None:
+        return cancel
+    batch = current_batch()
+    return batch.cancel if batch is not None else None
+
+
+def cancelled() -> bool:
+    cancel = current_cancel()
+    return cancel is not None and cancel.is_set()
+
+
+def set_reserve(reserve: Optional[bool]) -> None:
+    """Положен ли проверке в этом потоке резерв ручных проверок; None — по входу
+    (у ключа внешней системы — нет, см. uses_reserve)."""
+    _local.reserve = reserve
+
+
+def uses_reserve() -> bool:
+    """Резерв очереди к модели — только людям в интерфейсе. Проверка по ключу внешней
+    системы (логин key:…, auth.Principal) занимает пакетный слот."""
+    reserve = getattr(_local, "reserve", None)
+    if reserve is not None:
+        return reserve
+    return not str(actor() or "").startswith("key:")
+
+
 def note_llm(queue_seconds: float, llm_seconds: float) -> None:
     stats: Optional[CheckStats] = getattr(_local, "stats", None)
     if stats is not None:
@@ -635,13 +704,15 @@ def note_llm(queue_seconds: float, llm_seconds: float) -> None:
 def carry(func: Callable[..., Any]) -> Callable[..., Any]:
     """Оборачивает func для запуска в другом потоке с контекстом текущей проверки."""
     login, batch, stats = actor(), current_batch(), getattr(_local, "stats", None)
+    cancel, reserve = getattr(_local, "cancel", None), getattr(_local, "reserve", None)
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         _local.login, _local.batch, _local.stats = login, batch, stats
+        _local.cancel, _local.reserve = cancel, reserve
         try:
             return func(*args, **kwargs)
         finally:
-            _local.login = _local.batch = _local.stats = None
+            _local.login = _local.batch = _local.stats = _local.cancel = _local.reserve = None
 
     return wrapper
 
@@ -649,9 +720,11 @@ def carry(func: Callable[..., Any]) -> Callable[..., Any]:
 _ACTOR = object()
 
 
-def start_batch(batch_id: str, total: int, login: Optional[str] | object = _ACTOR) -> Batch:
-    """Пакет в мониторинге. login — чей он; без него — кто проверяет в этом потоке."""
-    batch = Batch(batch_id, actor() if login is _ACTOR else login, total)  # type: ignore[arg-type]
+def start_batch(batch_id: str, total: int, login: Optional[str] | object = _ACTOR,
+                cancel: Optional[threading.Event] = None) -> Batch:
+    """Пакет в мониторинге. login — чей он; без него — кто проверяет в этом потоке.
+    cancel — флаг остановки пакета."""
+    batch = Batch(batch_id, actor() if login is _ACTOR else login, total, cancel=cancel)  # type: ignore[arg-type]
     with _lock:
         _batches[batch_id] = batch
     return batch
@@ -747,7 +820,7 @@ def snapshot() -> dict[str, Any]:
     edge = time.time() - RECENT_WINDOW_SECONDS
     with _lock:
         recent = [r for r in _recent if r[0] >= edge]
-        batches = [vars(b).copy() for b in _batches.values()]
+        batches = [{k: v for k, v in vars(b).items() if k != "cancel"} for b in _batches.values()]
         running = _running_checks
     computed = [r for r in recent if not r[3]]
     return {

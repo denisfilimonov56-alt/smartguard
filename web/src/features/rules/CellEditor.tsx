@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { api } from "../../api/client";
+import { api, isStale, STALE_TEXT } from "../../api/client";
 import type { Department, Rule } from "../../api/types";
 import { useCatalog } from "../../state/catalog";
 import { registerDraft } from "../../state/drafts";
@@ -39,7 +39,7 @@ export function useCellEditor() {
 
 export function CellEditor({ rule, department, anchor, initialMode, close }: Props) {
   const toast = useToast();
-  const { mutate } = useCatalog();
+  const { mutate, reload } = useCatalog();
   const departmentId = department.departmentId ?? "";
   const [mode, setMode] = useState<CellState>(initialMode ?? cellState(rule, departmentId));
   // Выбор, отличный от текущего состояния ячейки, переживает повторный вход.
@@ -75,9 +75,17 @@ export function CellEditor({ rule, department, anchor, initialMode, close }: Pro
         setBusy(false);
         return;
       }
-      await mutate(() => api.setRuleScope(rule.nodeId, next), "Область действия обновлена");
+      // expected — область, от которой посчитан новый список: если её успели изменить, API ответит 409
+      // и не заменит чужое изменение списком, собранным из старого снимка.
+      await mutate(() => api.setRuleScope(rule.nodeId, next, scope), "Область действия обновлена");
       close();
     } catch (err) {
+      if (isStale(err)) {
+        toast(STALE_TEXT, "err");
+        close();
+        await reload();
+        return;
+      }
       toast(errorText(err), "err");
       setBusy(false);
     }

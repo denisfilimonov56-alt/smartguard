@@ -24,6 +24,8 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from neo4j.exceptions import ConstraintError
+
 from graph import get_driver
 
 log = logging.getLogger(__name__)
@@ -56,6 +58,8 @@ class Conflict(KeyError_):
 
 
 _lock = threading.Lock()
+# Создание ключей — по одному: проверка названия и запись не разделяются.
+_create_lock = threading.Lock()
 _cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 _misses: OrderedDict[str, float] = OrderedDict()
 _touched: dict[str, float] = {}
@@ -102,18 +106,34 @@ def create(name: str, created_by: str) -> dict[str, Any]:
     name = " ".join((name or "").split())
     if not name or len(name) > NAME_MAX:
         raise Conflict(f"Название ключа — от 1 до {NAME_MAX} символов")
-    # Название попадает в историю проверок как «кто проверял» — оно должно различать системы.
-    if any(k["name"].lower() == name.lower() for k in list_keys()):
-        raise Conflict(f"Ключ с названием {name!r} уже есть")
+    # Название попадает в историю проверок как «кто проверял» и в счёт квоты
+    # (auth.spend_checks по логину key:<название>) — оно должно различать системы.
+    # Проверка и создание — одним запросом и под замком процесса: раньше между
+    # чтением списка и CREATE второй запрос с тем же названием успевал
+    # завести двойника, и две системы делили одну квоту (N25).
     key_id, secret = secrets.token_hex(4), secrets.token_urlsafe(32)
-    rows = _run(
-        """
-        CREATE (k:ApiKey {keyId: $key_id, name: $name, hash: $hash,
-                          createdAt: $now, createdBy: $created_by})
-        RETURN properties(k) AS props
-        """,
-        key_id=key_id, name=name, hash=_hash(secret), now=_now(), created_by=created_by,
-    )
+    try:
+        with _create_lock:
+            if any(k["name"].lower() == name.lower() for k in list_keys()):
+                raise Conflict(f"Ключ с названием {name!r} уже есть")
+            # Условие повторено в самом CREATE: другой процесс API мог завести ключ после чтения.
+            rows = _run(
+                """
+                OPTIONAL MATCH (same:ApiKey) WHERE toLower(same.name) = $name_key
+                WITH count(same) AS taken
+                WHERE taken = 0
+                CREATE (k:ApiKey {keyId: $key_id, name: $name, nameKey: $name_key, hash: $hash,
+                                  createdAt: $now, createdBy: $created_by})
+                RETURN properties(k) AS props
+                """,
+                key_id=key_id, name=name, name_key=name.lower(), hash=_hash(secret), now=_now(),
+                created_by=created_by,
+            )
+    except ConstraintError as exc:
+        # Ограничение уникальности в графе (если заведено) — тот же отказ.
+        raise Conflict(f"Ключ с названием {name!r} уже есть") from exc
+    if not rows:
+        raise Conflict(f"Ключ с названием {name!r} уже есть")
     forget()
     return {**_public(rows[0]["props"]), "key": f"{PREFIX}_{key_id}_{secret}"}
 

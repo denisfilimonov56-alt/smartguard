@@ -17,3 +17,17 @@ def normalize_name(name: str) -> str:
     text = re.sub(r"[\s\-]+", "_", text)
     text = re.sub(r"_+", "_", text)
     return text.strip("_")
+
+
+# Служебные метки шаблона чата: <|im_start|>, <|im_end|> и подобные, теги Qwen3
+# <think>, <tool_call>, <tool_response>. Тот же образец, что agent.SPECIAL_TOKEN
+# (его вырезает clean_goal из цели). Тексты каталога — примеры, описания,
+# инструкции — идут в системное сообщение модели, и метка в них закрыла бы его
+# раньше времени, поэтому каталог такие тексты не сохраняет (422).
+TEMPLATE_MARK = re.compile(r"<\|[^<>|\n]{0,40}\|>|<\s*/?\s*(?:think|tool_call|tool_response)\s*>",
+                           re.IGNORECASE)
+
+
+def has_template_mark(text: str) -> bool:
+    """Есть ли в тексте служебная метка шаблона чата."""
+    return bool(TEMPLATE_MARK.search(text))

@@ -17,6 +17,8 @@ services:
     pull_policy: build
   keycloak:
     pull_policy: missing
+  autoheal:
+    pull_policy: missing
   vllm:
     pull_policy: missing
     environment:

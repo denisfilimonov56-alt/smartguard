@@ -22,12 +22,22 @@ XHR = {"X-Requested-With": "XMLHttpRequest"}
 ISSUER = "https://sso.corp.local/realms/goal-checker"
 CLIENT = "goal-checker-web"
 # Маршруты, открытые без входа: всё остальное обязано отвечать 401.
-PUBLIC = {"/health", "/ready", "/auth/config"}
+# /metrics, как и /ready, — для опроса с самого сервера: nginx его не проксирует.
+PUBLIC = {"/health", "/ready", "/metrics", "/auth/config"}
 
 REALM_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 STRANGER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 # Настоящая проверка ключа: фикстура keycloak её подменяет, тесты JWKS возвращают.
 real_signing_key = auth.signing_key
+
+
+@pytest.fixture(autouse=True)
+def fresh_anonymous_counter():
+    """Счётчик анонимных отказов по адресу (audit) не переходит из теста в тест:
+    все тесты идут с одного адреса и за минуту исчерпали бы его."""
+    audit.flush_anonymous()
+    yield
+    audit.flush_anonymous()
 
 
 def token_for(login, *, key=REALM_KEY, sid="sid-1", kid="realm-key", headers=None, **overrides):
@@ -713,15 +723,21 @@ def test_audit_is_written_to_a_file_on_the_volume(monkeypatch, tmp_path, audit_h
 
 
 def test_audit_file_rotates_by_size_and_keeps_retention(monkeypatch, tmp_path, audit_handlers):
-    """Поток запросов не заполняет том: файл сменяется по размеру, лишние старые удаляются."""
+    """Файл сменяется по размеру, но сменённые за сутки не удаляются: хранение — по возрасту (M8)."""
+    import os
     monkeypatch.setenv("AUDIT_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("AUDIT_RETENTION_DAYS", "3")
     monkeypatch.setenv("AUDIT_MAX_FILE_MB", "1")
+    old = tmp_path / "audit.log.2020-01-01"
+    old.write_text("{}\n", encoding="utf-8")
+    week_ago = time.time() - 7 * 86400
+    os.utime(old, (week_ago, week_ago))
     audit.setup()
     for _ in range(25_000):
-        audit.event("request", pad="x" * 200)
+        audit.event("login_ok", pad="x" * 200)
     names = sorted(p.name for p in tmp_path.iterdir())
-    assert "audit.log" in names and len(names) == 4, names
+    assert "audit.log" in names and len(names) >= 6, names
+    assert old.name not in names, "файл старше AUDIT_RETENTION_DAYS суток удалён"
     assert all(p.stat().st_size <= 1024 * 1024 for p in tmp_path.iterdir())
 
 

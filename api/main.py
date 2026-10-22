@@ -1,7 +1,9 @@
 """HTTP-интерфейс агента проверки целей."""
 
+import inspect
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -13,9 +15,13 @@ import anyio.from_thread
 import anyio.lowlevel
 import anyio.to_thread
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+import agent
+import apikeys
 import audit
 import auth
 import diagnostics
@@ -27,7 +33,7 @@ import routes
 import schemas
 import settings
 from advisor import router as advisor_router
-from agent import BULK_MAX_WORKERS, check_goal, check_goals
+from agent import BULK_MAX_WORKERS, BULK_UNCHECKED_NOTE, check_goal, check_goals  # noqa: F401 — BULK_UNCHECKED_NOTE нужен тестам
 from examples_check import router as examples_router
 from monitoring import router as monitoring_router
 from routes import router as catalog_router
@@ -68,11 +74,91 @@ def _thread_limit() -> int:
 BULK_MAX_REQUESTS = max(1, int(os.getenv("BULK_MAX_REQUESTS", "4")))
 _bulk_requests = threading.BoundedSemaphore(BULK_MAX_REQUESTS)
 
+# Пакет должен ответить раньше, чем nginx перестанет ждать (proxy_read_timeout
+# 600 с): посчитанное позже никто не прочтёт, а место пакета и модель заняты.
+# По истечении срока или при обрыве соединения клиентом цели, до которых не
+# дошли, возвращаются как NEEDS_MANUAL_REVIEW с пометкой BULK_UNCHECKED_NOTE
+# и "unchecked": true. После остановки новые запросы к модели не уходят и не
+# повторяются (agent._pause), но запрос, уже бывший в полёте, дожидается ответа
+# или таймаута: срок по умолчанию оставляет на него LLM_TIMEOUT_SECONDS +
+# LLM_CONNECT_TIMEOUT_SECONDS и ещё BULK_DEADLINE_MARGIN_SECONDS запаса
+# (при умолчаниях 600 − 65 − 15 = 520 с).
+PROXY_READ_TIMEOUT_SECONDS = 600
+BULK_DEADLINE_MARGIN_SECONDS = 15
+_BULK_DEADLINE_DEFAULT = max(10.0, PROXY_READ_TIMEOUT_SECONDS - (agent.LLM_TIMEOUT + agent.LLM_CONNECT_TIMEOUT)
+                             - BULK_DEADLINE_MARGIN_SECONDS)
+BULK_DEADLINE_SECONDS = max(10.0, float(os.getenv("BULK_DEADLINE_SECONDS") or _BULK_DEADLINE_DEFAULT))
+if BULK_DEADLINE_SECONDS + agent.LLM_TIMEOUT + agent.LLM_CONNECT_TIMEOUT >= PROXY_READ_TIMEOUT_SECONDS:
+    log.warning("BULK_DEADLINE_SECONDS (%d) + таймаут модели (%d) не меньше proxy_read_timeout nginx (%d с): "
+                "пакет, остановленный по сроку, может ответить уже после того, как nginx отдаст 504",
+                BULK_DEADLINE_SECONDS, agent.LLM_TIMEOUT + agent.LLM_CONNECT_TIMEOUT,
+                PROXY_READ_TIMEOUT_SECONDS)
+# Как часто обработчик пакета смотрит на срок и на соединение клиента.
+BULK_WATCH_SECONDS = 1.0
+# Без отмены внутри agent.check_goals пакет идёт частями по столько целей,
+# и срок проверяется между частями.
+BULK_CHUNK = 4 * BULK_MAX_WORKERS
 
-def _apply_thread_limit(token: Any) -> None:
-    """Пересчитывает предел потоков AnyIO; вызывается из любого потока
-    (gate.reconfigure после правки llmMaxConcurrency). Предел только растёт:
-    уменьшение не отнимает потоки у идущих запросов, а лишние ничего не стоят."""
+
+class _CheckAdmission:
+    """Ручные проверки (/check-goal) в работе и ждущие — не больше предела.
+
+    Ручная проверка держит поток всё время ожидания модели. Без предела
+    поток проверок быстрее модели копился бы в очереди потоков без границы и
+    без 503. Сверх предела (CHECK_MAX_PENDING, по умолчанию вдвое больше
+    ёмкости модели) — сразу 503 с Retry-After, до того как запрос займёт
+    поток. Ключам внешних систем — предел без интерактивного резерва (вдвое):
+    места сверх него остаются людям. Пределы пересчитываются в потоке
+    (refresh), здесь — только чтение запомненного: граф из цикла событий не читается.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.total = self.keys = 0
+        self.rejected = 0
+        self.limit, self.key_limit = self._compute(32, 4)
+
+    @staticmethod
+    def _compute(capacity: int, reserve: int) -> tuple[int, int]:
+        explicit = os.getenv("CHECK_MAX_PENDING", "").strip()
+        try:
+            limit = max(1, int(explicit)) if explicit else 2 * capacity
+        except ValueError:
+            limit = 2 * capacity
+        return limit, max(1, limit - 2 * reserve)
+
+    def refresh(self) -> None:
+        """Пределы по ёмкости и резерву модели; вызывать из потока, не из цикла событий."""
+        try:
+            capacity, reserve = metrics.gate.limits()
+        except Exception as exc:  # noqa: BLE001 — предел остаётся прежним
+            log.warning("Предел ручных проверок не пересчитан: %s", exc)
+            return
+        self.limit, self.key_limit = self._compute(capacity, reserve)
+
+    def enter(self, key: bool) -> bool:
+        with self._lock:
+            if self.total >= self.limit or (key and self.keys >= self.key_limit):
+                self.rejected += 1
+                return False
+            self.total += 1
+            self.keys += key
+            return True
+
+    def leave(self, key: bool) -> None:
+        with self._lock:
+            self.total -= 1
+            self.keys -= key
+
+
+check_admission = _CheckAdmission()
+
+
+def _apply_thread_limit(token: Any, check_limiter: Optional[anyio.CapacityLimiter] = None) -> None:
+    """Пересчитывает предел потоков AnyIO (и потоков ручных проверок); вызывается
+    из любого потока (gate.reconfigure после правки llmMaxConcurrency). Предел
+    только растёт: уменьшение не отнимает потоки у идущих запросов, а лишние
+    ничего не стоят."""
     wanted = _thread_limit()
 
     def apply() -> None:
@@ -80,6 +166,8 @@ def _apply_thread_limit(token: Any) -> None:
         if wanted > limiter.total_tokens:
             limiter.total_tokens = wanted
             log.info("Потоков для синхронных маршрутов: %s", wanted)
+        if check_limiter is not None and check_admission.limit > check_limiter.total_tokens:
+            check_limiter.total_tokens = check_admission.limit
 
     anyio.from_thread.run_sync(apply, token=token)
 
@@ -95,13 +183,19 @@ async def lifespan(app: FastAPI):
     else:
         log.warning("Neo4j недоступен на старте, повторим при первом запросе")
     auth.check_config()
+    agent.check_config()
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = max(limiter.total_tokens, _thread_limit())
     log.info("Потоков для синхронных маршрутов: %s", limiter.total_tokens)
+    await anyio.to_thread.run_sync(check_admission.refresh)
+    # Ручные проверки — в своих потоках: ожидание модели не занимает потоки
+    # входа, каталога и настроек. Больше предела допуска их всё равно не будет.
+    app.state.check_limiter = anyio.CapacityLimiter(max(check_admission.limit, 1))
     token = anyio.lowlevel.current_token()
 
     def on_limits_changed() -> None:
-        _apply_thread_limit(token)
+        check_admission.refresh()
+        _apply_thread_limit(token, app.state.check_limiter)
 
     metrics.gate.on_reconfigure(on_limits_changed)
     # У /ready свой лимит: он отвечает, даже когда общий пул занят проверками.
@@ -148,8 +242,7 @@ def _audit_body(path: str, raw: bytes) -> Optional[str]:
     return raw[:AUDIT_BODY_LIMIT].decode("utf-8", "replace") or None
 
 
-@app.middleware("http")
-async def guard(request: Request, call_next):
+class Guard:
     """Защита от CSRF, заголовки ответа и журнал аудита.
 
     CORS не настроен намеренно: интерфейс ходит в API через свой же nginx
@@ -158,45 +251,105 @@ async def guard(request: Request, call_next):
     добавит. Для изменяющих запросов без этого заголовка (их быть не должно)
     остаётся второй слой: X-Requested-With, который чужая страница без CORS
     поставить не может.
-    """
-    unsafe = request.method not in SAFE_METHODS
-    path = request.url.path
-    body = None
-    if unsafe and path.startswith("/catalog"):
-        # Что именно поменяли — в журнал; тела /auth туда не попадают никогда.
-        body = _audit_body(path, await request.body())
 
-    started = time.monotonic()
-    status = 500
-    try:
-        # Заголовок Authorization (токен или ключ доступа) чужая страница без
-        # CORS поставить не может — как и X-Requested-With.
-        if (unsafe and request.headers.get("x-requested-with") != "XMLHttpRequest"
-                and not auth.bearer_token(request)):
-            response = JSONResponse(status_code=403,
-                                    content={"detail": "Запрос отклонён: нет заголовка X-Requested-With"})
-        else:
-            response = await call_next(request)
-        status = response.status_code
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        return response
-    finally:
-        # Вход и отказ по токену журналируются в auth.py подробнее: с причиной.
-        if unsafe or status == 403:
-            user = getattr(request.state, "user", None)
-            query = request.url.query or None
-            if not user:
-                # Без входа тело не пишется, а строка запроса обрезается: иначе
-                # любой без учётной записи наполнял бы журнал килобайтами на запрос.
-                body = None
-                query = query[:audit.ANONYMOUS_QUERY_MAX] if query else None
-            audit.event(
-                "request", login=user.login if user else None, role=user.role if user else None,
-                ip=audit.client_ip(request), method=request.method, path=path[:audit.PATH_MAX],
-                query=query, status=status,
-                ms=round((time.monotonic() - started) * 1000), body=body,
-            )
+    Чистый ASGI, а не @app.middleware("http"): BaseHTTPMiddleware не пропускает
+    к обработчику http.disconnect, request.is_disconnected() под ним всегда
+    False, и пакет с советчиком при обрыве клиента досчитывались до срока (N1).
+    Прочитанное для журнала тело отдаётся обработчику заново, а дальше receive —
+    настоящий: обрыв соединения доходит до маршрута.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        unsafe = request.method not in SAFE_METHODS
+        path = request.url.path
+        body = None
+        if unsafe and path.startswith("/catalog"):
+            # Что именно поменяли — в журнал; тела /auth туда не попадают никогда.
+            receive, raw = await _buffer_body(receive)
+            body = _audit_body(path, raw)
+
+        started = time.monotonic()
+        status = 500
+
+        async def send_with_headers(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                headers = MutableHeaders(scope=message)
+                headers["Cache-Control"] = "no-store"
+                headers["X-Content-Type-Options"] = "nosniff"
+            await send(message)
+
+        try:
+            # Заголовок Authorization (токен или ключ доступа) чужая страница без
+            # CORS поставить не может — как и X-Requested-With.
+            if (unsafe and request.headers.get("x-requested-with") != "XMLHttpRequest"
+                    and not auth.bearer_token(request)):
+                response = JSONResponse(status_code=403,
+                                        content={"detail": "Запрос отклонён: нет заголовка X-Requested-With"})
+                await response(scope, receive, send_with_headers)
+            else:
+                await self.app(scope, receive, send_with_headers)
+        finally:
+            # Вход и отказ по токену журналируются в auth.py подробнее: с причиной.
+            if unsafe or status == 403:
+                _audit_request(request, path, status, started, body)
+
+
+async def _buffer_body(receive: Receive) -> tuple[Receive, bytes]:
+    """Читает тело запроса целиком и возвращает receive, который сначала отдаёт
+    прочитанное, а затем передаёт вызовы настоящему receive (в том числе
+    http.disconnect при обрыве)."""
+    chunks: list[bytes] = []
+    messages: list[Message] = []
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message["type"] != "http.request":
+            break
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body", False):
+            break
+
+    async def replay() -> Message:
+        if messages:
+            return messages.pop(0)
+        return await receive()
+
+    return replay, b"".join(chunks)
+
+
+app.add_middleware(Guard)
+
+
+# Проверки целей: удачная проверка по ключу уже записана в историю проверок,
+# строка журнала на каждую из них только раздувала бы его.
+CHECK_PATHS = {"/check-goal", "/check-goals"}
+
+
+def _audit_request(request: Request, path: str, status: int, started: float, body: Optional[str]) -> None:
+    user = getattr(request.state, "user", None)
+    query = request.url.query or None
+    fields = dict(method=request.method, path=path[:audit.PATH_MAX], status=status,
+                  ms=round((time.monotonic() - started) * 1000))
+    if not user:
+        # Без входа тело не пишется, строка запроса обрезается сильнее, а строк с
+        # одного адреса — не больше audit.ANONYMOUS_PER_MINUTE в минуту: иначе
+        # любой без учётной записи наполнял бы журнал килобайтами на запрос.
+        audit.anonymous("request", audit.client_ip(request), **fields,
+                        query=query[:audit.ANONYMOUS_QUERY_MAX] if query else None)
+        return
+    if user.role == auth.SERVICE_ROLE and path.rstrip("/") in CHECK_PATHS and status < 400:
+        return
+    audit.event("request", login=user.login, role=user.role, ip=audit.client_ip(request), **fields,
+                query=query[:audit.QUERY_MAX] if query else None, body=body)
 
 
 @app.exception_handler(metrics.QueueTimeout)
@@ -228,10 +381,11 @@ VIEWER = [Depends(auth.viewer)]
 class GoalRequest(BaseModel):
     goal: schemas.GoalText = Field(
         ..., description="Формулировка цели для проверки, не длиннее настройки goalMaxChars")
-    department_id: Optional[str] = Field(
+    department_id: schemas.OptionalDepartmentId = Field(
         None,
-        description="Идентификатор подразделения (Department.departmentId). "
-                    "Без него применяются все правила, а причина пишется в notes",
+        description="Идентификатор подразделения (Department.departmentId), до 100 символов. "
+                    "Без него применяются все правила, а причина пишется в notes; "
+                    "пустая строка — то же, что без поля",
     )
     is_student: Optional[bool] = Field(
         None,
@@ -241,24 +395,117 @@ class GoalRequest(BaseModel):
     )
 
 
-@app.post("/check-goal")
-def check(req: GoalRequest, user: auth.Principal = Depends(auth.checker)):
-    """Проверка цели на соответствие действующим приказам."""
-    auth.spend_checks(user, 1)
-    metrics.set_actor(user.login)
+async def _admit_check(request: Request):
+    """Допуск ручной проверки — до входа и до потока (см. _CheckAdmission).
+
+    Ключ это или токен, видно по виду заголовка: подлинность проверит
+    auth.checker следом, а поддельный ключ получит 401 и место освободит.
+    """
+    token = auth.bearer_token(request)
+    key = bool(token and apikeys.TOKEN_RE.match(token))
+    if not check_admission.enter(key):
+        raise HTTPException(status_code=503, headers={"Retry-After": "10"}, detail=(
+            "Сейчас идёт слишком много проверок, модель не успевает. Повторите проверку позже"))
     try:
-        return check_goal(req.goal, department_id=req.department_id, is_student=req.is_student)
+        yield
     finally:
-        # Поток пула переиспользуется: следующий запрос в нём не должен считаться чужим.
-        metrics.set_actor(None)
+        check_admission.leave(key)
+
+
+@app.post("/check-goal", dependencies=[Depends(_admit_check)])
+async def check(request: Request, req: GoalRequest, user: auth.Principal = Depends(auth.checker)):
+    """Проверка цели на соответствие действующим приказам."""
+
+    def work() -> dict[str, Any]:
+        auth.spend_checks(user, 1)
+        metrics.set_actor(user.login)
+        try:
+            return check_goal(req.goal, department_id=req.department_id, is_student=req.is_student)
+        finally:
+            # Поток пула переиспользуется: следующий запрос в нём не должен считаться чужим.
+            metrics.set_actor(None)
+
+    limiter = getattr(request.app.state, "check_limiter", None)
+    return await anyio.to_thread.run_sync(work, limiter=limiter)
 
 
 MAX_BATCH = int(os.getenv("MAX_GOALS_PER_REQUEST", "200"))
 
 
+def _unchecked(item: dict[str, Any]) -> dict[str, Any]:
+    """Цель пакета, до которой не дошли до срока или обрыва соединения."""
+    return {"id": item.get("id"), **agent.unchecked_review(
+        item["goal"], agent.resolve_student(item.get("is_student"))[0])}
+
+
+def _summary(results: list[dict[str, Any]]) -> dict[str, int]:
+    statuses = [r.get("status") for r in results]
+    return {"total": len(results), "allowed": statuses.count(agent.STATUS_ALLOWED),
+            "violations": statuses.count(agent.STATUS_VIOLATIONS),
+            "manual_review": statuses.count(agent.STATUS_MANUAL_REVIEW)}
+
+
+def _run_batch(items: list[dict[str, Any]], stop: threading.Event) -> dict[str, Any]:
+    """Пакет с остановкой по stop: недосчитанные цели — ручная проверка с пометкой.
+
+    Если agent.check_goals принимает cancel, останавливается сам пакет (и
+    ожидание очереди к модели). Иначе пакет идёт частями по BULK_CHUNK целей,
+    и stop проверяется между частями.
+    """
+    if "cancel" in inspect.signature(check_goals).parameters:
+        return check_goals(items, cancel=stop)
+    if len(items) <= BULK_CHUNK:
+        return check_goals(items)
+    results: list[dict[str, Any]] = []
+    for start in range(0, len(items), BULK_CHUNK):
+        chunk = items[start:start + BULK_CHUNK]
+        if stop.is_set():
+            results += [_unchecked(item) for item in chunk]
+            continue
+        results += check_goals(chunk)["results"]
+    return {"results": results, "summary": _summary(results)}
+
+
+async def _until_done(request: Request, work, stop: threading.Event) -> Any:
+    """Запускает work в потоке; по истечении BULK_DEADLINE_SECONDS или при обрыве
+    соединения клиентом ставит stop. Исключение work поднимается как есть."""
+    outcome: dict[str, Any] = {}
+    started = time.monotonic()
+
+    async def run() -> None:
+        try:
+            outcome["value"] = await anyio.to_thread.run_sync(work)
+        except Exception as exc:  # noqa: BLE001 — поднимется ниже, вне группы задач
+            outcome["error"] = exc
+        group.cancel_scope.cancel()
+
+    async def watch() -> None:
+        try:
+            while True:
+                await anyio.sleep(BULK_WATCH_SECONDS)
+                if time.monotonic() - started >= BULK_DEADLINE_SECONDS:
+                    log.warning("Пакет не уложился в %d с: оставшиеся цели — на ручную проверку",
+                                BULK_DEADLINE_SECONDS)
+                    break
+                if await request.is_disconnected():
+                    log.warning("Клиент закрыл соединение: пакет останавливается")
+                    break
+        finally:
+            # И отмена самого обработчика (сервер остановился, соединение
+            # закрыто) останавливает пакет: иначе он досчитывался бы впустую.
+            stop.set()
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run)
+        group.start_soon(watch)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
 @app.post("/check-goals")
-def check_many(items: list[schemas.GoalItem] = Body(..., description="Массив целей"),
-               user: auth.Principal = Depends(auth.checker)):
+async def check_many(request: Request, items: list[schemas.GoalItem] = Body(..., description="Массив целей"),
+                     user: auth.Principal = Depends(auth.checker)):
     """Пакетная проверка целей.
 
     Вход — массив объектов вида {"goal": "...", "department_id": "...", "is_student": true, "id": "..."}.
@@ -266,33 +513,46 @@ def check_many(items: list[schemas.GoalItem] = Body(..., description="Масси
     цель студент; без него применяются и правила только для студентов. Порядок ответов
     совпадает с порядком входа, id возвращается как передан (или null).
     Обращения к модели идут параллельно; словари атрибутов и подразделений
-    читаются один раз.
+    читаются один раз. Пакет отвечает не позже BULK_DEADLINE_SECONDS: цели,
+    до которых не дошли (или клиент закрыл соединение), возвращаются как
+    NEEDS_MANUAL_REVIEW с пометкой о повторной отправке.
     """
     if len(items) > MAX_BATCH:
         raise HTTPException(
             status_code=413,
             detail=f"За один раз можно проверить не более {MAX_BATCH} целей, передано {len(items)}",
         )
-    if not settings.flag("bulkChecks"):
-        raise HTTPException(
-            status_code=503,
-            detail="Пакетная проверка временно отключена администратором. Цели можно проверять по одной",
-        )
-    if not _bulk_requests.acquire(blocking=False):
-        raise HTTPException(
-            status_code=503, headers={"Retry-After": "30"},
-            detail=f"Сейчас уже идут {BULK_MAX_REQUESTS} пакетных проверки — больше одновременно "
-                   "сервис не принимает. Повторите запрос позже",
-        )
-    try:
-        auth.spend_checks(user, len(items))
-        metrics.set_actor(user.login)
+    stop = threading.Event()
+
+    def work() -> dict[str, Any]:
+        if not settings.flag("bulkChecks"):
+            raise HTTPException(
+                status_code=503,
+                detail="Пакетная проверка временно отключена администратором. Цели можно проверять по одной",
+            )
+        if not _bulk_requests.acquire(blocking=False):
+            raise HTTPException(
+                status_code=503, headers={"Retry-After": "30"},
+                detail=f"Сейчас уже идут {BULK_MAX_REQUESTS} пакетных проверки — больше одновременно "
+                       "сервис не принимает. Повторите запрос позже",
+            )
         try:
-            return check_goals([item.model_dump() for item in items])
+            spent = auth.spend_checks(user, len(items))
+            metrics.set_actor(user.login)
+            try:
+                outcome = _run_batch([item.model_dump() for item in items], stop)
+            finally:
+                metrics.set_actor(None)
+            # Непроверенные цели (пакет остановлен) клиент отправит снова:
+            # квоту за них возвращаем, иначе повтор упёрся бы в лимит.
+            unchecked = sum(1 for r in outcome["results"] if r.get("unchecked"))
+            if unchecked:
+                auth.refund_checks(user, unchecked, spent)
+            return outcome
         finally:
-            metrics.set_actor(None)
-    finally:
-        _bulk_requests.release()
+            _bulk_requests.release()
+
+    return await _until_done(request, work, stop)
 
 
 @app.get("/check-targets", dependencies=VIEWER)
@@ -340,7 +600,8 @@ async def ready(request: Request):
     без идентификаторов делают проверку целей молча неполной, поэтому это
     тоже «не готов», а не предупреждение. Развёрнутый разбор с указанием
     конкретных узлов — в /catalog/diagnostics. Поле llm — ответил ли vLLM
-    на GET /health за VLLM_READY_TIMEOUT с; без модели проверка целей не
+    на GET /v1/models с ключом за VLLM_READY_TIMEOUT с и есть ли в списке
+    VLLM_MODEL (ответ кэшируется на 45 с); без модели проверка целей не
     работает, поэтому это тоже «не готов».
     """
     limiter = getattr(request.app.state, "ready_limiter", None) or anyio.CapacityLimiter(READY_THREADS)
@@ -374,7 +635,7 @@ async def ready(request: Request):
 
     problems = list(report["problems"])
     if not llm:
-        problems.append("Модель (vLLM) недоступна: не ответила на /health")
+        problems.append("Модель недоступна: " + (monitoring.vllm_problem() or "нет ответа"))
     ok = report["ready"] and llm
     payload = {
         "status": "ready" if ok else "not_ready",
@@ -383,8 +644,86 @@ async def ready(request: Request):
         "check_targets": report["check_targets"],
         "problems": problems,
         "diagnostics": report,
+        # Расхождение часов API и Keycloak, замеченное по токенам за последний час (> 0 — API отстаёт).
+        "clock_skew_seconds": auth.clock_skew(),
     }
     if ok:
         return payload
     log.warning("Сервис не готов к проверкам: %s", "; ".join(problems))
     return JSONResponse(status_code=503, content=payload)
+
+
+def _prometheus_number(value: Any) -> str:
+    """Число для Prometheus без потери точности: целые — как есть, дробные — repr.
+
+    Формат :g оставлял шесть значащих цифр: счётчик 1234567 уходил как
+    1.23457e+06, и rate() по нему врал (N19).
+    """
+    if isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, int):
+        return str(value)
+    value = float(value or 0)
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "+Inf" if value > 0 else "-Inf"
+    if value.is_integer() and abs(value) < 2 ** 53:
+        return str(int(value))
+    return repr(value)
+
+
+def _prometheus() -> str:
+    """Показатели в текстовом формате Prometheus (то же, что «Мониторинг», без истории за период)."""
+    now = metrics.snapshot()
+    recent = now["recent"]
+    history_state = history.state()
+    lines: list[str] = []
+    described: set[str] = set()
+
+    def put(name: str, value: Any, help_text: str, kind: str = "gauge", labels: str = "") -> None:
+        if name not in described:
+            described.add(name)
+            lines.append(f"# HELP goal_checker_{name} {help_text}")
+            lines.append(f"# TYPE goal_checker_{name} {kind}")
+        lines.append(f"goal_checker_{name}{labels} {_prometheus_number(value)}")
+
+    llm = now["llm"]
+    put("llm_capacity", llm["capacity"], "Одновременных запросов к модели (llmMaxConcurrency)")
+    put("llm_running", llm["running"], "Запросов к модели в работе")
+    put("llm_waiting", llm["waiting"], "Запросов, ждущих места в очереди к модели")
+    put("checks_running", now["checks"]["running"], "Проверок целей в работе")
+    put("bulk_batches", len(now["checks"]["batches"]), "Пакетов в работе")
+    put("bulk_queued_goals", now["checks"]["queued"], "Целей принятых пакетов, до которых не дошла очередь")
+    put("single_checks_admitted", check_admission.total, "Ручных проверок в работе и ждущих")
+    put("single_checks_rejected_total", check_admission.rejected,
+        "Ручных проверок, отклонённых 503 сверх предела", "counter")
+    put("recent_checks", recent["checks"], f"Проверок за последние {recent['window_seconds']} с")
+    put("recent_manual_review", recent["manual_review"],
+        f"Ответов NEEDS_MANUAL_REVIEW за последние {recent['window_seconds']} с")
+    put("recent_manual_review_ratio", recent["manual_review"] / recent["checks"] if recent["checks"] else 0,
+        "Доля NEEDS_MANUAL_REVIEW среди недавних проверок")
+    for kind, breaker in sorted(getattr(agent, "_breakers", {}).items()):
+        put("llm_breaker_open", int(breaker.is_open()), "Разомкнут ли предохранитель модели",
+            labels=f'{{kind="{kind}"}}')
+    put("history_pending", history_state["pending"], "Записей истории проверок, ждущих записи в Neo4j")
+    put("history_dropped_total", history_state["dropped"], "Записей истории, потерянных при переполнении",
+        "counter")
+    skew = auth.clock_skew()
+    if skew is not None:
+        put("clock_skew_seconds", skew, "Расхождение часов API и Keycloak за последний час, > 0 — API отстаёт")
+    put("uptime_seconds", now["uptime_seconds"], "Сколько секунд работает процесс API")
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus(request: Request):
+    """Показатели для Prometheus: очередь к модели, доля ручных проверок, предохранители, история.
+
+    Открыт без входа, как /ready, — для опроса с самого сервера: порт API
+    слушает только localhost, а nginx интерфейса этот маршрут не проксирует.
+    Считается в потоках /ready: отвечает, даже когда общий пул занят.
+    """
+    limiter = getattr(request.app.state, "ready_limiter", None) or anyio.CapacityLimiter(READY_THREADS)
+    text = await anyio.to_thread.run_sync(_prometheus, limiter=limiter, abandon_on_cancel=True)
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")

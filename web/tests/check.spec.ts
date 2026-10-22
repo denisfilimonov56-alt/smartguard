@@ -1,4 +1,6 @@
-import { check, choose, expect, go, isApi, mockTokens, modal, test, toast } from "./fixtures";
+import { apiHeaders, check, choose, DEADLINE, expect, go, isApi, mockTokens, modal, test, toast } from "./fixtures";
+
+const DEADLINE_RULE = DEADLINE;
 
 const GOAL = "Снизить долю просроченных заявок до 5% к 31.12.2025";
 
@@ -246,4 +248,48 @@ test("смена подразделения или «студента» во в�
   await app.locator("#studentInput").uncheck();
   await choose(app.locator("#departmentInput"), { value: "UCT" });
   await expect(app.locator("#checkResult")).toBeVisible();
+});
+
+test("ручная проверка и непроверенные правила не получают ✓ в списке «Что проверяется»", async ({ app }) => {
+  // Требование на атрибуте, который определяется по должностным инструкциям; у FIN инструкций нет.
+  await app.evaluate(async (headers) => {
+    await fetch("/api/catalog/check-targets", { method: "POST", headers, body: JSON.stringify({
+      name: "по_инструкции", description: "цель совпадает с обязанностью", source: "job_descriptions" }) });
+    await fetch("/api/catalog/rules", { method: "POST", headers, body: JSON.stringify({
+      clauseNodeId: "c:2", type: "REQUIREMENT", checkInstruction: "", description: "Цель опирается на инструкцию",
+      targets: ["по_инструкции"] }) });
+  }, apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  const line = (text: string) => app.locator("#tab-check aside .checkline").filter({ hasText: text });
+
+  // Нарушений нет, но инструкции сравнить не удалось — ручная проверка: ✓ не стоит ни у кого.
+  let result = await check(app, GOAL, "FIN");
+  await expect(result.getByText("Требуется ручная проверка")).toBeVisible();
+  await expect(app.locator('#tab-check aside .checkline[data-state="good"]')).toHaveCount(0);
+  await expect(line(DEADLINE_RULE)).toHaveAttribute("data-state", "unknown");
+  await expect(line("Цель опирается на инструкцию")).toContainText("не проверено");
+  // Итог не делает вид, что проверено всё: сколько правил не проверено — видно в строке итога.
+  await expect(result.locator("[data-rules-line]")).toContainText("не проверено: 1");
+
+  // Есть нарушение — статус другой, но непроверенное правило всё равно «не проверено», а не ✓.
+  result = await check(app, "Снизить долю просроченных заявок", "FIN");
+  await expect(result.getByText("Нужно доработать")).toBeVisible();
+  await expect(line(DEADLINE_RULE)).toHaveAttribute("data-state", "bad");
+  await expect(line("Цель опирается на инструкцию")).toHaveAttribute("data-state", "unknown");
+  await expect(app.locator('#tab-check aside .checkline[data-state="good"]')).not.toHaveCount(0);
+  // Не «не выполнено 1 из N» как будто остальные выполнены: непроверенное правило названо отдельно, со знаком «?».
+  await expect(result.locator("[data-rules-line]")).toContainText(/^не выполнено правил: 1 из \d+ · не проверено: 1$/);
+  await expect(result.locator(".vitem.unverified .ico")).toHaveText("?");
+  await app.locator("#checkJson summary").click();
+  expect(JSON.parse(await app.locator("#checkJson pre").innerText()).unverified_rule_node_ids).toHaveLength(1);
+});
+
+test("429 от прокси (limit_req, тело не JSON) у одиночной проверки — понятный текст, а не «HTTP 429»", async ({ app }) => {
+  await app.route("**/api/check-goal", (route) =>
+    route.fulfill({ status: 429, contentType: "text/html", body: "<html><body>429 Too Many Requests</body></html>" }));
+  await app.getByLabel("Формулировка цели").fill(GOAL);
+  await choose(app.locator("#departmentInput"), { value: "UCT" });
+  await app.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
+  await expect(toast(app, /Слишком много запросов, повторите через несколько секунд/)).toBeVisible();
 });

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from catalog import TEXT_LIMITS
 from graph import ACTIVE, JOB_SOURCE, get_driver
 from naming import normalize_name
 
@@ -26,6 +27,11 @@ ERROR, WARNING, INFO = "error", "warning", "info"
 def _run(query: str, **params) -> list[dict[str, Any]]:
     with get_driver().session() as session:
         return [dict(record) for record in session.run(query, **params)]
+
+
+def _text(value: Any) -> str:
+    """Текстовое свойство как строка: число или true/false в описании не роняют сбор."""
+    return "" if value is None else value if isinstance(value, str) else str(value)
 
 
 # --------------------------------------------------------------------------
@@ -74,7 +80,8 @@ WHERE (n:Order       AND (n.orderId   IS NULL OR trim(toString(n.orderId))   = '
    OR (n:Rule        AND (n.ruleId    IS NULL OR trim(toString(n.ruleId))    = ''))
    OR (n:ViolationExample AND (n.exampleId IS NULL OR trim(toString(n.exampleId)) = ''))
 RETURN elementId(n) AS nodeId, head(labels(n)) AS kind,
-       coalesce(n.number, n.code, n.description, n.text, '(без названия)') AS label
+       coalesce(toStringOrNull(n.number), toStringOrNull(n.code), toStringOrNull(n.description),
+                toStringOrNull(n.text), '(без названия)') AS label
 ORDER BY kind, label
 LIMIT 200
 """
@@ -84,7 +91,7 @@ MATCH (o:Order)-[:CONTAINS]->(c:Clause)
 WHERE {ACTIVE.format('o')} AND {ACTIVE.format('c')}
   AND NOT (c)-[:DEFINES]->(:Rule)
 RETURN elementId(c) AS nodeId,
-       coalesce(o.number, '?') + ' ' + coalesce(c.code, '?') AS label
+       coalesce(toStringOrNull(o.number), '?') + ' ' + coalesce(toStringOrNull(c.code), '?') AS label
 ORDER BY label
 """
 
@@ -97,14 +104,14 @@ WHERE {ACTIVE.format('o')} AND {ACTIVE.format('c')}
     MATCH (c)-[:DEFINES]->(r:Rule) WHERE {ACTIVE.format('r')}
   }}
 RETURN elementId(c) AS nodeId,
-       coalesce(o.number, '?') + ' ' + coalesce(c.code, '?') AS label
+       coalesce(toStringOrNull(o.number), '?') + ' ' + coalesce(toStringOrNull(c.code), '?') AS label
 ORDER BY label
 """
 
 Q_ORDERS_WITHOUT_CLAUSES = f"""
 MATCH (o:Order) WHERE {ACTIVE.format('o')}
   AND NOT (o)-[:CONTAINS]->(:Clause)
-RETURN elementId(o) AS nodeId, coalesce(o.number, o.orderId, '?') AS label
+RETURN elementId(o) AS nodeId, coalesce(toStringOrNull(o.number), toStringOrNull(o.orderId), '?') AS label
 ORDER BY label
 """
 
@@ -126,7 +133,7 @@ MATCH (o:Order)-[:CONTAINS]->(c:Clause)
 WHERE {ACTIVE.format('o')} AND {ACTIVE.format('c')}
 WITH o, c.code AS code, collect(elementId(c)) AS nodes
 WHERE size(nodes) > 1 AND code IS NOT NULL
-RETURN coalesce(o.number, '?') + ' — пункт ' + code AS label, nodes
+RETURN coalesce(toStringOrNull(o.number), '?') + ' — пункт ' + coalesce(toStringOrNull(code), '?') AS label, nodes
 """
 
 # Область действия правил по подразделениям: одна выборка на все проверки.
@@ -136,7 +143,7 @@ WHERE {ACTIVE.format('r')}
 RETURN elementId(r) AS nodeId,
        coalesce(r.ruleId, '(без ruleId)') AS rule,
        type(x) AS kind,
-       coalesce(d.name, d.departmentId, '?') AS department,
+       coalesce(toStringOrNull(d.name), toStringOrNull(d.departmentId), '?') AS department,
        coalesce(d.status, 'active') AS departmentStatus
 ORDER BY rule, department
 """
@@ -144,7 +151,7 @@ ORDER BY rule, department
 Q_DEPARTMENTS_WITHOUT_ID = """
 MATCH (d:Department)
 WHERE d.departmentId IS NULL OR trim(toString(d.departmentId)) = ''
-RETURN elementId(d) AS nodeId, coalesce(d.name, '(без названия)') AS label
+RETURN elementId(d) AS nodeId, coalesce(toStringOrNull(d.name), '(без названия)') AS label
 ORDER BY label
 """
 
@@ -171,7 +178,7 @@ WHERE {ACTIVE.format('d')} AND d.departmentId IS NOT NULL
     WHERE {ACTIVE.format('r')} AND {ACTIVE.format('t')}
       AND (NOT (r)-[:ONLY_IN]->(:Department) OR (r)-[:ONLY_IN]->(d))
   }}
-RETURN elementId(d) AS nodeId, coalesce(d.name, d.departmentId) AS label
+RETURN elementId(d) AS nodeId, coalesce(toStringOrNull(d.name), toStringOrNull(d.departmentId), '?') AS label
 ORDER BY label
 """
 
@@ -182,9 +189,38 @@ WHERE {ACTIVE.format('d')} AND {ACTIVE.format('j')}
   AND coalesce(j.dutiesStatus, 'ready') <> 'pending'
   AND (size(coalesce(j.duties, [])) = 0 OR coalesce(j.dutiesReviewed, false) = false)
 RETURN elementId(d) AS nodeId,
-       coalesce(d.name, d.departmentId, '?') + ' — ' + coalesce(j.title, '?') AS label,
+       coalesce(toStringOrNull(d.name), toStringOrNull(d.departmentId), '?') + ' — '
+         + coalesce(toStringOrNull(j.title), '?') AS label,
        size(coalesce(j.duties, [])) AS duties
 ORDER BY label
+"""
+
+# Известные текстовые свойства (catalog.TEXT_LIMITS) — для проверки типа и
+# длины. Текст должностной инструкции сюда не входит: он большой и правится
+# своей операцией.
+# Текстовые свойства, без которых проверка идёт неверно: по имени атрибут
+# ищется в цели и в правилах, по описанию его распознаёт модель, по коду
+# находится подразделение. Нестроковое значение здесь — ошибка (и /ready 503),
+# у остальных свойств — предупреждение: они только показываются.
+CHECK_TEXT_PROPERTIES = frozenset({
+    ("CheckTarget", "name"), ("CheckTarget", "description"), ("Department", "departmentId"),
+})
+
+Q_TEXT_PROPERTIES = """
+MATCH (n)
+WHERE n:Order OR n:Clause OR n:Rule OR n:CheckTarget OR n:ViolationExample OR n:Department
+   OR n:JobDescription
+WITH n, [l IN labels(n) WHERE l IN $labels][0] AS kind
+RETURN elementId(n) AS nodeId, kind,
+       CASE kind
+         WHEN 'Order' THEN n {.number, .title, key: n.orderId}
+         WHEN 'Clause' THEN n {.code, .text, key: n.clauseId}
+         WHEN 'Rule' THEN n {.description, .checkInstruction, key: n.ruleId}
+         WHEN 'ViolationExample' THEN n {.text, key: n.exampleId}
+         WHEN 'CheckTarget' THEN n {.name, .description, key: n.name}
+         WHEN 'Department' THEN n {.departmentId, .name, key: n.departmentId}
+         ELSE n {.title, key: n.jobDescriptionId}
+       END AS props
 """
 
 Q_ARCHIVED = """
@@ -249,7 +285,7 @@ def collect() -> dict[str, Any]:
         ))
 
     # Атрибуты без описания
-    no_description = [t for t in active_targets if not t["description"].strip()]
+    no_description = [t for t in active_targets if not _text(t["description"]).strip()]
     if no_description:
         issues.append(_issue(
             "targets_without_description", ERROR,
@@ -467,6 +503,51 @@ def collect() -> dict[str, Any]:
             "пропущенная обязанность — это пропущенное нарушение.",
             items=[{"label": row["label"], "nodeId": row["nodeId"], "kind": "Department"}
                    for row in unreviewed],
+        ))
+
+    # Текстовые свойства не той формы: не строка или длиннее предела
+    not_text, not_text_shown, too_long = [], [], []
+    for row in _run(Q_TEXT_PROPERTIES, labels=sorted({label for label, _ in TEXT_LIMITS})):
+        props = row["props"] or {}
+        for name, value in props.items():
+            limit = TEXT_LIMITS.get((row["kind"], name))
+            if limit is None or value is None:
+                continue
+            item = {"label": f"{KIND_NAMES.get(row['kind'], row['kind'])} "
+                             f"{_text(props.get('key')) or '(без ключа)'}: {name}",
+                    "nodeId": row["nodeId"], "kind": row["kind"]}
+            if not isinstance(value, str):
+                (not_text if (row["kind"], name) in CHECK_TEXT_PROPERTIES else not_text_shown).append(item)
+            elif len(value) > limit:
+                too_long.append({**item, "label": f"{item['label']} — {len(value)} симв., предел {limit}"})
+    if not_text:
+        issues.append(_issue(
+            "non_text_properties", ERROR,
+            "Свойства проверки с нестроковым значением",
+            "Имя или описание атрибута либо код подразделения хранится числом, true/false "
+            "или списком. Проверка сравнивает их как текст: атрибут с таким именем не "
+            "находится в цели, без описания модель его не распознаёт, подразделение с "
+            "таким кодом не находится — цели проверяются неверно. Сохраните значение строкой.",
+            items=not_text,
+        ))
+    if not_text_shown:
+        issues.append(_issue(
+            "non_text_display_properties", WARNING,
+            "Текстовые свойства с нестроковым значением",
+            "Номер или название приказа, текст пункта, описание правила, текст примера, "
+            "название подразделения или инструкции хранится числом, true/false или списком. "
+            "Проверку это не ломает (пример-список в промпт не попадает), но в ответах и "
+            "в интерфейсе значение показывается не так. Сохраните значение строкой.",
+            items=not_text_shown,
+        ))
+    if too_long:
+        issues.append(_issue(
+            "too_long_texts", WARNING,
+            "Слишком длинные тексты",
+            "Текст длиннее предела, который действует при создании и правке. Описания и "
+            "примеры целиком уходят в промпт модели: слишком длинный текст переполняет её "
+            "окно, и все цели уходят на ручную проверку. Сократите текст.",
+            items=too_long,
         ))
 
     # Справка про архив

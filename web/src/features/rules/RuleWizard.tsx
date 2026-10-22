@@ -1,6 +1,7 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../api/client";
+import { limitOf } from "../../api/limits";
 import type { RuleType } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog, type WizardPreset } from "../../state/catalog";
@@ -39,6 +40,11 @@ interface Created {
 
 let draftKey = 0;
 
+/** В мастере есть что терять: ввод или созданное прошлой попыткой. Пустой мастер закрывается без вопроса. */
+const typed = (d: WizardDraft) => !!(d.code.trim() || d.text.trim() || d.description.trim() || d.instruction.trim()
+  || d.picked.length || d.newName.trim() || d.newDescription.trim() || d.only.length || d.examples.length
+  || d.exampleText.trim() || d.created.rule || d.created.clause || d.created.target);
+
 /** Мастер целиком — черновик на время повторного входа (state/drafts.ts). */
 interface WizardDraft {
   step: number; reached: number;
@@ -54,7 +60,7 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
   const { confirm } = useDialogs();
   const { isAdmin } = useAuth();
   const catalog = useCatalog();
-  const { targets, departments, reload, closeWizard, openRule } = catalog;
+  const { targets, departments, reload, closeWizard, openRule, setWizardGuard } = catalog;
   // Правило в архивном приказе или пункте не участвует в проверках — их мастер не предлагает.
   const orders = catalog.orders.filter((o) => o.status === "active")
     .map((o) => ({ ...o, clauses: o.clauses.filter((c) => c.status === "active") }));
@@ -102,10 +108,11 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
 
   // Сессия истекла посреди мастера — после повторного входа он откроется с тем же вводом
   // и с тем, что уже создано прошлой попыткой.
-  useDraft<WizardDraft, WizardDraft>("wizard", {
+  const draft: WizardDraft = {
     step, reached, orderId, newClause, clauseId, code, text, type, description, instruction, picked, newName,
     newDescription, limited, only, studentsOnly, examples, exampleText, exampleBad, created: created.current,
-  }, (d) => {
+  };
+  useDraft<WizardDraft, WizardDraft>("wizard", draft, (d) => {
     setStep(d.step); setReached(d.reached); setOrderId(d.orderId); setNewClause(d.newClause); setClauseId(d.clauseId);
     setCode(d.code); setText(d.text); setType(d.type); setDescription(d.description); setInstruction(d.instruction);
     setPicked(d.picked); setNewName(d.newName); setNewDescription(d.newDescription); setLimited(d.limited);
@@ -113,12 +120,26 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
     setExamples(d.examples.map((e) => ({ ...e, key: ++draftKey })));
     setExampleText(d.exampleText); setExampleBad(d.exampleBad);
     created.current = d.created ?? {};
-  }, (d) => {
-    // Пустой мастер сохранять незачем.
-    const typed = d.code.trim() || d.text.trim() || d.description.trim() || d.instruction.trim() || d.picked.length
-      || d.newName.trim() || d.only.length || d.examples.length || d.exampleText.trim() || d.created.rule || d.created.clause;
-    return typed ? { ...d, created: { ...d.created } } : undefined;
-  });
+  }, (d) => (typed(d) ? { ...d, created: { ...d.created } } : undefined));
+
+  // Закрытие мастера (переход в другой раздел, «Назад», поиск, обучение, «Отмена») с несохранённым
+  // вводом сначала спрашивает; если прошлая попытка уже что-то создала — предлагает это убрать.
+  const leaveRef = useRef<() => Promise<boolean>>(async () => true);
+  leaveRef.current = async () => {
+    if (busy) { toast("Правило создаётся — дождитесь окончания", "err"); return false; }
+    if (!typed(draft)) return true;
+    const leave = await confirm({
+      title: "Закрыть мастер правила?", confirmLabel: "Закрыть", danger: true,
+      message: <p>Введённое в мастере не сохранено и пропадёт.</p>,
+    });
+    if (!leave) return false;
+    await dropCreated(created.current);
+    return true;
+  };
+  useEffect(() => {
+    setWizardGuard(() => leaveRef.current());
+    return () => setWizardGuard(null);
+  }, [setWizardGuard]);
 
   const label = (id: string) => known.find((d) => d.departmentId === id)?.name || id;
   const clauseCode = useNewClause ? code.trim() : clause?.code ?? "";
@@ -195,6 +216,38 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
     }
   }
 
+  /** Мастер закрывают, а прошлая попытка уже создала правило, пункт или атрибут: без вопроса они
+      остались бы в каталоге — правило ещё и участвовало бы в проверках, а повторный ввод создал бы дубли. */
+  async function dropCreated(done: Created) {
+    const items = [
+      ...(done.rule ? [{ nodeId: done.rule, what: "правило" }] : []),
+      ...(done.clause ? [{ nodeId: done.clause.nodeId, what: `пункт ${done.clause.code}` }] : []),
+      ...(done.target ? [{ nodeId: done.target.nodeId, what: `атрибут «${done.target.name}»` }] : []),
+    ];
+    if (!items.length) return;
+    const drop = await confirm({
+      title: "Убрать созданное прошлой попыткой?",
+      confirmLabel: isAdmin ? "Удалить" : "В архив", cancelLabel: "Оставить", danger: isAdmin,
+      message: <>
+        <p>Прошлая попытка успела создать {items.map((i) => i.what).join(", ")}.
+          {done.rule ? " Правило уже участвует в проверках." : ""}</p>
+        <p className="muted">{isAdmin ? "Удалить навсегда" : "Убрать в архив"}, чтобы в каталоге не осталось
+          недоделанного? Если оставить — найдёте в «Приказах»{done.target ? " и «Атрибутах»" : ""}.</p>
+      </>,
+    });
+    if (!drop) return;
+    // Сначала правило: под ним примеры, и на атрибут оно ссылается.
+    for (const item of items) {
+      try {
+        await (isAdmin ? api.remove(item.nodeId, true) : api.setStatus(item.nodeId, "archived"));
+      } catch (err) {
+        toast(`Не удалось убрать ${item.what}: ${errorText(err)}`, "err");
+      }
+    }
+    created.current = {};
+    await reload();
+  }
+
   async function submit() {
     for (let i = 0; i < 3; i++) {
       const message = problem(i);
@@ -266,7 +319,7 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
       toast("Правило создано", "ok");
       const ruleNodeId = done.rule;
       await reload();
-      closeWizard();
+      closeWizard(true);
       openRule(ruleNodeId);
     } catch (err) {
       toast(errorText(err), "err");
@@ -318,12 +371,12 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
                 <div style={{ marginTop: 14 }}>
                   <div className="field">
                     <label htmlFor="wizCode">Номер пункта</label>
-                    <input id="wizCode" type="text" value={code} placeholder="3.1" style={{ width: 160 }}
+                    <input id="wizCode" type="text" value={code} maxLength={limitOf("Clause", "code")} placeholder="3.1" style={{ width: 160 }}
                       onChange={(e) => setCode(e.target.value)} />
                   </div>
                   <div className="field">
                     <label htmlFor="wizText">Текст пункта</label>
-                    <textarea id="wizText" value={text} placeholder="Как пункт сформулирован в приказе"
+                    <textarea id="wizText" value={text} maxLength={limitOf("Clause", "text")} placeholder="Как пункт сформулирован в приказе"
                       onChange={(e) => setText(e.target.value)} />
                   </div>
                 </div>
@@ -353,13 +406,13 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
               </div>
               <div className="field" style={{ marginTop: 16 }}>
                 <label htmlFor="wizDescription">Формулировка правила</label>
-                <input id="wizDescription" type="text" value={description}
+                <input id="wizDescription" type="text" value={description} maxLength={limitOf("Rule", "description")}
                   placeholder={type === "PROHIBITION" ? "Цель не должна сводиться к обучению" : "Цель обязана содержать конкретный срок"}
                   onChange={(e) => setDescription(e.target.value)} />
               </div>
               <div className="field">
                 <label htmlFor="wizInstruction">Что подсказать автору цели</label>
-                <input id="wizInstruction" type="text" value={instruction}
+                <input id="wizInstruction" type="text" value={instruction} maxLength={limitOf("Rule", "checkInstruction")}
                   placeholder="Добавьте в формулировку дату или период завершения"
                   onChange={(e) => setInstruction(e.target.value)} />
               </div>
@@ -382,9 +435,9 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
               <div className="field" style={{ marginBottom: 0 }}>
                 <label htmlFor="wizNewName">Или новый атрибут</label>
                 <div className="row top">
-                  <input id="wizNewName" type="text" value={newName} placeholder="имя, например срок_исполнения"
+                  <input id="wizNewName" type="text" value={newName} maxLength={limitOf("CheckTarget", "name")} placeholder="имя, например срок_исполнения"
                     style={{ width: 260 }} onChange={(e) => setNewName(e.target.value)} />
-                  <input type="text" aria-label="Описание нового атрибута" value={newDescription}
+                  <input type="text" aria-label="Описание нового атрибута" value={newDescription} maxLength={limitOf("CheckTarget", "description")}
                     placeholder="как понять, что это есть в цели" onChange={(e) => setNewDescription(e.target.value)} />
                 </div>
               </div>
@@ -453,7 +506,7 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
               </div>
               <div className="field" style={{ marginTop: 14 }}>
                 <label htmlFor="wizExample">Формулировка цели</label>
-                <textarea id="wizExample" value={exampleText} onChange={(e) => setExampleText(e.target.value)}
+                <textarea id="wizExample" value={exampleText} maxLength={limitOf("ViolationExample", "text")} onChange={(e) => setExampleText(e.target.value)}
                   placeholder="В рамках проекта «Альфа» разработать API для интеграции до 01.06.2025" />
               </div>
               <div className="row between">
@@ -482,9 +535,9 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
         <div className="row between" style={{ marginTop: 18 }}>
           {step > 0
             ? <button className="btn" onClick={() => setStep(step - 1)}>← Назад</button>
-            : <button className="btn" onClick={closeWizard}>Отмена</button>}
+            : <button className="btn" onClick={() => closeWizard()}>Отмена</button>}
           <div className="row">
-            {step > 0 && <button className="btn ghost" onClick={closeWizard}>Отмена</button>}
+            {step > 0 && <button className="btn ghost" onClick={() => closeWizard()}>Отмена</button>}
             {step < 3
               ? <button className="btn primary" onClick={() => go(step + 1)}>Далее: {STEPS[step + 1].toLowerCase()} →</button>
               : <button className="btn primary" disabled={busy} onClick={() => void submit()}>

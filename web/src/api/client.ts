@@ -94,6 +94,31 @@ async function readBody(response: Response, onChunk: () => void): Promise<string
 /** Запрос отменён вызывающим: не ошибка для пользователя. */
 export const isAborted = (e: unknown) => e instanceof ApiError && e.status === -1;
 
+/** Начало ответа 409, когда узел или набор связей изменили после того, как форма их прочитала
+    (catalog.STALE_MESSAGE): правка отклонена, ничего не записано. */
+const STALE_DETAIL = "Узел изменён другим пользователем";
+/** Что сказать пользователю, когда прокси отклонил запрос из-за частоты запросов (429 без JSON). */
+export const TOO_MANY_REQUESTS = "Слишком много запросов, повторите через несколько секунд";
+
+/** Правку отклонили, потому что данные успели изменить (поле expected не совпало с базой). */
+export const isStale = (e: unknown) => e instanceof ApiError && e.status === 409 && e.message.startsWith(STALE_DETAIL);
+/** Что сказать пользователю, когда правка отклонена из-за чужого изменения. */
+export const STALE_TEXT = "Пока вы правили, эти данные изменил другой пользователь. Ваша правка не сохранена, "
+  + "каталог обновлён — проверьте и повторите её.";
+
+/** Одна ошибка проверки тела (422 от pydantic) — по-русски и с именем поля: «Слишком длинно» без поля
+    не объясняет, что править. Прочие типы — как прислал API. */
+function validationText(d: { loc?: unknown[]; msg?: string; type?: string; ctx?: Record<string, unknown> } | null): string {
+  if (!d || typeof d !== "object") return JSON.stringify(d);
+  const field = (d.loc ?? []).filter((part) => part !== "body" && typeof part === "string").join(".");
+  const where = field ? `«${field}»: ` : "";
+  if (d.type === "string_too_long") return `${where}не длиннее ${d.ctx?.max_length ?? "допустимого"} символов`;
+  if (d.type === "string_too_short") return `${where}не может быть пустым`;
+  if (d.type === "missing") return `${where}обязательное поле`;
+  if (d.type === "string_type") return `${where}должно быть строкой`;
+  return where + String(d.msg ?? JSON.stringify(d)).replace(/^Value error, /, "");
+}
+
 async function request<T>(method: Method, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
   // Токен Keycloak обновляется по пути, если истёк; без него запрос уйдёт
   // без заголовка и получит 401 — это и есть «сессия закончилась».
@@ -153,7 +178,10 @@ async function request<T>(method: Method, path: string, body?: unknown, options:
   if (!response.ok) {
     const detail = (payload as { detail?: unknown } | null)?.detail;
     const message = typeof detail === "string" ? detail
-      : Array.isArray(detail) ? detail.map((d) => d?.msg ?? JSON.stringify(d)).join("; ")
+      : Array.isArray(detail) ? detail.map(validationText).join("; ")
+      // 429 без JSON — ограничение частоты у прокси (nginx limit_req, его HTML-страница):
+      // пакет повторяет такой запрос сам (features/check/batch.ts), остальным — понятный текст.
+      : response.status === 429 ? TOO_MANY_REQUESTS
       : `HTTP ${response.status}`;
     if (response.status === 401 && !NOT_SESSION_LOSS.has(path)) onSessionLost?.(message, method !== "GET");
     throw new ApiError(message, response.status, retryAfterOf(response));
@@ -236,8 +264,9 @@ export const api = {
   deleteApiKey: (keyId: string) => request("DELETE", `/settings/api-keys/${enc(keyId)}`),
 
   node: (id: string) => request<NodeProps>("GET", node(id)),
-  patch: (id: string, properties: Record<string, unknown>) =>
-    request<NodeProps>("PATCH", `${node(id)}/properties`, { properties }),
+  /** expected — прежние значения изменяемых свойств, как их видел редактор; если в базе уже другие — 409. */
+  patch: (id: string, properties: Record<string, unknown>, expected?: Record<string, unknown>) =>
+    request<NodeProps>("PATCH", `${node(id)}/properties`, expected ? { properties, expected } : { properties }),
   setStatus: (id: string, status: Status) => request("POST", `${node(id)}/status`, { status }),
   descendants: (id: string) => request<Descendants>("GET", `${node(id)}/descendants`),
   remove: (id: string, force = false) => request("DELETE", node(id) + (force ? "?force=true" : "")),
@@ -258,27 +287,33 @@ export const api = {
     request<Created>("POST", "/catalog/check-targets", body),
   createJobDescription: (body: { departmentNodeId: string; title: string; text: string }) =>
     request<JobDescriptionNode>("POST", "/catalog/job-descriptions", body),
-  updateJobDescription: (id: string, body: { title: string; text: string }) =>
-    request<JobDescriptionNode>("PUT", `/catalog/job-descriptions/${enc(id)}`, body),
+  /** expected — прежние название и текст, как их видел редактор; если в базе уже другие — 409. */
+  updateJobDescription: (id: string, body: { title: string; text: string },
+    expected?: { title: string; text: string }) =>
+    request<JobDescriptionNode>("PUT", `/catalog/job-descriptions/${enc(id)}`, expected ? { ...body, expected } : body),
   extractJobDuties: (id: string) =>
     request<JobDescriptionNode>("POST", `/catalog/job-descriptions/${enc(id)}/extract-duties`),
   /** Опрос фоновой выписки обязанностей. */
   jobDescription: (id: string) => request<JobDescriptionNode>("GET", `/catalog/job-descriptions/${enc(id)}`),
-  setJobDuties: (id: string, duties: string[]) =>
-    request<JobDescriptionNode>("PUT", `/catalog/job-descriptions/${enc(id)}/duties`, { duties }),
+  /** expected — прежний список, как его видел редактор; если в базе уже другой — 409. */
+  setJobDuties: (id: string, duties: string[], expected?: string[]) =>
+    request<JobDescriptionNode>("PUT", `/catalog/job-descriptions/${enc(id)}/duties`,
+      expected ? { duties, expected } : { duties }),
 
   createDepartment: (body: { departmentId: string; name: string }) =>
     request<Created>("POST", "/catalog/departments", body),
 
-  setRuleScope: (id: string, only: string[]) =>
-    request("PUT", `/catalog/rules/${enc(id)}/departments`, { only }),
+  /* PUT наборов связей заменяет набор целиком; expected — прежний набор в том же формате,
+     что и новый: если в базе уже другой (его поменяли после чтения) — 409, ничего не записано. */
+  setRuleScope: (id: string, only: string[], expected?: string[]) =>
+    request("PUT", `/catalog/rules/${enc(id)}/departments`, expected ? { only, expected } : { only }),
   /** Для кого действует правило: только для студентов или для всех. */
   setRuleAudience: (id: string, studentsOnly: boolean) =>
     request("PUT", `/catalog/rules/${enc(id)}/audience`, { studentsOnly }),
-  setRuleTargets: (id: string, targets: string[]) =>
-    request("PUT", `/catalog/rules/${enc(id)}/targets`, { targets }),
-  setReferences: (id: string, references: string[]) =>
-    request("PUT", `/catalog/clauses/${enc(id)}/references`, { references }),
+  setRuleTargets: (id: string, targets: string[], expected?: string[]) =>
+    request("PUT", `/catalog/rules/${enc(id)}/targets`, expected ? { targets, expected } : { targets }),
+  setReferences: (id: string, references: string[], expected?: string[]) =>
+    request("PUT", `/catalog/clauses/${enc(id)}/references`, expected ? { references, expected } : { references }),
   moveClause: (id: string, parentNodeId: string) =>
     request("POST", `/catalog/clauses/${enc(id)}/move`, { parentNodeId }),
   moveRule: (id: string, parentNodeId: string) =>

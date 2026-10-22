@@ -90,8 +90,12 @@ export function CheckView() {
   const skippedForStudents = active.length - applicable.length - skippedByDepartment;
   const problems = (health?.error ?? 0) + (health?.warning ?? 0);
   // Отметки «✓ / ✕» у правил — по ответу одиночной проверки; у пакета ответ у каждой цели свой.
+  // При ручной проверке ✓ не ставится никому: ненарушенное правило там не значит выполненное.
+  // Правила, которые API проверить не смог (unverified_rule_node_ids), — «не проверено» и при другом статусе.
   const marks = mode === "single" ? result : null;
   const failed = useMemo(() => failedRules(marks?.violations ?? []), [marks]);
+  const unverified = useMemo(() => new Set(marks?.unverified_rule_node_ids ?? []), [marks]);
+  const manual = marks?.status === "NEEDS_MANUAL_REVIEW";
 
   // Не согласен с ответом по атрибуту — советчик; только редактору и не при сбое проверки.
   const dispute = result && canEdit && result.status !== "NEEDS_MANUAL_REVIEW"
@@ -173,11 +177,13 @@ export function CheckView() {
               {skippedForStudents ? ` · только для студентов: ${skippedForStudents}` : ""}
             </div>
             {applicable.map(({ rule }) => {
-              const state = !marks ? "skip" : failed(rule) ? "bad" : "good";
+              const state = !marks ? "skip" : failed(rule) ? "bad"
+                : manual || unverified.has(rule.nodeId) ? "unknown" : "good";
               return (
-                <div key={rule.nodeId} className="checkline">
-                  <span className={`ico sm ${state}`}>{state === "bad" ? "✕" : state === "good" ? "✓" : "–"}</span>
-                  <span>{rule.description}</span>
+                <div key={rule.nodeId} className="checkline" data-state={state}>
+                  <span className={`ico sm ${state}`} title={state === "unknown" ? "Не проверено: нужна ручная проверка" : undefined}>
+                    {state === "bad" ? "✕" : state === "good" ? "✓" : state === "unknown" ? "?" : "–"}</span>
+                  <span>{rule.description}{state === "unknown" && <span className="dim"> · не проверено</span>}</span>
                 </div>
               );
             })}

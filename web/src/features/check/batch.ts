@@ -1,7 +1,7 @@
 import { api, ApiError } from "../../api/client";
-import type { BatchCheck, CheckStatus, Department, GoalItem, Violation } from "../../api/types";
+import type { BatchCheck, CheckResult, CheckStatus, Department, GoalItem, Violation } from "../../api/types";
 import { writeWorkbook, type Sheet } from "../../lib/xlsx";
-import type { BatchRow } from "../../state/checkForm";
+import type { BatchRow, BatchSnapshot } from "../../state/checkForm";
 
 /* Пакетная проверка целей: разбор листа Excel в строки, проверка строк до
    отправки, запрос к API частями и выгрузка результата. Чистые функции,
@@ -22,6 +22,29 @@ export const STATUS_CLASS: Record<CheckStatus, string> = {
   ALLOWED: "ok", VIOLATIONS_FOUND: "err", NEEDS_MANUAL_REVIEW: "warn",
 };
 
+/** Цель пакета, до которой API не дошёл (unchecked): не проверена — ни «ручная проверка», ни проверенная. */
+export const UNCHECKED_LABEL = "Не проверено";
+
+/** Заметка API о временном сбое проверки цели (api/agent.py FAILURE_NOTE): статус — ручная проверка,
+    но цель не разбирали, и её стоит отправить снова. API отмечает такой ответ полем retryable; по тексту
+    заметки узнаётся ответ старого API, где поля ещё нет. */
+export const FAILURE_NOTE = "Проверку не удалось завершить из-за временного сбоя сервиса.";
+
+type BatchResult = BatchCheck["results"][number];
+
+/** Проверка цели сорвалась из-за временного сбоя (FAILURE_NOTE): «Проверить оставшиеся» повторит её. */
+export const failedTemporarily = (r: CheckResult) =>
+  r.status === "NEEDS_MANUAL_REVIEW" && !r.unchecked
+  && (r.retryable === true || r.notes.some((n) => n.startsWith(FAILURE_NOTE)));
+
+/** Сводка по ответам: непроверенные (unchecked) — отдельно, в ручную проверку не входят.
+    total — все цели с ответом, включая непроверенные. */
+export function summaryOf(results: CheckResult[]): BatchCheck["summary"] {
+  const count = (status: CheckResult["status"]) => results.filter((r) => !r.unchecked && r.status === status).length;
+  return { total: results.length, allowed: count("ALLOWED"), violations: count("VIOLATIONS_FOUND"),
+    manual_review: count("NEEDS_MANUAL_REVIEW"), unchecked: results.filter((r) => r.unchecked).length };
+}
+
 export const place = (v: Violation) =>
   `Приказ ${v.order_number ?? "?"}, пункт ${v.clause_code ?? "?"}${v.clause_text ? " — " + v.clause_text : ""}`;
 
@@ -37,6 +60,13 @@ export function byRule(violations: Violation[]): { first: Violation; attributes:
     else groups.set(ruleKey(v), { first: v, attributes: [v.attribute] });
   }
   return [...groups.values()];
+}
+
+/** Сколько правил API проверить не смог (unverified_rule_node_ids): ни выполненными, ни нарушенными
+    их считать нельзя. Нарушенные правила сюда не входят, даже если API отдал их и там. */
+export function unverifiedCount(result: CheckResult): number {
+  const failed = new Set(result.violations.map((v) => v.rule_node_id).filter(Boolean));
+  return new Set((result.unverified_rule_node_ids ?? []).filter((id) => !failed.has(id))).size;
 }
 
 /** Русское склонение: plural(3, ["строка", "строки", "строк"]) → «3 строки». */
@@ -117,12 +147,25 @@ export function detectColumns(rows: string[][]): { columns: Columns; header: boo
   } };
 }
 
-/** Подразделение по идентификатору или названию, без учёта регистра. */
+const nameKey = (text: string | null | undefined) => (text ?? "").trim().toLowerCase();
+
+/** Действующие подразделения с таким названием (без учёта регистра). Названия в справочнике
+    не уникальны: у двух филиалов может быть своя «Бухгалтерия». */
+export const activeByName = (text: string, departments: Department[]) =>
+  departments.filter((d) => d.departmentId && d.status === "active" && nameKey(d.name) === nameKey(text));
+
+/** Подразделение по идентификатору или названию, без учёта регистра. Название сопоставляется
+    только с одним действующим: одноимённых несколько — undefined, строка остаётся с исходным текстом,
+    и validateRows просит указать идентификатор. Только архивное с таким названием — оно (строка
+    получит понятную ошибку «в архиве»). */
 export function resolveDepartment(text: string, departments: Department[]): Department | undefined {
-  const key = text.trim().toLowerCase();
+  const key = nameKey(text);
   if (!key) return undefined;
-  return departments.find((d) => d.departmentId?.toLowerCase() === key)
-    ?? departments.find((d) => d.name?.trim().toLowerCase() === key);
+  const byId = departments.find((d) => d.departmentId?.toLowerCase() === key);
+  if (byId) return byId;
+  const active = activeByName(text, departments);
+  if (active.length) return active.length === 1 ? active[0] : undefined;
+  return departments.find((d) => d.departmentId && nameKey(d.name) === key);
 }
 
 /** Строки таблицы из листа: пустые строки пропускаются, название подразделения заменяется идентификатором. */
@@ -169,7 +212,9 @@ export function validateRows(rows: BatchRow[], departments: Department[], fallba
     if (!departmentId) issues.push(error("Подразделение не указано"));
     else {
       const department = departments.find((d) => d.departmentId === departmentId);
-      if (!department) issues.push(error(`Подразделения «${departmentId}» нет в справочнике`));
+      if (!department && activeByName(departmentId, departments).length > 1)
+        issues.push(error(`Название «${departmentId}» относится к нескольким подразделениям — укажите идентификатор`));
+      else if (!department) issues.push(error(`Подразделения «${departmentId}» нет в справочнике`));
       else if (department.status !== "active")
         issues.push(error(`Подразделение «${department.name || departmentId}» в архиве`));
     }
@@ -195,19 +240,28 @@ export const hasErrors = (issues: Issue[] | undefined) => !!issues?.some((i) => 
 const emptyBatch = (): BatchCheck =>
   ({ results: [], summary: { total: 0, allowed: 0, violations: 0, manual_review: 0 } });
 
-/** Сколько раз подряд повторять часть пакета, на которую API ответил 503 «занято», и предел паузы
-    (API обещает Retry-After: 30; больше двух минут ждать не будем). */
+/** Сколько раз подряд повторять часть пакета, на которую API ответил 503 «занято» или 429 «лимит»,
+    и предел паузы (API обещает Retry-After: 30 при занятой очереди и до 60 с при лимите;
+    больше двух минут ждать не будем). */
 export const BUSY_RETRIES = 10;
 export const BUSY_RETRY_MAX_S = 120;
+/** Предел своей паузы на 429 без Retry-After (ограничение частоты у прокси): 2, 3, 4, 5, 5… с. */
+export const PROXY_RETRY_MAX_S = 5;
 
-/** Подождать seconds секунд с обратным отсчётом; отмена прерывает ожидание ошибкой «Запрос отменён». */
+/** Почему пакет ждёт: API занят другими пакетами (503) или исчерпан лимит проверок в минуту (429). */
+export type WaitReason = "busy" | "rate";
+
+/** Подождать seconds секунд с обратным отсчётом; отмена прерывает ожидание ошибкой «Запрос отменён».
+    Оставшееся время считается по часам, а не по числу срабатываний таймера: в фоновой вкладке
+    браузер реже будит таймеры, и отсчёт не должен из-за этого растягиваться. */
 function waitRetry(seconds: number, signal: AbortSignal | undefined, onWait?: (seconds: number | null) => void) {
   return new Promise<void>((resolve, reject) => {
-    let left = Math.max(1, Math.ceil(seconds));
-    onWait?.(left);
+    const until = Date.now() + Math.max(1, Math.ceil(seconds)) * 1000;
+    const left = () => Math.ceil((until - Date.now()) / 1000);
+    onWait?.(left());
     const timer = setInterval(() => {
-      left -= 1;
-      if (left > 0) { onWait?.(left); return; }
+      const rest = left();
+      if (rest > 0) { onWait?.(rest); return; }
       finish();
       resolve();
     }, 1000);
@@ -225,13 +279,15 @@ function waitRetry(seconds: number, signal: AbortSignal | undefined, onWait?: (s
 /** Проверить строки частями по chunk целей; после каждой части onPart получает всё проверенное к этому моменту.
     При сбое бросает ошибку, но уже полученные результаты остаются у вызывающего через onPart.
     Ответ 413 (часть больше предела API или прокси) — часть уменьшается вдвое и отправляется снова.
-    Ответ 503 с Retry-After (API занят другими пакетами, BULK_MAX_REQUESTS) — та же часть повторяется
-    через указанное время (не дольше BUSY_RETRY_MAX_S), не больше BUSY_RETRIES раз подряд. 503 без
-    Retry-After (пакетная проверка выключена, обслуживание) не повторяется. onWait получает оставшиеся
-    секунды ожидания каждую секунду и null, когда ожидание кончилось.
+    Ответ 503 с Retry-After (API занят другими пакетами, BULK_MAX_REQUESTS) и 429 с Retry-After
+    (исчерпан лимит проверок в минуту, checkRatePerMinute) — та же часть повторяется через указанное
+    время (не дольше BUSY_RETRY_MAX_S), не больше BUSY_RETRIES раз подряд. 429 без Retry-After
+    (limit_req у nginx, тело не JSON) — повтор через свою паузу 2–5 с с нарастанием. 503 без Retry-After
+    (пакетная проверка выключена, обслуживание) не повторяется. onWait получает оставшиеся
+    секунды ожидания каждую секунду и причину, и null, когда ожидание кончилось.
     signal останавливает пакет: текущий запрос или ожидание повтора прерывается, следующие части не отправляются. */
 export async function runBatch(rows: BatchRow[], fallback: string, chunk: number, onPart: (partial: BatchCheck) => void,
-  signal?: AbortSignal, onWait?: (seconds: number | null) => void): Promise<BatchCheck> {
+  signal?: AbortSignal, onWait?: (seconds: number | null, reason: WaitReason) => void): Promise<BatchCheck> {
   const items: GoalItem[] = rows.map((r) => ({
     goal: r.goal.trim(), department_id: r.departmentId.trim() || fallback, is_student: r.isStudent,
     id: r.id.trim() || null,
@@ -246,9 +302,15 @@ export async function runBatch(rows: BatchRow[], fallback: string, chunk: number
       part = await api.checkGoals(items.slice(start, start + size), signal);
     } catch (err) {
       if (err instanceof ApiError && err.status === 413 && size > 1) { size = Math.max(1, Math.floor(size / 2)); continue; }
-      if (err instanceof ApiError && err.status === 503 && err.retryAfter !== null && busy < BUSY_RETRIES) {
+      // 429 без Retry-After — ограничение частоты запросов у прокси (nginx limit_req, тело — его HTML-страница):
+      // своя пауза с нарастанием, 2–5 с.
+      const pause = err instanceof ApiError && err.status === 429 && err.retryAfter === null
+        ? Math.min(2 + busy, PROXY_RETRY_MAX_S) : err instanceof ApiError ? err.retryAfter : null;
+      if (err instanceof ApiError && (err.status === 503 || err.status === 429) && pause !== null
+        && busy < BUSY_RETRIES) {
         busy++;
-        await waitRetry(Math.min(err.retryAfter, BUSY_RETRY_MAX_S), signal, onWait);
+        const reason: WaitReason = err.status === 429 ? "rate" : "busy";
+        await waitRetry(Math.min(pause, BUSY_RETRY_MAX_S), signal, (seconds) => onWait?.(seconds, reason));
         continue;
       }
       throw err;
@@ -256,11 +318,54 @@ export async function runBatch(rows: BatchRow[], fallback: string, chunk: number
     busy = 0;
     start += size;
     total.results.push(...part.results);
-    for (const key of Object.keys(total.summary) as (keyof BatchCheck["summary"])[])
-      total.summary[key] += part.summary[key];
+    // Сводка — по ответам, а не сложением сводок API: там непроверенные цели входят в ручную проверку.
+    total.summary = summaryOf(total.results);
     onPart({ results: [...total.results], summary: { ...total.summary } });
   }
   return total;
+}
+
+/* --------------------------- продолжение пакета --------------------------- */
+
+/** Строка та же, что проверялась: цель, признак студента, идентификатор и подразделение
+    (пустое — подразделение по умолчанию того запуска). */
+export const sameRow = (a: BatchRow, b: BatchRow, fallback: string, checkedFallback: string) =>
+  a.goal.trim() === b.goal.trim() && a.isStudent === b.isStudent && a.id.trim() === b.id.trim()
+  && (a.departmentId.trim() || fallback) === (b.departmentId.trim() || checkedFallback);
+
+/** Ответ прошлой проверки, который ещё относится к строке; undefined — строку не проверяли, изменили,
+    API её не проверил (unchecked: пакет остановили по сроку) или проверка сорвалась из-за временного
+    сбоя (failedTemporarily) — такие строки отправляются снова. */
+export function checkedResults(rows: BatchRow[], fallback: string, batch: BatchSnapshot | null): (BatchResult | undefined)[] {
+  if (!batch) return rows.map(() => undefined);
+  const byKey = new Map(batch.rows.map((r, i) => [r.key, { row: r, result: batch.result.results[i] }]));
+  return rows.map((row) => {
+    const hit = byKey.get(row.key);
+    return hit?.result && !hit.result.unchecked && !failedTemporarily(hit.result) && sameRow(row, hit.row, fallback, batch.fallback)
+      ? hit.result : undefined;
+  });
+}
+
+/** Снимок пакета после продолжения: строки в порядке таблицы — проверенные раньше (kept) и проверенные
+    сейчас (fresh, по порядку непроверенных строк); строки, до которых очередь не дошла, в снимок не входят.
+    Подразделение по умолчанию — текущее: строка без своего подразделения сохраняется, только если
+    оно не менялось (иначе sameRow её не узнал бы). Сводка пересчитывается по статусам (summaryOf). */
+export function mergeBatch(rows: BatchRow[], fallback: string, kept: (BatchResult | undefined)[],
+  fresh: BatchResult[]): BatchSnapshot {
+  const outRows: BatchRow[] = [];
+  const results: BatchResult[] = [];
+  let next = 0;
+  rows.forEach((row, i) => {
+    const old = kept[i];
+    if (old) {
+      outRows.push(row);
+      results.push(old);
+    } else if (next < fresh.length) {
+      outRows.push(row);
+      results.push(fresh[next++]);
+    }
+  });
+  return { rows: outRows, fallback, result: { results, summary: summaryOf(results) } };
 }
 
 /* -------------------------------- Excel ---------------------------------- */
@@ -298,7 +403,7 @@ export function resultsWorkbook(rows: BatchRow[], result: BatchCheck): Uint8Arra
         i + 1, r.id ?? "", r.goal,
         r.department ? r.department.name || r.department.id : rows[i]?.departmentId ?? "",
         r.is_student ? "да" : "нет",
-        STATUS_LABEL[r.status],
+        r.unchecked ? UNCHECKED_LABEL : STATUS_LABEL[r.status],
         lines(byRule(r.violations).map(({ first, attributes }) =>
           `${first.rule_text ?? "?"} (${place(first)})${attributes.length > 1 ? ` — атрибуты: ${attributes.join(", ")}` : ""}`)),
         lines(byRule(r.violations).map(({ first }) => first.check_instruction)),

@@ -4,8 +4,14 @@
 лог API (`docker compose logs api | grep audit`) и в файл
 `$AUDIT_LOG_DIR/audit.log` на томе: контейнер пересоздаётся при каждом
 обновлении, и без файла история входов и изменений пропадала бы вместе с
-ним. Файл сменяется в полночь или по достижении AUDIT_MAX_FILE_MB (100 МБ),
-хранится AUDIT_RETENTION_DAYS последних файлов (включая сменённые по размеру).
+ним. Файл сменяется в полночь или по достижении AUDIT_MAX_FILE_MB (100 МБ);
+сменённые файлы удаляются, когда им больше AUDIT_RETENTION_DAYS суток, —
+по возрасту, а не по числу: поток запросов, сменяющий файл по размеру, не
+стирает историю за год. Сверх AUDIT_MAX_TOTAL_MB на все файлы история не
+удаляется: в файл перестают идти только анонимные отказы, а в общий лог —
+ERROR. Анонимные отказы (запрос без входа, отвергнутый токен или ключ)
+пишутся не больше ANONYMOUS_PER_MINUTE строк в минуту с одного адреса,
+остальные — счётчиком в событии anonymous_suppressed.
 Логгер пишет INFO всегда, независимо от LOG_LEVEL. Пароли и содержимое
 запросов к /auth сюда не попадают никогда.
 """
@@ -16,6 +22,8 @@ import json
 import logging
 import logging.handlers
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,19 +37,66 @@ log.setLevel(logging.INFO)
 DEFAULT_DIR = "/data/audit"
 DEFAULT_RETENTION_DAYS = 365
 # Файл сменяется и по размеру: поток запросов без входа не должен заполнить
-# том за сутки. Предел на один файл, всего файлов — AUDIT_RETENTION_DAYS.
+# том за сутки. Предел на один файл; сколько файлов хранить — по их возрасту.
 DEFAULT_MAX_FILE_MB = 100
-# Что пишется о запросах без входа (main.guard).
+# Предел на все файлы журнала: сверх него — ERROR и в файл не идут анонимные отказы.
+DEFAULT_MAX_TOTAL_MB = 20 * 1024
+# Объём каталога пересчитывается не чаще раза в столько секунд.
+TOTAL_RECHECK_SECONDS = 60
+# Что пишется о запросах (main.guard): строка запроса без входа и со входом.
 ANONYMOUS_QUERY_MAX = 200
+QUERY_MAX = 1000
 PATH_MAX = 300
+# Анонимные отказы с одного адреса: столько строк за ANONYMOUS_WINDOW секунд,
+# остальное — счётчиком. Адресов в памяти не больше ANONYMOUS_MAX_IPS, прочие
+# считаются вместе под адресом «*».
+ANONYMOUS_PER_MINUTE = 10
+ANONYMOUS_WINDOW = 60.0
+ANONYMOUS_MAX_IPS = 10_000
+
+_errors = logging.getLogger("audit_journal")
+_now = time.monotonic
 
 
 class _DailyOrSizeHandler(logging.handlers.TimedRotatingFileHandler):
     """Смена файла в полночь или при превышении max_bytes — что наступит раньше."""
 
-    def __init__(self, *args: Any, max_bytes: int, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, max_bytes: int, max_total_bytes: int = 0, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.max_bytes = max_bytes
+        self.max_total_bytes = max_total_bytes
+        self._total_checked = float("-inf")
+        self._over_total = False
+        self._alarmed = float("-inf")
+
+    def _files(self) -> list[str]:
+        directory, base = os.path.split(self.baseFilename)
+        return [os.path.join(directory, n) for n in os.listdir(directory or ".") if n.startswith(base + ".")]
+
+    def over_total(self) -> bool:
+        """Превышен ли предел на все файлы; при превышении — ERROR не чаще раза в час."""
+        if not self.max_total_bytes:
+            return False
+        now = time.monotonic()
+        if now - self._total_checked < TOTAL_RECHECK_SECONDS:
+            return self._over_total
+        self._total_checked = now
+        try:
+            total = sum(os.path.getsize(p) for p in self._files() + [self.baseFilename] if os.path.exists(p))
+        except OSError:
+            return self._over_total
+        was, self._over_total = self._over_total, total >= self.max_total_bytes
+        if self._over_total and (not was or now - self._alarmed >= 3600):
+            self._alarmed = now
+            _errors.error("Журнал аудита занимает %d МБ — больше AUDIT_MAX_TOTAL_MB (%d МБ). История не "
+                          "удаляется, анонимные отказы в файл больше не пишутся: освободите место "
+                          "или перенесите старые файлы", total // 2**20, self.max_total_bytes // 2**20)
+        return self._over_total
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "audit_noise", False) and self.over_total():
+            return
+        super().emit(record)
 
     def shouldRollover(self, record: logging.LogRecord) -> int:  # noqa: N802 — имя из logging
         if super().shouldRollover(record):
@@ -53,17 +108,16 @@ class _DailyOrSizeHandler(logging.handlers.TimedRotatingFileHandler):
         return 0
 
     def getFilesToDelete(self) -> list[str]:  # noqa: N802 — имя из logging
-        """Старые файлы сверх backupCount, включая сменённые по размеру (с номером).
+        """Сменённые файлы старше backupCount суток (по последней записи), включая
+        сменённые по размеру (с номером).
 
-        Штатный разбор имён в logging признаёт только «.ГГГГ-ММ-ДД», и файлы
-        с номером не удалялись бы никогда.
+        Возраст, а не число файлов: иначе поток запросов, сменяющий файл по
+        размеру каждые минуты, за сутки вытеснил бы историю за год. Штатный
+        разбор имён в logging признаёт только «.ГГГГ-ММ-ДД», и файлы с
+        номером не удалялись бы никогда.
         """
-        directory, base = os.path.split(self.baseFilename)
-        old = [os.path.join(directory, n) for n in os.listdir(directory or ".") if n.startswith(base + ".")]
-        if len(old) <= self.backupCount:
-            return []
-        old.sort(key=os.path.getmtime)
-        return old[:len(old) - self.backupCount]
+        edge = time.time() - self.backupCount * 86400
+        return [path for path in self._files() if os.path.getmtime(path) < edge]
 
     def rotation_filename(self, default_name: str) -> str:
         # Несколько смен за сутки дали бы одно и то же имя с датой: добавляется номер.
@@ -79,6 +133,14 @@ def _max_file_bytes() -> int:
         return max(int(raw or DEFAULT_MAX_FILE_MB), 1) * 1024 * 1024
     except ValueError:
         return DEFAULT_MAX_FILE_MB * 1024 * 1024
+
+
+def _max_total_bytes() -> int:
+    raw = os.getenv("AUDIT_MAX_TOTAL_MB", "").strip()
+    try:
+        return max(int(raw or DEFAULT_MAX_TOTAL_MB), 0) * 1024 * 1024
+    except ValueError:
+        return DEFAULT_MAX_TOTAL_MB * 1024 * 1024
 
 
 def _retention_days() -> int:
@@ -105,7 +167,7 @@ def setup() -> None:
         os.makedirs(directory, exist_ok=True)
         handler = _DailyOrSizeHandler(
             path, when="midnight", backupCount=_retention_days(), encoding="utf-8", utc=True,
-            max_bytes=_max_file_bytes())
+            max_bytes=_max_file_bytes(), max_total_bytes=_max_total_bytes())
     except OSError as exc:
         logging.getLogger(__name__).warning(
             "Журнал аудита не пишется в %s (%s): только stdout, история пропадёт с контейнером", path, exc)
@@ -121,10 +183,90 @@ def client_ip(request: Request) -> str:
     return request.headers.get("x-real-ip") or (request.client.host if request.client else "-")
 
 
-def event(name: str, **fields: Any) -> None:
+def _write(name: str, fields: dict[str, Any], noise: bool = False) -> None:
     record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event": name}
     record.update({k: v for k, v in fields.items() if v is not None})
-    log.info(json.dumps(record, ensure_ascii=False, default=str))
+    log.info(json.dumps(record, ensure_ascii=False, default=str), extra={"audit_noise": noise})
+
+
+def event(name: str, **fields: Any) -> None:
+    _write(name, fields)
+    _anonymous.sweep()
+
+
+class _AnonymousCounter:
+    """Анонимные отказы по адресу за минуту: первые ANONYMOUS_PER_MINUTE — строкой, остальные — счётчиком.
+
+    Без этого любой без учётной записи писал бы в журнал строку на каждый
+    запрос. Итог за окно (anonymous_suppressed) пишется, когда окно адреса
+    закончилось и в журнал пришло любое следующее событие.
+    """
+
+    def __init__(self) -> None:
+        self._ips: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._swept = float("-inf")
+
+    def admit(self, ip: str, name: str) -> bool:
+        now = _now()
+        with self._lock:
+            done = self._expired(now)
+            if ip not in self._ips and len(self._ips) >= ANONYMOUS_MAX_IPS:
+                ip = "*"
+            entry = self._ips.get(ip)
+            if entry is None:
+                entry = self._ips[ip] = {"start": now, "since": datetime.now(timezone.utc), "written": 0,
+                                         "suppressed": {}}
+            admitted = entry["written"] < ANONYMOUS_PER_MINUTE
+            if admitted:
+                entry["written"] += 1
+            else:
+                entry["suppressed"][name] = entry["suppressed"].get(name, 0) + 1
+        self._report(done)
+        return admitted
+
+    def sweep(self) -> None:
+        now = _now()
+        if now - self._swept < ANONYMOUS_WINDOW:
+            return
+        with self._lock:
+            done = self._expired(now)
+        self._report(done)
+
+    def _expired(self, now: float) -> list[tuple[str, dict[str, Any]]]:
+        """Закончившиеся окна: забываются, а с подавленными строками — к отчёту. Под _lock."""
+        self._swept = now
+        done = [(ip, e) for ip, e in self._ips.items() if now - e["start"] >= ANONYMOUS_WINDOW]
+        for ip, _ in done:
+            del self._ips[ip]
+        return [(ip, e) for ip, e in done if e["suppressed"]]
+
+    @staticmethod
+    def _report(done: list[tuple[str, dict[str, Any]]]) -> None:
+        for ip, entry in done:
+            _write("anonymous_suppressed", {
+                "ip": ip, "since": entry["since"].isoformat(timespec="seconds"),
+                "counts": entry["suppressed"]}, noise=True)
+
+    def flush(self) -> None:
+        """Отчёт по всем окнам сразу и чистое состояние (остановка, тесты)."""
+        with self._lock:
+            done = [(ip, e) for ip, e in self._ips.items() if e["suppressed"]]
+            self._ips.clear()
+        self._report(done)
+
+
+_anonymous = _AnonymousCounter()
+
+
+def anonymous(name: str, ip: str, **fields: Any) -> None:
+    """Событие без входа (отказ): не больше ANONYMOUS_PER_MINUTE строк в минуту с адреса."""
+    if _anonymous.admit(ip, name):
+        _write(name, {"ip": ip, **fields}, noise=True)
+
+
+def flush_anonymous() -> None:
+    _anonymous.flush()
 
 
 setup()

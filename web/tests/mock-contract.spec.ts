@@ -136,3 +136,62 @@ test("коды диагностики как у API, ошибки — в problem
   expect(body.issues.map((i) => i.code)).toContain("targets_without_description");
   expect(body.problems.some((p) => p.startsWith("Атрибуты без описания"))).toBe(true);
 });
+
+test("expected: прежние значения и наборы связей — 409 при расхождении, ничего не записано", () => {
+  const backend = createBackend();
+  const patch = (body: object) => backend.handle("PATCH", "/catalog/nodes/r:2/properties", body, as("editor"));
+  expect(patch({ properties: { checkInstruction: "x" }, expected: { checkInstruction: "не то" } }).status).toBe(409);
+  const stale = patch({ properties: { description: "x" }, expected: { description: "не то", nope: 1 } });
+  expect((stale.body as { detail: string }).detail)
+    .toBe("Узел изменён другим пользователем — обновите страницу и повторите правку. Изменились: description, nope");
+  expect(patch({ properties: { nope: "x" }, expected: { nope: null } }).status).toBe(200);
+  expect(patch({ properties: { description: 5 } }).status).toBe(422);
+  expect(patch({ properties: { description: "я".repeat(4001) } }).status).toBe(422);
+
+  const put = (path: string, body: object) => backend.handle("PUT", path, body, as("editor"));
+  expect(put("/catalog/rules/r:1/departments", { only: ["UCT"], expected: [] }).status).toBe(409);
+  expect(put("/catalog/rules/r:1/departments", { only: ["UCT"], expected: ["AGD", "UCT"] }).status).toBe(200);
+  expect(put("/catalog/rules/r:1/targets", { targets: ["проект"], expected: ["срок_исполнения"] }).status).toBe(409);
+  expect(put("/catalog/clauses/c:2/references", { references: [], expected: [] }).status).toBe(409);
+  expect(put("/catalog/clauses/c:2/references", { references: [], expected: ["c:1"] }).status).toBe(200);
+});
+
+test("инструкция и обязанности: expected — прежние значения, при расхождении 409 и ничего не записано", () => {
+  const backend = createBackend();
+  const created = backend.handle("POST", "/catalog/job-descriptions",
+    { departmentNodeId: "d:1", title: "Аналитик", text: "готовить отчёт;\nвести реестр" }, as("editor"));
+  const { nodeId } = created.body as { nodeId: string };
+  backend.handle("GET", `/catalog/job-descriptions/${nodeId}`, undefined, as("editor"));
+  const put = (path: string, body: object) => backend.handle("PUT", `/catalog/job-descriptions/${nodeId}${path}`, body, as("editor"));
+  const node = () => backend.handle("GET", `/catalog/nodes/${nodeId}`, undefined, as("editor")).body as Record<string, unknown>;
+
+  const stale = put("", { title: "Новое", text: "другое", expected: { title: "Старое", text: "готовить отчёт;\nвести реестр" } });
+  expect(stale.status).toBe(409);
+  expect((stale.body as { detail: string }).detail).toMatch(/^Узел изменён другим пользователем.*Изменились: title$/);
+  expect(node()).toMatchObject({ title: "Аналитик", text: "готовить отчёт;\nвести реестр" });
+  expect(put("", { title: "Новое", text: "готовить отчёт;\nвести реестр",
+    expected: { title: "Аналитик", text: "готовить отчёт;\nвести реестр" } }).status).toBe(200);
+  expect(put("", { title: "Без сверки", text: "готовить отчёт;\nвести реестр" }).status).toBe(200);
+
+  const staleDuties = put("/duties", { duties: ["x"], expected: ["готовить отчёт"] });
+  expect(staleDuties.status).toBe(409);
+  expect((staleDuties.body as { detail: string }).detail).toMatch(/^Узел изменён другим пользователем/);
+  expect(node().duties).toEqual(["готовить отчёт", "вести реестр"]);
+  expect(put("/duties", { duties: ["x"], expected: ["готовить отчёт", "вести реестр"] }).status).toBe(200);
+  expect(put("/duties", { duties: ["y"] }).status).toBe(200);
+  expect(node().duties).toEqual(["y"]);
+});
+
+test("лимит проверок в минуту: скользящее окно, 429 с Retry-After, крупный запрос проходит при пустом окне", () => {
+  const backend = createBackend();
+  expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 2 }, as("admin")).status).toBe(200);
+  const goals = (n: number) => Array.from({ length: n }, () => ({ goal: "Цель", department_id: "UCT" }));
+  expect(backend.handle("POST", "/check-goals", goals(5), as("viewer")).status).toBe(200);
+  const refused = backend.handle("POST", "/check-goal", { goal: "Цель" }, as("viewer"));
+  expect(refused.status).toBe(429);
+  expect(Number(refused.headers?.["Retry-After"])).toBeGreaterThan(0);
+  // У другого пользователя своё окно.
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель" }, as("editor")).status).toBe(200);
+  backend.advanceClock(61);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель" }, as("viewer")).status).toBe(200);
+});

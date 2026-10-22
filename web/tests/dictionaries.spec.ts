@@ -91,6 +91,65 @@ test("должностные инструкции: загрузка, правк�
   await expect(result.getByText(/Цель не сравнивалась с должностными инструкциями/)).toBeVisible();
 });
 
+test("инструкция и её обязанности: форма шлёт прежние значения (expected), чужая правка — 409, не затирается", async ({ app }) => {
+  // Инструкция с готовым списком обязанностей (GET фейка завершает выписку).
+  const nodeId = await app.evaluate(async (headers) => {
+    const { departments } = await (await fetch("/api/catalog/departments", { headers })).json();
+    const uct = departments.find((d: { departmentId: string }) => d.departmentId === "UCT");
+    const created = await (await fetch("/api/catalog/job-descriptions", { method: "POST", headers,
+      body: JSON.stringify({ departmentNodeId: uct.nodeId, title: "Аналитик", text: "готовить отчёт;\nвести реестр" }) })).json();
+    await fetch(`/api/catalog/job-descriptions/${created.nodeId}`, { headers });
+    return created.nodeId as string;
+  }, apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await go(app, "Подразделения");
+  const job = departmentRow(app, "UCT").getByRole("button", { name: /^Аналитик/ });
+  const putJob = (body: object) => app.evaluate(([id, headers, data]) => fetch(`/api/catalog/job-descriptions/${id}`,
+    { method: "PUT", headers, body: JSON.stringify(data) }).then((r) => r.status), [nodeId, apiHeaders(), body] as const);
+
+  // Правка текста: в запросе — прежние название и текст, как их прочитала форма.
+  await job.click();
+  await app.getByRole("menuitem", { name: "Изменить текст" }).click();
+  await modal(app).getByLabel("Должность").fill("Ведущий аналитик");
+  const [request] = await Promise.all([
+    app.waitForRequest((r) => decodeURIComponent(r.url()).endsWith(`/job-descriptions/${nodeId}`) && r.method() === "PUT"),
+    modal(app).getByRole("button", { name: "Сохранить" }).click(),
+  ]);
+  expect(request.postDataJSON()).toEqual({ title: "Ведущий аналитик", text: "готовить отчёт;\nвести реестр",
+    expected: { title: "Аналитик", text: "готовить отчёт;\nвести реестр" } });
+  await expect(toast(app, "Инструкция обновлена")).toBeVisible();
+
+  // Форма открыта, а другой редактор тем временем сменил название — его правка не затирается.
+  await departmentRow(app, "UCT").getByRole("button", { name: /^Ведущий аналитик/ }).click();
+  await app.getByRole("menuitem", { name: "Изменить текст" }).click();
+  await modal(app).getByLabel("Должность").fill("Версия A");
+  expect(await putJob({ title: "Версия B", text: "готовить отчёт;\nвести реестр" })).toBe(200);
+  await modal(app).getByRole("button", { name: "Сохранить" }).click();
+  await expect(toast(app, "эти данные изменил другой пользователь")).toBeVisible();
+  await expect(modal(app).locator(".modal")).toHaveCount(0);
+  await expect(departmentRow(app, "UCT").getByRole("button", { name: /^Версия B/ })).toBeVisible();
+
+  // Список обязанностей: expected — список, показанный редактору; его успели поправить — 409.
+  await departmentRow(app, "UCT").getByRole("button", { name: /^Версия B/ }).click();
+  await app.getByRole("menuitem", { name: "Обязанности", exact: true }).click();
+  await modal(app).getByLabel("Обязанности", { exact: true }).fill("готовить отчёт\nвести реестр\nпроводить обучение");
+  expect(await app.evaluate(([id, headers]) => fetch(`/api/catalog/job-descriptions/${id}/duties`,
+    { method: "PUT", headers, body: JSON.stringify({ duties: ["чужой список"] }) }).then((r) => r.status),
+  [nodeId, apiHeaders()] as const)).toBe(200);
+  const [dutiesRequest] = await Promise.all([
+    app.waitForRequest((r) => r.url().endsWith("/duties") && r.method() === "PUT"),
+    modal(app).getByRole("button", { name: "Подтвердить список" }).click(),
+  ]);
+  expect(dutiesRequest.postDataJSON()).toEqual({ duties: ["готовить отчёт", "вести реестр", "проводить обучение"],
+    expected: ["готовить отчёт", "вести реестр"] });
+  await expect(toast(app, "эти данные изменил другой пользователь")).toBeVisible();
+  await expect(modal(app).locator(".modal")).toHaveCount(0);
+  const node = await app.evaluate(([id, headers]) => fetch(`/api/catalog/nodes/${id}`, { headers }).then((r) => r.json()),
+    [nodeId, apiHeaders()] as const);
+  expect(node.duties).toEqual(["чужой список"]);
+});
+
 test("подразделение, задающее область действия правил, удалить нельзя", async ({ app }) => {
   await go(app, "Подразделения");
   await menu(departmentRow(app, "UCT"), "Удалить");

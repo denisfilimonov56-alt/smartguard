@@ -1,6 +1,6 @@
 import type { Download, Page } from "@playwright/test";
 
-import { choose, expect, go, mockApi, modal, test, toast } from "./fixtures";
+import { apiHeaders, choose, expect, go, mockApi, modal, test, toast } from "./fixtures";
 import { workbook } from "./xlsx-fixture";
 
 /* Проверка нескольких целей на главном экране: таблица вручную, загрузка
@@ -349,4 +349,186 @@ test("API занят другими пакетами (503 + Retry-After): час
   await page.locator("#batchStop").click();
   await expect(toast(page, "Проверка остановлена")).toBeVisible();
   await expect(page.locator("#batchRun")).toBeEnabled();
+});
+
+/** Загрузить n целей из Excel и вернуться к таблице. */
+async function uploadGoals(page: Page, n: number) {
+  const data = workbook([["Цель", "Подразделение"],
+    ...Array.from({ length: n }, (_, i) => [`${GOAL} — цель ${i + 1}`, "UCT"])]);
+  const dialog = await upload(page, data);
+  await dialog.getByRole("button", { name: `Загрузить ${n} строк` }).click();
+  await expect(rows(page)).toHaveCount(n);
+}
+
+test("лимит проверок в минуту (429 + Retry-After): пакет ждёт и повторяет ту же часть", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.clock.install();
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  // Первая часть (50 целей) проходит при пустом окне, вторая упирается в лимит.
+  expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 3 }).status).toBe(200);
+  await batchMode(page);
+  await uploadGoals(page, 60);
+  await run(page);
+  await expect(page.locator("#batchRun")).toContainText("Проверено 50 из 60 · лимит проверок в минуту, повтор через");
+
+  // Минута прошла — окно освободилось, та же часть уходит снова, пакет заканчивается.
+  backend.advanceClock(61);
+  await page.clock.fastForward(62_000);
+  await expect(page.locator("#batchResult").getByText("Проверено целей: 60")).toBeVisible();
+});
+
+test("прерванный пакет продолжается с непроверенных строк, проверенные не отправляются снова", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 3 }).status).toBe(200);
+  await batchMode(page);
+  await uploadGoals(page, 60);
+  const sent: number[] = [];
+  page.on("request", (r) => { if (r.url().endsWith("/api/check-goals")) sent.push(JSON.parse(r.postData() ?? "[]").length); });
+
+  await run(page);
+  await expect(page.locator("#batchRun")).toContainText("лимит проверок в минуту");
+  await page.locator("#batchStop").click();
+  await expect(toast(page, "Проверка остановлена. Проверено 50 из 60")).toBeVisible();
+  await expect(page.locator("#batchResult").getByText("Проверено целей: 50")).toBeVisible();
+  await expect(rows(page).nth(55).locator(".badge")).toHaveCount(0);
+
+  // Правка проверенной строки — она тоже уходит в продолжение.
+  await page.getByLabel("Цель 1", { exact: true }).fill(GOAL + " в рамках проекта «Альфа»");
+  backend.advanceClock(61);
+  sent.length = 0;
+  await page.locator("#batchContinue").filter({ hasText: "Проверить оставшиеся (11)" }).click();
+  await expect(page.locator("#batchResult").getByText("Проверено целей: 60")).toBeVisible();
+  expect(sent).toEqual([11]);
+  await expect(rows(page).nth(0).locator(".badge")).toHaveText("Нарушений нет");
+  await expect(rows(page).nth(59).locator(".badge")).toHaveText("Нужно доработать");
+  await expect(page.locator("#batchContinue")).toHaveCount(0);
+});
+
+test("цели, которые API не успел проверить до срока пакета (unchecked), уходят в «Проверить оставшиеся»", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  await batchMode(page);
+  await uploadGoals(page, 5);
+  const sent: number[] = [];
+  page.on("request", (r) => { if (r.url().endsWith("/api/check-goals")) sent.push(JSON.parse(r.postData() ?? "[]").length); });
+
+  backend.stopBulkAfter(2);
+  await run(page);
+  await expect(toast(page, /Не проверено целей: 3/)).toBeVisible();
+  await expect(rows(page).nth(0).locator(".badge")).toHaveText("Нужно доработать");
+  await expect(rows(page).nth(2).locator(".badge")).toHaveText("не проверено, отправьте снова");
+  // Сводка и список: непроверенные — отдельно, не «проверено» и не «ручная проверка».
+  const result = page.locator("#batchResult");
+  await expect(result.getByText("Проверено целей: 2")).toBeVisible();
+  await expect(result.getByText("ручная проверка: 0")).toBeVisible();
+  await expect(result.locator("#batchUnchecked")).toHaveText("не проверено: 3");
+  await expect(result.locator(".batch-item").nth(2).locator("summary .badge")).toHaveText("Не проверено");
+  // В Excel — тоже «Не проверено», а не «Ручная проверка».
+  const [download] = await Promise.all([
+    page.waitForEvent("download"), page.getByRole("button", { name: "Скачать Excel" }).click(),
+  ]);
+  const text = await downloaded(download);
+  expect(text.match(/<t>Не проверено<\/t>/g)).toHaveLength(3);
+  expect(text).not.toContain("<t>Ручная проверка</t>");
+
+  sent.length = 0;
+  await page.locator("#batchContinue").filter({ hasText: "Проверить оставшиеся (3)" }).click();
+  await expect(rows(page).nth(4).locator(".badge")).toHaveText("Нужно доработать");
+  expect(sent).toEqual([3]);
+  await expect(page.locator("#batchContinue")).toHaveCount(0);
+  await expect(result.getByText("Проверено целей: 5")).toBeVisible();
+  await expect(result.locator("#batchUnchecked")).toHaveCount(0);
+});
+
+test("цели с временным сбоем модели (FAILURE_NOTE) «Проверить оставшиеся» отправляет снова", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  await batchMode(page);
+  await uploadGoals(page, 3);
+  const sent: string[][] = [];
+  page.on("request", (r) => {
+    if (r.url().endsWith("/api/check-goals")) sent.push(JSON.parse(r.postData() ?? "[]").map((i: { goal: string }) => i.goal));
+  });
+
+  backend.failBulkGoals(1);
+  await run(page);
+  await expect(rows(page).nth(0).locator(".badge")).toHaveText("сбой, отправьте снова");
+  await expect(rows(page).nth(1).locator(".badge")).toHaveText("Нужно доработать");
+  await expect(page.locator("#batchResult").getByText("ручная проверка: 1")).toBeVisible();
+
+  sent.length = 0;
+  await page.locator("#batchContinue").filter({ hasText: "Проверить оставшиеся (1)" }).click();
+  await expect(rows(page).nth(0).locator(".badge")).toHaveText("Нужно доработать");
+  expect(sent).toEqual([[`${GOAL} — цель 1`]]);
+  await expect(page.locator("#batchResult").getByText("ручная проверка: 0")).toBeVisible();
+  await expect(page.locator("#batchContinue")).toHaveCount(0);
+});
+
+test("правила, которые API не проверил (unverified_rule_node_ids), в пакете — «?», а не выполненные", async ({ app }) => {
+  // Требование на атрибуте из должностных инструкций; у FIN инструкций нет — правило не проверено.
+  await app.evaluate(async (headers) => {
+    await fetch("/api/catalog/check-targets", { method: "POST", headers, body: JSON.stringify({
+      name: "по_инструкции", description: "цель совпадает с обязанностью", source: "job_descriptions" }) });
+    await fetch("/api/catalog/rules", { method: "POST", headers, body: JSON.stringify({
+      clauseNodeId: "c:2", type: "REQUIREMENT", checkInstruction: "", description: "Цель опирается на инструкцию",
+      targets: ["по_инструкции"] }) });
+  }, apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await batchMode(app);
+  await app.getByRole("button", { name: "+ Строка" }).click();
+  await app.getByLabel("Цель 1").fill("Снизить долю просроченных заявок");
+  await choose(app.getByLabel("Подразделение 1"), "Финансовое управление");
+  await run(app);
+
+  const item = app.locator("#batchResult .batch-item").first();
+  await expect(item.locator("summary")).toContainText("? не проверено правил: 1");
+  await item.locator("summary").click();
+  await expect(item.locator("[data-rules-line]")).toContainText(/не выполнено правил: \d+ из \d+ · не проверено: 1/);
+  await expect(item.locator(".vitem.unverified")).toContainText("Не проверено: 1 правило");
+});
+
+test("429 без Retry-After (ограничение частоты у прокси, тело не JSON): пакет ждёт свою паузу", async ({ page }) => {
+  await mockApi(page, "admin");
+  let throttled = false;
+  await page.route("**/api/check-goals", (route) => {
+    if (throttled) return route.fallback();
+    throttled = true;
+    return route.fulfill({ status: 429, contentType: "text/html", body: "<html><body>429 Too Many Requests</body></html>" });
+  });
+  await page.goto("/");
+  await batchMode(page);
+  await page.getByRole("button", { name: "+ Строка" }).click();
+  await page.getByLabel("Цель 1").fill(GOAL);
+  await choose(page.getByLabel("Подразделение 1"), "УЦТ");
+  await run(page);
+  await expect(page.locator("#batchRun")).toContainText("повтор через 2 с");
+  await expect(page.locator("#batchResult").getByText("Проверено целей: 1")).toBeVisible();
+});
+
+test("подразделение из Excel по названию: одноимённые действующие — ошибка, архивный двойник не мешает", async ({ app }) => {
+  await app.evaluate(async (headers) => {
+    const post = (departmentId: string, name: string) => fetch("/api/catalog/departments",
+      { method: "POST", headers, body: JSON.stringify({ departmentId, name }) }).then((r) => r.json());
+    await post("MSK-ACC", "Бухгалтерия");
+    await post("SPB-ACC", "Бухгалтерия");
+    const old = await post("OLD-STORE", "Склад");
+    await fetch(`/api/catalog/nodes/${old.nodeId}/status`, { method: "POST", headers, body: JSON.stringify({ status: "archived" }) });
+    await post("STORE", "Склад");
+  }, apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await batchMode(app);
+  const dialog = await upload(app, workbook([["Цель", "Подразделение"],
+    [GOAL, "бухгалтерия"], [GOAL, "SPB-ACC"], [GOAL, "Склад"]]));
+  await expect(dialog.locator("#importIssues"))
+    .toContainText("строка 2 Название «бухгалтерия» относится к нескольким подразделениям — укажите идентификатор");
+  await expect(dialog.locator("#importSummary")).toContainText("с ошибками: 1");
+  await expect(dialog.locator(".preview-table tbody tr").nth(2)).toContainText("STORE");
+  await expect(dialog.locator(".preview-table tbody tr").nth(2)).not.toContainText("OLD-STORE");
 });

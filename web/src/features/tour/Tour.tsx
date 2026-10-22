@@ -78,7 +78,9 @@ export function TourProvider({ children }: { children: ReactNode }) {
   // строки таблицы, подразделение и признак студента остаются как есть.
   const savedForm = useRef<Pick<CheckForm, TourField> | null>(null);
 
-  const start = useCallback(() => {
+  const start = useCallback(async () => {
+    // Мастер правила с несохранённым вводом обучение не закрывает молча: сначала вопрос.
+    if (!running.current && !(await ctx.current.catalog.leaveWizard())) return;
     if (!running.current) savedForm.current = pickTourFields(ctx.current.catalog.checkForm);
     running.current = true;
     setSteps(stepsFor(auth));
@@ -91,7 +93,7 @@ export function TourProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (auth.tourSeen || autoStarted.current || catalog.apiState !== "online" || innerWidth < MIN_WIDTH) return;
     autoStarted.current = true;
-    start();
+    void start();
   }, [auth.tourSeen, catalog.apiState, start]);
 
   const leave = useCallback((i: number) => { steps[i]?.after?.(ctx.current); }, [steps]);

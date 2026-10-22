@@ -28,8 +28,8 @@ interface FieldBase {
 }
 
 export type Field =
-  | (FieldBase & { type?: "text" | "date"; value?: string; placeholder?: string })
-  | (FieldBase & { type: "textarea"; value?: string; placeholder?: string })
+  | (FieldBase & { type?: "text" | "date"; value?: string; placeholder?: string; maxLength?: number })
+  | (FieldBase & { type: "textarea"; value?: string; placeholder?: string; maxLength?: number })
   | (FieldBase & { type: "select"; value?: string; options: Option[] })
   | (FieldBase & { type: "checkbox"; value?: boolean })
   | (FieldBase & { type: "multi"; value?: string[]; options: Option[]; emptyText?: string });
@@ -41,13 +41,17 @@ export interface FormConfig {
   fields: Field[];
   submitLabel?: string;
   wide?: boolean;
-  onSubmit: (values: Values) => Promise<unknown>;
+  /** changed — имена полей, которые изменили по сравнению с исходными значениями формы:
+      форма правки отправляет только их, чтобы не затереть чужие правки нетронутыми полями. */
+  onSubmit: (values: Values, changed: string[]) => Promise<unknown>;
 }
 
 export interface ConfirmConfig {
   title: string;
   message: ReactNode;
   confirmLabel?: string;
+  /** Подпись кнопки «нет», если «Отмена» не подходит по смыслу (например, «Оставить»). */
+  cancelLabel?: string;
   danger?: boolean;
 }
 
@@ -295,9 +299,12 @@ function FormDialog({ config, close }: { config: FormConfig; close: () => void }
       cleaned[f.name] = typeof raw === "string" ? raw.trim() : raw;
       if (f.required && !cleaned[f.name]) { toast(`Заполните поле «${f.label}»`, "err"); return; }
     }
+    const start = JSON.parse(initial) as Values;
+    const changed = fields.map((f) => f.name)
+      .filter((name) => JSON.stringify(values[name]) !== JSON.stringify(start[name]));
     setBusy(true);
     try {
-      await onSubmit(cleaned);
+      await onSubmit(cleaned, changed);
       close();
     } catch (err) {
       toast(errorText(err), "err");
@@ -354,7 +361,7 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
 
   let control: ReactNode;
   if (f.type === "textarea") {
-    control = <textarea id={id} value={value as string} placeholder={f.placeholder} autoFocus={autoFocus}
+    control = <textarea id={id} value={value as string} placeholder={f.placeholder} autoFocus={autoFocus} maxLength={f.maxLength}
       onChange={(e) => onChange(e.target.value)} />;
   } else if (f.type === "select") {
     control = (
@@ -379,7 +386,7 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
       </div>
     );
   } else {
-    control = <input type={f.type || "text"} id={id} value={value as string} placeholder={f.placeholder}
+    control = <input type={f.type || "text"} id={id} value={value as string} placeholder={f.placeholder} maxLength={f.maxLength}
       autoFocus={autoFocus} onChange={(e) => onChange(e.target.value)} />;
   }
 
@@ -393,14 +400,14 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
 }
 
 function ConfirmDialog({ config, done }: { config: ConfirmConfig; done: (answer: boolean) => void }) {
-  const { title, message, confirmLabel = "Подтвердить", danger = false } = config;
+  const { title, message, confirmLabel = "Подтвердить", cancelLabel = "Отмена", danger = false } = config;
   return (
     <Overlay>
       <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
         <h3>{title}</h3>
         <div className="content">{message}</div>
         <div className="foot">
-          <button className="btn" onClick={() => done(false)}>Отмена</button>
+          <button className="btn" onClick={() => done(false)}>{cancelLabel}</button>
           <button className={`btn ${danger ? "danger" : "primary"}`} autoFocus onClick={() => done(true)}>
             {confirmLabel}
           </button>

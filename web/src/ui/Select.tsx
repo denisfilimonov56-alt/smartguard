@@ -22,6 +22,10 @@ interface Props {
   style?: CSSProperties;
   placeholder?: string;
   autoFocus?: boolean;
+  /** Выбор недоступен: значение видно, меню не открывается. */
+  disabled?: boolean;
+  /** Подсказка при наведении (например, почему выбор недоступен). */
+  title?: string;
 }
 
 interface Position {
@@ -33,7 +37,7 @@ interface Position {
 
 const GAP = 6;
 
-export function Select({ value, options, onChange, id, ariaLabel, className = "", style, placeholder, autoFocus }: Props) {
+export function Select({ value, options, onChange, id, ariaLabel, className = "", style, placeholder, autoFocus, disabled, title }: Props) {
   const trigger = useRef<HTMLButtonElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
@@ -120,7 +124,7 @@ export function Select({ value, options, onChange, id, ariaLabel, className = ""
   return (
     <>
       <button ref={trigger} type="button" id={id} role="combobox" aria-haspopup="listbox" aria-expanded={open}
-        aria-label={ariaLabel} data-value={value} autoFocus={autoFocus}
+        aria-label={ariaLabel} data-value={value} autoFocus={autoFocus} disabled={disabled} title={title}
         className={`select ${open ? "open" : ""} ${className}`} style={style}
         onClick={() => (open ? setOpen(false) : show())} onKeyDown={onKeyDown}>
         <span className={`select-value ${selected ? "" : "dim"}`}>{selected?.label ?? placeholder ?? ""}</span>

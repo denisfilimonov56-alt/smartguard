@@ -3,8 +3,9 @@
 # наружу не публикуется. В Keycloak браузер ходит напрямую — у него свой CORS
 # (Web origins клиента).
 #
-# Файл — шаблон: при старте контейнера nginx подставляет ${TRUSTED_PROXY}
-# (см. /docker-entrypoint.d/20-envsubst-on-templates.sh в образе nginx).
+# Файл — шаблон: при старте контейнера nginx подставляет ${TRUSTED_PROXY},
+# ${API_RATE_LIMIT} и ${API_RATE_BURST} (см. /docker-entrypoint.d/20-envsubst-on-templates.sh
+# в образе nginx; умолчания и проверка чисел — в 15-api-rate.envsh).
 # Заголовки безопасности и CSP с адресом Keycloak — в security-headers.inc.
 
 # TLS завершается на внешнем прокси. Его адрес (или подсеть) — в TRUSTED_PROXY:
@@ -14,6 +15,16 @@
 set_real_ip_from ${TRUSTED_PROXY};
 real_ip_header X-Forwarded-For;
 real_ip_recursive on;
+
+# Частота запросов к API с одного адреса (после real_ip — настоящего клиента).
+# Интерфейс шлёт пакет частями по очереди, а при загрузке страницы — десяток
+# запросов разом: это укладывается в burst. Внешней системе хватает с запасом
+# на лимит проверок (checkRatePerMinute) — его считает сам API. Сверх — 429:
+# поток запросов без входа не забивает журнал аудита и потоки API.
+# Умолчание (50 в секунду, всплеск 200) рассчитано и на офис за NAT, когда
+# TRUSTED_PROXY не настроен и все делят один адрес; меняется через
+# API_RATE_LIMIT и API_RATE_BURST.
+limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=${API_RATE_LIMIT}r/s;
 
 server {
     listen 80;
@@ -53,11 +64,15 @@ server {
     }
 
     # Служебные маршруты API — только с самого сервера (localhost:8080).
-    location ~ ^/api/(ready|docs|openapi\.json)$ {
+    location ~ ^/api/(ready|metrics|docs|openapi\.json)/?$ {
         return 404;
     }
 
     location /api/ {
+        limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
+        limit_req_status 429;
+        limit_req_log_level warn;
+
         # Имя сервиса разрешается при каждом запросе, а не один раз на старте:
         # пересозданный контейнер api получает новый адрес.
         resolver 127.0.0.11 valid=10s;

@@ -4,7 +4,7 @@ import {
 
 import { api, isAborted } from "../api/client";
 import type { BatchCheck, CheckResult } from "../api/types";
-import { CHUNK, runBatch } from "../features/check/batch";
+import { CHUNK, checkedResults, mergeBatch, runBatch, type WaitReason } from "../features/check/batch";
 import { errorText, useToast } from "../ui/Toasts";
 import { useAuth } from "./auth";
 
@@ -75,12 +75,16 @@ export interface BatchRun {
   running: boolean;
   done: number;
   total: number;
-  /** API занят другими пакетами (503): через сколько секунд повтор части; null — не ждём. */
+  /** API занят другими пакетами (503) или исчерпан лимит проверок (429): через сколько секунд
+      повтор части; null — не ждём. */
   waiting: number | null;
+  /** Почему ждём: занята очередь пакетов или лимит проверок в минуту. */
+  waitReason: WaitReason | null;
   /** Остановить: текущий запрос или ожидание повтора отменяется, проверенное остаётся. */
   stop: () => void;
-  /** Запустить пакет; пока идёт другой — ничего не делает. */
-  start: (rows: BatchRow[], fallback: string) => Promise<void>;
+  /** Запустить пакет; пока идёт другой — ничего не делает. onlyPending — проверить только строки
+      без ответа или изменённые после проверки, а прежние ответы остальных строк оставить. */
+  start: (rows: BatchRow[], fallback: string, onlyPending?: boolean) => Promise<void>;
 }
 
 /** Идущая проверка одной цели. */
@@ -140,7 +144,9 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
   const limit = user.limits?.maxGoalsPerRequest;
   const chunk = limit && limit > 0 ? Math.min(CHUNK, limit) : CHUNK;
 
-  const [progress, setProgress] = useState<{ done: number; total: number; waiting: number | null } | null>(null);
+  const [progress, setProgress] = useState<{
+    done: number; total: number; waiting: number | null; waitReason: WaitReason | null;
+  } | null>(null);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   useEffect(() => {
@@ -151,24 +157,36 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
 
   const stop = useCallback(() => controller.current?.abort(), []);
 
-  const start = useCallback(async (rows: BatchRow[], fallback: string) => {
+  const start = useCallback(async (rows: BatchRow[], fallback: string, onlyPending = false) => {
     if (controller.current || !rows.length) return;
+    // Продолжение: строки с действующим ответом не отправляются снова и не тратят лимит проверок.
+    const kept = onlyPending ? checkedResults(rows, fallback, latest.current.batch) : rows.map(() => undefined);
+    const todo = rows.filter((_, i) => !kept[i]);
+    if (!todo.length) return;
+    const keptCount = rows.length - todo.length;
     const ctrl = new AbortController();
     controller.current = ctrl;
-    setProgress({ done: 0, total: rows.length, waiting: null });
-    setCheckForm({ batch: null });
+    setProgress({ done: keptCount, total: rows.length, waiting: null, waitReason: null });
+    if (!keptCount) setCheckForm({ batch: null });
     let partial: BatchCheck | null = null;
     try {
-      const result = await runBatch(rows, fallback, chunk, (part) => {
+      const result = await runBatch(todo, fallback, chunk, (part) => {
         partial = part;
-        setProgress({ done: part.results.length, total: rows.length, waiting: null });
-      }, ctrl.signal, (waiting) => setProgress((p) => (p ? { ...p, waiting } : p)));
-      setCheckForm({ batch: { rows, fallback, result } });
+        setProgress({ done: keptCount + part.results.length, total: rows.length, waiting: null, waitReason: null });
+      }, ctrl.signal, (waiting, reason) => setProgress((p) => (p ? { ...p, waiting, waitReason: waiting === null ? null : reason } : p)));
+      setCheckForm({ batch: mergeBatch(rows, fallback, kept, result.results) });
+      // Пакет на сервере остановили по сроку: часть целей не проверена, их надо отправить снова.
+      const unchecked = result.results.filter((r) => r.unchecked).length;
+      if (unchecked && mounted.current)
+        toast(`Не проверено целей: ${unchecked} — пакет не уложился в отведённое время. `
+          + "Нажмите «Проверить оставшиеся»", "err");
     } catch (err) {
-      // Что успели проверить, не теряется: ответ показывается по проверенным строкам.
+      // Что успели проверить, не теряется: ответ показывается по проверенным строкам,
+      // а «Проверить оставшиеся» продолжит с первой непроверенной.
       const done = partial as BatchCheck | null;
-      if (done) setCheckForm({ batch: { rows: rows.slice(0, done.results.length), fallback, result: done } });
-      const checked = done ? `. Проверено ${done.results.length} из ${rows.length}` : "";
+      if (done || keptCount) setCheckForm({ batch: mergeBatch(rows, fallback, kept, done?.results ?? []) });
+      const count = keptCount + (done?.results.length ?? 0);
+      const checked = count ? `. Проверено ${count} из ${rows.length}` : "";
       if (!mounted.current) return;
       if (isAborted(err)) toast(`Проверка остановлена${checked}`, "ok");
       else toast(`Проверка прервана: ${errorText(err)}${checked}`, "err");
@@ -180,7 +198,7 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
 
   const batchRun = useMemo<BatchRun>(() => ({
     running: progress !== null, done: progress?.done ?? 0, total: progress?.total ?? 0,
-    waiting: progress?.waiting ?? null, stop, start,
+    waiting: progress?.waiting ?? null, waitReason: progress?.waitReason ?? null, stop, start,
   }), [progress, stop, start]);
 
   // Одна цель: пока идёт проверка, повторный запуск (кнопка, Ctrl+Enter, советчик) не шлёт второй запрос.

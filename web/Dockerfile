@@ -26,6 +26,8 @@ ENV TRUSTED_PROXY=127.0.0.1
 
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY security-headers.inc.template /etc/nginx/templates/security-headers.inc.template
+# Предел частоты запросов к API (limit_req): умолчания и проверка чисел — в envsh.
+COPY --chmod=755 docker-entrypoint.d/15-api-rate.envsh /docker-entrypoint.d/
 # Origin Keycloak для CSP вычисляется из KEYCLOAK_URL при старте контейнера.
 COPY --chmod=755 docker-entrypoint.d/16-keycloak-csp.envsh /docker-entrypoint.d/
 COPY --from=build /app/dist /usr/share/nginx/html

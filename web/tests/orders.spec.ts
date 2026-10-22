@@ -1,5 +1,5 @@
 import {
-  choose, clauseBlock, expect, go, menu, modal, orderDoc, orderItem, panel, ruleCard, test, toast, TRAINING,
+  apiHeaders, choose, clauseBlock, expect, go, menu, mockApi, modal, orderDoc, orderItem, panel, ruleCard, test, toast, TRAINING,
 } from "./fixtures";
 
 /* Раздел «Приказы»: приказ как документ. Сценарии, на которых прежний
@@ -147,4 +147,93 @@ test("пустое обязательное поле не отправляетс
   await app.getByRole("button", { name: "+ Добавить приказ" }).click();
   await modal(app).getByRole("button", { name: "Создать" }).click();
   await expect(toast(app, "Заполните поле «Номер»")).toBeVisible();
+});
+
+test("свойства: тип текстовых свойств (номер, заголовок) не меняется, длина ограничена пределом API", async ({ app }) => {
+  await go(app, "Приказы");
+  await menu(orderDoc(app), "Свойства");
+  const props = modal(app).getByRole("dialog", { name: /Свойства узла/ });
+  const number = props.locator('.prop-row[data-prop="number"]');
+  await expect(number.getByLabel("Тип свойства")).toBeDisabled();
+  await expect(number.getByLabel("Тип свойства")).toHaveText("строка");
+  await expect(number.getByLabel("Значение свойства")).toHaveAttribute("maxlength", "100");
+  await expect(props.locator('.prop-row[data-prop="title"]').getByLabel("Тип свойства")).toBeDisabled();
+  // Своё свойство — любого типа.
+  await props.getByRole("button", { name: "+ Свойство" }).click();
+  const row = props.locator(".prop-row").last();
+  await row.getByLabel("Имя свойства").fill("priority");
+  await expect(row.getByLabel("Тип свойства")).toBeEnabled();
+  // Новое свойство с именем текстового тоже только строка.
+  await row.getByLabel("Имя свойства").fill("title");
+  await expect(row.getByLabel("Тип свойства")).toBeDisabled();
+});
+
+test("подразделение без названия правится без ложного 409: name не сверяется", async ({ page }) => {
+  const backend = await mockApi(page, "admin");
+  expect(backend.handle("PATCH", "/catalog/nodes/d:3/properties", { properties: { name: null } }).status).toBe(200);
+  await page.goto("/");
+  await expect(page.getByText("API на связи")).toBeVisible();
+  await go(page, "Подразделения");
+  const row = page.locator("#tab-departments tr").filter({ has: page.locator(".mono", { hasText: "FIN" }) });
+  await row.getByRole("button", { name: "Действия" }).click();
+  await page.getByRole("menuitem", { name: "Изменить", exact: true }).click();
+  await modal(page).getByLabel("Название").fill("Финансы");
+  const [request] = await Promise.all([
+    page.waitForRequest((r) => r.url().includes("/properties") && r.method() === "PATCH"),
+    modal(page).getByRole("button", { name: "Сохранить" }).click(),
+  ]);
+  expect(request.postDataJSON()).toEqual({ properties: { name: "Финансы" }, expected: {} });
+  await expect(toast(page, "Подразделение обновлено")).toBeVisible();
+});
+
+test("свойства: шлют только изменённое и прежние значения; строка-дата не считается изменённой; чужая правка — 409", async ({ app }) => {
+  // Заголовок — текстовое свойство; значение вида YYYY-MM-DD угадывается датой, но остаётся строкой.
+  await app.evaluate((headers) => fetch("/api/catalog/nodes/o:1/properties", { method: "PATCH", headers,
+    body: JSON.stringify({ properties: { title: "2025-12-31" } }) }), apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await go(app, "Приказы");
+  await orderItem(app, "ПР-01").click();
+  await menu(orderDoc(app), "Свойства");
+  const props = modal(app).getByRole("dialog", { name: /Свойства узла/ });
+  await props.locator('.prop-row[data-prop="number"]').getByLabel("Значение свойства").fill("ПР-01а");
+  const [request] = await Promise.all([
+    app.waitForRequest((r) => r.url().includes("/properties") && r.method() === "PATCH"),
+    props.getByRole("button", { name: "Сохранить" }).click(),
+  ]);
+  expect(request.postDataJSON()).toEqual({ properties: { number: "ПР-01а" }, expected: { number: "ПР-01" } });
+  await expect(toast(app, "Свойства сохранены")).toBeVisible();
+
+  // Окно открыто, а другой редактор тем временем сменил номер — его правка не затирается.
+  await menu(orderDoc(app), "Свойства");
+  await props.locator('.prop-row[data-prop="number"]').getByLabel("Значение свойства").fill("Версия A");
+  await app.evaluate((headers) => fetch("/api/catalog/nodes/o:1/properties", { method: "PATCH", headers,
+    body: JSON.stringify({ properties: { number: "Версия B" } }) }), apiHeaders());
+  await props.getByRole("button", { name: "Сохранить" }).click();
+  await expect(toast(app, "эти данные изменил другой пользователь")).toBeVisible();
+  await expect(props).toHaveCount(0);
+  await expect(orderItem(app, "Версия B")).toBeVisible();
+});
+
+test("переход к архивному правилу открывает панель, даже если перечитку каталога обогнала другая", async ({ app }) => {
+  // Правило без ruleId — в «Узлах без идентификатора»; в архиве его нет в дереве без архива.
+  await app.evaluate((headers) => fetch("/api/catalog/nodes/r:3/status", { method: "POST", headers,
+    body: JSON.stringify({ status: "archived" }) }), apiHeaders());
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await go(app, /Замечания/);
+  // Первая перечитка с архивом отвечает с задержкой — её обгоняет «Обновить».
+  let delayed = false;
+  await app.route("**/api/catalog/tree?include_archived=true", async (route) => {
+    if (delayed) return route.fallback();
+    delayed = true;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    return route.fallback();
+  });
+  const item = app.locator(".issue .item").filter({ hasText: "Rule r:3" });
+  await item.getByRole("button", { name: "Показать" }).click();
+  await app.getByRole("button", { name: "Меню пользователя" }).click();
+  await app.getByRole("menuitem", { name: "Обновить" }).click();
+  await expect(panel(app)).toContainText(TRAINING);
+  await expect(app.locator("#tab-orders")).toBeVisible();
 });

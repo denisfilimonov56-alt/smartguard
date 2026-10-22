@@ -30,6 +30,7 @@ from typing import Any, Callable, Literal, Optional
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from neo4j.exceptions import ConstraintError
 from pydantic import BaseModel, Field
 
 import apikeys
@@ -48,8 +49,23 @@ RANK[SERVICE_ROLE] = -1
 # Подписи, которыми Keycloak подписывает access-токены. HS* исключены
 # намеренно: симметричный ключ API не известен, а принять «none» нельзя.
 ALGORITHMS = ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512")
-# Допуск на расхождение часов API и Keycloak при проверке exp/nbf/iat.
+# Допуск на расхождение часов API и Keycloak при проверке exp: срок — строго.
 LEEWAY_SECONDS = 30
+# iat и nbf в будущем значат, что часы API отстают от Keycloak. До стольких
+# секунд такой токен принимается (с предупреждением в журнале): иначе отставшие
+# на минуту часы зацикливали бы вход у всех. Дальше — отказ.
+CLOCK_SKEW_MAX_SECONDS = 300
+# Предупреждение о расхождении часов — не чаще раза в столько секунд; в /ready
+# расхождение показывается, пока ему не больше часа.
+CLOCK_SKEW_LOG_SECONDS = 60
+CLOCK_SKEW_SHOW_SECONDS = 3600
+# Первый токен сессии: iat отстоит от auth_time (вход) не больше чем на столько секунд.
+FRESH_LOGIN_SECONDS = 5
+# Первый токен сессии, просроченный не больше чем на столько секунд, считается
+# просроченным сразу при получении (часы API спешат); просроченный сильнее —
+# пришёл после простоя вкладки, о часах он ничего не говорит. Больше LEEWAY_SECONDS:
+# раньше допуска токен не отвергается.
+EXPIRED_ON_ARRIVAL_SECONDS = LEEWAY_SECONDS + 90
 # Сколько секунд набор ключей realm-а считается свежим; удалённый из realm-а
 # ключ перестаёт приниматься не позже чем через этот срок.
 JWKS_LIFESPAN_SECONDS = 300
@@ -283,6 +299,84 @@ def signing_key(token: str):
     return _jwks_client(url).key(kid)
 
 
+_skew_lock = threading.Lock()
+# Последнее замеченное расхождение часов: (секунд, когда замечено по time.time, когда записано в лог).
+_skew: dict[str, float] = {}
+
+
+def _note_skew(seconds: float) -> None:
+    """Часы API и Keycloak расходятся: в лог (не чаще CLOCK_SKEW_LOG_SECONDS) и в /ready.
+
+    seconds > 0 — часы API отстают, < 0 — спешат.
+    """
+    now = time.time()
+    with _skew_lock:
+        _skew["seconds"], _skew["at"] = round(seconds), now
+        if now - _skew.get("logged", float("-inf")) < CLOCK_SKEW_LOG_SECONDS:
+            return
+        _skew["logged"] = now
+    log.warning("Часы API и Keycloak расходятся на %d с (часы API %s). Синхронизируйте время "
+                "(chrony или NTP контура): при расхождении больше %d с вход перестаёт работать",
+                abs(round(seconds)), "отстают" if seconds > 0 else "спешат", CLOCK_SKEW_MAX_SECONDS)
+
+
+def clock_skew() -> Optional[int]:
+    """Расхождение часов API и Keycloak, замеченное за последний час, сек (> 0 — API отстаёт); None — не замечено."""
+    with _skew_lock:
+        if time.time() - _skew.get("at", float("-inf")) > CLOCK_SKEW_SHOW_SECONDS:
+            return None
+        return int(_skew["seconds"])
+
+
+def _numeric(claims: dict[str, Any], name: str) -> Optional[float]:
+    value = claims.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TokenInvalid(f"{name} должен быть числом")
+    return float(value)
+
+
+def _check_issued(claims: dict[str, Any]) -> None:
+    """iat и nbf в будущем: в пределах CLOCK_SKEW_MAX_SECONDS — принять и сообщить о часах, дальше — отказ."""
+    now = time.time()
+    ahead = max((v for v in (_numeric(claims, "iat"), _numeric(claims, "nbf")) if v is not None),
+                default=now) - now
+    if ahead <= LEEWAY_SECONDS:
+        return
+    _note_skew(ahead)
+    if ahead > CLOCK_SKEW_MAX_SECONDS:
+        raise TokenInvalid(f"токен ещё не действует: часы API отстают от Keycloak на {round(ahead)} с")
+
+
+def _explain_expired(token: str, key: Any, issuer: str) -> None:
+    """Истёкший токен — первый после входа (iat≈auth_time): значит, часы API спешат.
+
+    Подпись перепроверяется: в лог о часах идёт только подлинный токен.
+    """
+    import jwt
+
+    try:
+        claims = jwt.decode(token, key, algorithms=list(ALGORITHMS), issuer=issuer,
+                            options={"verify_aud": False, "verify_exp": False, "verify_iat": False,
+                                     "verify_nbf": False})
+        iat, auth_time = _numeric(claims, "iat"), _numeric(claims, "auth_time")
+    except (jwt.exceptions.PyJWTError, TypeError, ValueError, TokenInvalid):
+        return
+    if iat is None or auth_time is None or not 0 <= iat - auth_time <= FRESH_LOGIN_SECONDS:
+        return
+    # Просрочен давно — это не часы, а вкладка, простоявшая дольше срока токена:
+    # первый токен сессии пришёл после простоя. О часах говорит только токен,
+    # просроченный сразу при получении (не больше чем на EXPIRED_ON_ARRIVAL_SECONDS).
+    try:
+        exp = _numeric(claims, "exp")
+    except TokenInvalid:
+        return
+    if exp is None or time.time() - exp > EXPIRED_ON_ARRIVAL_SECONDS:
+        return
+    _note_skew(iat - time.time())
+
+
 def verify_token(token: str) -> dict[str, Any]:
     """Проверенные утверждения access-токена. Исключения: TokenInvalid, AccessRefused, DirectoryUnavailable.
 
@@ -300,14 +394,20 @@ def verify_token(token: str) -> dict[str, Any]:
     expected = client_id()
     key = signing_key(token)
     try:
+        # iat и nbf проверяются отдельно (_check_issued) с допуском на отставшие часы API.
         claims = jwt.decode(
             token, key, algorithms=list(ALGORITHMS), issuer=issuer, leeway=LEEWAY_SECONDS,
-            options={"verify_aud": False, "require": ["exp", "iat", "sub", "iss"]},
+            options={"verify_aud": False, "verify_iat": False, "verify_nbf": False,
+                     "require": ["exp", "iat", "sub", "iss"]},
         )
+    except jwt.exceptions.ExpiredSignatureError as exc:
+        _explain_expired(token, key, issuer)
+        raise TokenInvalid(str(exc)) from exc
     except (jwt.exceptions.PyJWTError, TypeError, ValueError) as exc:
         # TypeError/ValueError/InvalidKeyError — alg заголовка не подходит к типу
         # ключа (например, ES256 с kid RSA-ключа): это подделка, а не сбой сервера.
         raise TokenInvalid(str(exc)) from exc
+    _check_issued(claims)
     audience = claims.get("aud")
     audience = audience if isinstance(audience, list) else [audience] if audience else []
     if claims.get("typ", "Bearer") != "Bearer":
@@ -392,23 +492,30 @@ class SeenSessions:
 
 
 class RateLimit:
-    """Скользящее минутное окно: сколько целей проверил пользователь или ключ."""
+    """Скользящее минутное окно: сколько целей проверил пользователь или ключ.
+
+    Каждое списание — отдельная запись [время, сколько]; take отдаёт её как
+    квитанцию, и refund возвращает квоту именно из неё, а не из последних
+    списаний: иначе возврат пакета снимал бы чужие (более поздние) списания, а
+    если запись пакета уже вышла из окна — давал бы пользователю лимит дважды (N3).
+    """
 
     WINDOW = 60.0
     MAX_KEYS = 10_000
 
     def __init__(self) -> None:
-        self._spent: dict[str, deque[tuple[float, int]]] = {}
+        self._spent: dict[str, deque[list]] = {}
         self._lock = threading.Lock()
 
-    def take(self, key: str, amount: int, limit: int) -> int:
-        """Списывает amount; возвращает, сколько секунд ждать, если лимит исчерпан (0 — принято).
+    def spend(self, key: str, amount: int, limit: int) -> tuple[int, Optional[list]]:
+        """Списывает amount; возвращает (сколько секунд ждать, квитанция списания).
 
-        Запрос крупнее самого лимита проходит при пустом окне: иначе пакет
+        0 секунд — принято, квитанцию передают в refund. Сверх лимита квитанции
+        нет. Запрос крупнее самого лимита проходит при пустом окне: иначе пакет
         больше лимита не прошёл бы никогда.
         """
         if limit <= 0:
-            return 0
+            return 0, None
         now = _now()
         with self._lock:
             if len(self._spent) >= self.MAX_KEYS:
@@ -419,9 +526,40 @@ class RateLimit:
                 spent.popleft()
             used = sum(n for _, n in spent)
             if spent and used + amount > limit:
-                return int(spent[0][0] + self.WINDOW - now) + 1
-            spent.append((now, amount))
-            return 0
+                return int(spent[0][0] + self.WINDOW - now) + 1, None
+            entry = [now, amount]
+            spent.append(entry)
+            return 0, entry
+
+    def take(self, key: str, amount: int, limit: int) -> int:
+        """Как spend, но только секунды ожидания (0 — принято)."""
+        return self.spend(key, amount, limit)[0]
+
+    def refund(self, key: str, amount: int, entry: Optional[list] = None) -> None:
+        """Возвращает amount целей, которые не проверили.
+
+        С квитанцией (entry из spend) уменьшается только это списание и не
+        больше его самого; вышла запись из окна — возвращать нечего. Без
+        квитанции — из последних списаний (прежнее поведение, для вызовов без spend).
+        """
+        with self._lock:
+            spent = self._spent.get(key)
+            if not spent or amount <= 0:
+                return
+            if entry is not None:
+                for i, kept in enumerate(spent):
+                    if kept is entry:
+                        if entry[1] > amount:
+                            entry[1] -= amount
+                        else:
+                            del spent[i]
+                        break
+                return
+            while spent and amount > 0:
+                kept = spent.pop()
+                if kept[1] > amount:
+                    spent.append([kept[0], kept[1] - amount])
+                amount -= kept[1]
 
     def reset(self) -> None:
         with self._lock:
@@ -432,12 +570,13 @@ seen_sessions = SeenSessions()
 check_rate = RateLimit()
 
 
-def spend_checks(user: "Principal", goals: int) -> None:
+def spend_checks(user: "Principal", goals: int) -> Optional[list]:
     """Учитывает goals проверок за пользователем или ключом; сверх лимита — 429.
 
     Лимит — настройка checkRatePerMinute: целей в минуту на каждого, 0 выключает.
+    Возвращает квитанцию списания для refund_checks (None — лимит выключен).
     """
-    wait = check_rate.take(user.login, goals, settings.number("checkRatePerMinute"))
+    wait, entry = check_rate.spend(user.login, goals, settings.number("checkRatePerMinute"))
     if wait:
         audit.event("check_throttled", login=user.login, goals=goals, retry_after=wait)
         raise HTTPException(
@@ -445,6 +584,16 @@ def spend_checks(user: "Principal", goals: int) -> None:
             detail=f"Слишком много проверок за минуту. Повторите через {wait} с.",
             headers={"Retry-After": str(wait)},
         )
+    return entry
+
+
+def refund_checks(user: "Principal", goals: int, entry: Optional[list] = None) -> None:
+    """Возвращает квоту за goals целей, которые пакет не проверил (остановлен по сроку
+    или обрыву соединения): их отправят снова, и повтор не должен упереться в лимит.
+    entry — квитанция spend_checks этого пакета: возвращается только его списание."""
+    if entry is None:
+        return
+    check_rate.refund(user.login, goals, entry)
 
 
 # --------------------------------------------------------------------------
@@ -530,7 +679,7 @@ def _key_user(request: Request, token: str) -> Principal:
         if not settings.known():
             # Граф не отвечает, и включены ли ключи — неизвестно: отказ, но не «отключено».
             raise HTTPException(status_code=503, detail=SETTINGS_UNAVAILABLE, headers={"Retry-After": "30"})
-        audit.event("api_key_rejected", ip=audit.client_ip(request), reason="disabled")
+        audit.anonymous("api_key_rejected", audit.client_ip(request), reason="disabled")
         raise HTTPException(status_code=403, detail="Проверка по ключам доступа отключена администратором")
     try:
         key = apikeys.resolve(token)
@@ -538,7 +687,7 @@ def _key_user(request: Request, token: str) -> Principal:
         log.error("Реестр ключей доступа недоступен: %s", exc)
         raise HTTPException(status_code=503, detail="Реестр ключей доступа недоступен, попробуйте позже") from exc
     if key is None:
-        audit.event("api_key_rejected", ip=audit.client_ip(request))
+        audit.anonymous("api_key_rejected", audit.client_ip(request))
         raise HTTPException(status_code=401, detail="Ключ доступа недействителен или отозван")
     return Principal("key:" + key["name"], SERVICE_ROLE)
 
@@ -552,11 +701,11 @@ def _token_user(request: Request, token: str) -> Principal:
         account = resolve_account(login, str(claims.get("sub") or ""))
     except TokenInvalid as exc:
         # Причина — до REASON_MAX символов: без входа строку пишет кто угодно.
-        audit.event("token_rejected", ip=ip, reason=str(exc)[:REASON_MAX])
+        audit.anonymous("token_rejected", ip, reason=str(exc)[:REASON_MAX])
         raise HTTPException(status_code=401, detail=LOGIN_REQUIRED) from exc
     except DirectoryUnavailable as exc:
         log.error("Токен не проверен: %s", exc)
-        audit.event("token_rejected", ip=ip, reason="keycloak_unavailable")
+        audit.anonymous("token_rejected", ip, reason="keycloak_unavailable")
         raise HTTPException(status_code=503, detail="Сервис входа недоступен, попробуйте позже") from exc
     except AccessRefused as exc:
         if exc.reason == "sub_mismatch":
@@ -676,6 +825,9 @@ def _handle(func, *args, **kwargs):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except users.Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ConstraintError as exc:
+        # Ограничение уникальности графа: запись успел завести параллельный запрос (N25).
+        raise HTTPException(status_code=409, detail="Такая запись уже есть в реестре") from exc
 
 
 def _guard_builtin(login: str) -> None:

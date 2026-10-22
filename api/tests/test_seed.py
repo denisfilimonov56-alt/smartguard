@@ -23,6 +23,7 @@ from seed import SCHEMA_RE, split_statements
 INIT_DIR = Path(__file__).resolve().parents[2] / "neo4j" / "init"
 SEED_PATH = INIT_DIR / "seed.cypher"
 DATA_PATH = INIT_DIR / "data.cypher"
+EXAMPLE_PATH = INIT_DIR / "data.example.cypher"
 MIGRATIONS = sorted((INIT_DIR / "migrations").glob("*.cypher"))
 
 
@@ -80,9 +81,24 @@ def test_seed_contains_schema_only():
 
 
 def test_data_file_has_no_schema():
-    """Файл данных применяется условно; схема в нём потерялась бы на непустой базе."""
-    assert DATA_PATH.exists(), "export_graph пишет в neo4j/init/data.cypher — файл должен быть в наборе"
-    assert all(SCHEMA_RE.match(s) is None for s in split_statements(DATA_PATH.read_text(encoding="utf-8")))
+    """Файл данных применяется условно; схема в нём потерялась бы на непустой базе.
+
+    data.cypher — выгрузка конкретного сервера, в клоне его может не быть.
+    """
+    if DATA_PATH.exists():
+        assert all(SCHEMA_RE.match(s) is None
+                   for s in split_statements(DATA_PATH.read_text(encoding="utf-8")))
+
+
+def test_data_file_is_server_side_and_example_is_inert():
+    """M2: data.cypher не в git (иначе выгрузка на сервере ломает pull и откат); образец — без операторов."""
+    ignored = (INIT_DIR.parents[1] / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "neo4j/init/data.cypher" in ignored and "neo4j/init/data.cypher.new" in ignored
+    text = EXAMPLE_PATH.read_text(encoding="utf-8")
+    assert split_statements(text) == [], "образец сидер не читает — операторов в нём нет"
+    # Прямая запись «> data.cypher» обнулила бы файл до выгрузки — только через .new и mv.
+    for path in [EXAMPLE_PATH, SEED_PATH, INIT_DIR / "reset_and_load.cypher"]:
+        assert not re.search(r"> neo4j/init/data\.cypher\s*$", path.read_text(encoding="utf-8"), re.M), path.name
 
 
 def test_seed_has_no_demo_orders():
@@ -577,9 +593,14 @@ class _SeedRun:
         monkeypatch.setattr(seed, "wait_for_neo4j", lambda driver: None)
         monkeypatch.setattr(seed, "catalog_is_empty", lambda driver: empty)
         monkeypatch.setattr(seed, "report", lambda driver: None)
-        monkeypatch.setattr(seed, "run_statements",
-                            lambda driver, statements, data, load_data:
-                            setattr(self, "applied", (statements, data, load_data)))
+        self.options = {}
+
+        def run_statements(driver, statements, data, load_data, **options):
+            self.applied = (statements, data, load_data)
+            self.options = options
+
+        monkeypatch.setattr(seed, "run_statements", run_statements)
+        monkeypatch.setattr(seed, "migration_applied", lambda driver, migration: None)
 
 
 def test_reset_on_empty_db_does_not_apply_data_file(monkeypatch, tmp_path):

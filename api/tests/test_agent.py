@@ -630,10 +630,12 @@ def test_job_check_is_skipped_when_no_rule_applies(monkeypatch):
 def test_split_job_descriptions_respects_limit():
     items = [{"id": str(i), "title": f"Д{i}", "text": "x" * size}
              for i, size in enumerate([60, 60, 150])]
-    groups, truncated = agent.split_job_descriptions(items, limit=100)
-    assert [[d["id"] for d in g] for g in groups] == [["0"], ["1"], ["2"]]
-    assert truncated == ["Д2"]
+    groups, split = agent.split_job_descriptions(items, limit=100)
+    # Длинная инструкция не обрезается, а делится на части с тем же id (M13 аудита 19.10).
+    assert [[d["id"] for d in g] for g in groups] == [["0"], ["1"], ["2"], ["2"]]
+    assert split == ["Д2"]
     assert len(groups[2][0]["text"]) == 100
+    assert all(len(d["text"]) <= 100 for g in groups for d in g)
 
 
 def test_compare_parses_matches_and_resolves_instruction(monkeypatch):
@@ -1610,6 +1612,9 @@ def test_graph_failure_in_one_goal_keeps_the_rest_of_the_batch(monkeypatch, bulk
     first, second = result["results"]
     assert first["status"] == STATUS_ALLOWED
     assert second["status"] == STATUS_MANUAL_REVIEW and second["notes"] == [agent.FAILURE_NOTE]
+    # Сбой отмечен машиночитаемо: клиент отправит цель снова; проверенная цель пометки не несёт.
+    assert second.get("retryable") is True and "retryable" not in first
+    assert not second.get("unchecked")
     assert "Neo4j" not in str(second)
 
 

@@ -420,7 +420,9 @@ export interface GoalItem {
 /** Ответ пакетной проверки /check-goals: порядок результатов совпадает с порядком целей. */
 export interface BatchCheck {
   results: (CheckResult & { id: string | null })[];
-  summary: { total: number; allowed: number; violations: number; manual_review: number };
+  /** unchecked — цели, до которых пакет не дошёл (считает интерфейс, features/check/batch.ts summaryOf);
+      в сводке API они входят в manual_review. */
+  summary: { total: number; allowed: number; violations: number; manual_review: number; unchecked?: number };
 }
 
 export type SmartKey = "specific" | "measurable" | "achievable" | "relevant" | "time_bound";
@@ -442,6 +444,15 @@ export interface CheckResult {
   /** Оценка по SMART — справка автору, на статус не влияет; null — выключена или модель не ответила. */
   smart?: SmartScores | null;
   violations: Violation[];
+  /** nodeId правил, которые проверить не удалось (например, атрибут не сравнили с должностными
+      инструкциями): ни выполненными, ни нарушенными их считать нельзя. Старый API поля не отдаёт. */
+  unverified_rule_node_ids?: string[];
+  /** Пакет остановили (срок, обрыв соединения) раньше, чем цель проверили: статус — ручная проверка,
+      но цель надо отправить снова. Квота за неё возвращена. Старый API и проверенные цели поля не отдают. */
+  unchecked?: boolean;
+  /** Проверка сорвалась из-за временного сбоя (модель, база): статус — ручная проверка, но цель можно
+      отправить снова. Старый API поля не отдаёт — тогда признак берётся из заметки (batch.ts failedTemporarily). */
+  retryable?: boolean;
   notes: string[];
 }
 
