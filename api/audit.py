@@ -14,18 +14,38 @@ ERROR. Анонимные отказы (запрос без входа, отве
 остальные — счётчиком в событии anonymous_suppressed.
 Логгер пишет INFO всегда, независимо от LOG_LEVEL. Пароли и содержимое
 запросов к /auth сюда не попадают никогда.
+
+В каждой строке — поля требования ИБ 13.1, даже пустые (CORE_FIELDS):
+кто (login, role), откуда (source, ip), когда (ts), в какой сессии и
+каком запросе (session_id, request_id), что сделал (event), с чем
+(object), чем кончилось (result) и было ли действие заблокировано
+(blocked). Кто и откуда пришёл, берётся из контекста запроса (begin/bind):
+вызывающему коду их передавать не нужно.
+
+При заданном AUDIT_SYSLOG_URL строки дополнительно уходят в SIEM — syslog
+RFC 5424 по UDP, TCP или TLS. Отправка идёт из своего потока через
+очередь: недоступный SIEM не задерживает запросы, а строки сверх очереди
+отбрасываются с ошибкой в общем логе (файл на томе их сохраняет).
 """
 
 from __future__ import annotations
 
+import atexit
+import contextvars
 import json
 import logging
 import logging.handlers
 import os
+import queue
+import re
+import socket
+import ssl
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Request
 
@@ -56,6 +76,60 @@ ANONYMOUS_MAX_IPS = 10_000
 
 _errors = logging.getLogger("audit_journal")
 _now = time.monotonic
+
+# Поля требования ИБ 13.1: есть в каждой строке, даже пустые, — разбор в SIEM
+# не зависит от вида события.
+CORE_FIELDS = ("login", "role", "source", "ip", "session_id", "request_id", "object", "result", "blocked")
+# Источник: интерфейс сервиса (пользователь с токеном Keycloak), внешняя система
+# по ключу доступа, сам сервис (событие вне запроса).
+SOURCE_UI = "ui"
+SOURCE_API = "api"
+SOURCE_SYSTEM = "system"
+# Результат действия и признак блокировки по виду события; не названные здесь — удачные.
+OUTCOMES = {
+    "access_denied": ("denied", True),
+    "login_sub_mismatch": ("denied", True),
+    "token_rejected": ("denied", True),
+    "api_key_rejected": ("denied", True),
+    "check_throttled": ("denied", True),
+    "anonymous_suppressed": ("denied", True),
+}
+# Идентификатор запроса от nginx ($request_id); любой другой заменяется своим.
+REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+_context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar("audit_context", default=None)
+
+
+def request_id(incoming: Optional[str]) -> str:
+    """Идентификатор запроса: пришедший от nginx или новый, если его нет или он чужого вида."""
+    return incoming if incoming and REQUEST_ID_RE.match(incoming) else uuid.uuid4().hex
+
+
+def begin(**fields: Any) -> contextvars.Token:
+    """Начало запроса: его поля (ip, request_id, object) попадут в каждое событие до end."""
+    return _context.set(dict(fields))
+
+
+def bind(**fields: Any) -> None:
+    """Дополняет контекст запроса тем, что выяснилось по ходу: кто вошёл, роль, сессия.
+
+    Контекст — один словарь на запрос: дополнения из потока пула (синхронные
+    зависимости FastAPI) видны и в самом запросе.
+    """
+    ctx = _context.get()
+    if ctx is not None:
+        ctx.update({k: v for k, v in fields.items() if v is not None})
+
+
+def end(token: contextvars.Token) -> None:
+    _context.reset(token)
+
+
+def outcome(status: int) -> tuple[str, bool]:
+    """Результат запроса по коду ответа: отказ в доступе и предел частоты — блокировка."""
+    if status in (401, 403, 429):
+        return "denied", True
+    return ("failure", False) if status >= 400 else ("success", False)
 
 
 class _DailyOrSizeHandler(logging.handlers.TimedRotatingFileHandler):
@@ -153,12 +227,136 @@ def _retention_days() -> int:
         return DEFAULT_RETENTION_DAYS
 
 
+# Syslog: facility 13 — «log audit» (RFC 5424); severity — 4 (warning) для
+# заблокированных действий, 6 (informational) для остальных.
+SYSLOG_FACILITY = 13
+SYSLOG_PORTS = {"udp": 514, "tcp": 514, "tls": 6514}
+SIEM_QUEUE_SIZE = 10_000
+SIEM_TIMEOUT_SECONDS = 5.0
+SIEM_ALARM_SECONDS = 60.0
+
+
+class _SyslogSink(logging.Handler):
+    """Строки журнала в SIEM: syslog RFC 5424 по UDP (RFC 5426), TCP (RFC 6587) или TLS (RFC 5425).
+
+    По TCP и TLS сообщения разделяются подсчётом октетов. Соединение
+    открывается при первой строке и после обрыва; не удалось отправить и со
+    второй попытки — строка отбрасывается, а в общий лог идёт ERROR не чаще
+    раза в минуту с числом потерянных строк.
+    """
+
+    def __init__(self, url: str, ca_file: Optional[str] = None, app_name: str = "goal-checker",
+                 hostname: Optional[str] = None) -> None:
+        super().__init__(logging.INFO)
+        parts = urlsplit(url)
+        if parts.scheme not in SYSLOG_PORTS or not parts.hostname:
+            raise ValueError(f"ожидался udp://, tcp:// или tls://хост[:порт], а не {url!r}")
+        self.scheme = parts.scheme
+        self.address = (parts.hostname, parts.port or SYSLOG_PORTS[parts.scheme])
+        self.app_name = app_name
+        self.hostname = hostname or socket.gethostname()
+        self.tls = ssl.create_default_context(cafile=ca_file or None) if self.scheme == "tls" else None
+        self.sock: Optional[socket.socket] = None
+        self.lost = 0
+        self._alarmed = float("-inf")
+
+    def line(self, record: logging.LogRecord) -> bytes:
+        severity = 4 if getattr(record, "audit_blocked", False) else 6
+        stamp = datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds")
+        return (f"<{SYSLOG_FACILITY * 8 + severity}>1 {stamp} {self.hostname} {self.app_name} - AUDIT - "
+                + record.getMessage()).encode("utf-8")
+
+    def _connect(self) -> socket.socket:
+        if self.scheme == "udp":
+            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = socket.create_connection(self.address, timeout=SIEM_TIMEOUT_SECONDS)
+        if self.tls is not None:
+            sock = self.tls.wrap_socket(sock, server_hostname=self.address[0])
+        return sock
+
+    def _send(self, data: bytes) -> None:
+        if self.sock is None:
+            self.sock = self._connect()
+        if self.scheme == "udp":
+            self.sock.sendto(data, self.address)
+        else:
+            self.sock.sendall(str(len(data)).encode() + b" " + data)
+
+    def close_socket(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        data = self.line(record)
+        for attempt in (1, 2):
+            try:
+                self._send(data)
+                return
+            except OSError as exc:
+                self.close_socket()
+                if attempt == 2:
+                    self.drop(1, f"SIEM недоступен ({exc})")
+
+    def drop(self, count: int, why: str) -> None:
+        """Учёт потерянных строк; ERROR в общий лог не чаще раза в SIEM_ALARM_SECONDS."""
+        self.lost += count
+        now = time.monotonic()
+        if now - self._alarmed >= SIEM_ALARM_SECONDS:
+            self._alarmed = now
+            _errors.error("Журнал аудита: %s, в SIEM не отправлено строк: %d (в файле на томе они есть)",
+                          why, self.lost)
+            self.lost = 0
+
+    def close(self) -> None:
+        self.close_socket()
+        super().close()
+
+
+class _SiemQueue(logging.handlers.QueueHandler):
+    """Очередь перед отправкой в SIEM: запрос не ждёт сеть, переполнение — потеря строки, а не ожидание."""
+
+    def __init__(self, sink: _SyslogSink) -> None:
+        super().__init__(queue.Queue(SIEM_QUEUE_SIZE))
+        self.sink = sink
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            self.sink.drop(1, "очередь отправки переполнена")
+
+
+def _setup_siem() -> None:
+    url = os.getenv("AUDIT_SYSLOG_URL", "").strip()
+    if not url or any(getattr(h, "_audit_siem", False) for h in log.handlers):
+        return
+    try:
+        sink = _SyslogSink(url, os.getenv("AUDIT_SYSLOG_CA_FILE", "").strip() or None,
+                           os.getenv("AUDIT_SYSLOG_APP_NAME", "").strip() or "goal-checker",
+                           os.getenv("AUDIT_SYSLOG_HOSTNAME", "").strip() or None)
+    except (ValueError, OSError, ssl.SSLError) as exc:
+        logging.getLogger(__name__).error("Журнал аудита в SIEM не отправляется: AUDIT_SYSLOG_URL — %s", exc)
+        return
+    handler = _SiemQueue(sink)
+    handler.setLevel(logging.INFO)
+    handler._audit_siem = True  # type: ignore[attr-defined]
+    listener = logging.handlers.QueueListener(handler.queue, sink)
+    listener.start()
+    atexit.register(listener.stop)
+    log.addHandler(handler)
+
+
 def setup() -> None:
-    """Подключает файл журнала; повторный вызов ничего не меняет.
+    """Подключает файл журнала и отправку в SIEM; повторный вызов ничего не меняет.
 
     Каталог недоступен на запись — предупреждение, и журнал остаётся только
     в stdout: из-за журнала API не должен не запускаться.
     """
+    _setup_siem()
     if any(getattr(h, "_audit_file", False) for h in log.handlers):
         return
     directory = os.getenv("AUDIT_LOG_DIR", "").strip() or DEFAULT_DIR
@@ -183,10 +381,17 @@ def client_ip(request: Request) -> str:
     return request.headers.get("x-real-ip") or (request.client.host if request.client else "-")
 
 
-def _write(name: str, fields: dict[str, Any], noise: bool = False) -> None:
-    record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event": name}
+def _write(name: str, fields: dict[str, Any], noise: bool = False, context: bool = True) -> None:
+    """Строка журнала. context=False — событие не относится к текущему запросу (итоги по адресам)."""
+    ctx = (_context.get() if context else None) or {}
+    record: dict[str, Any] = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event": name}
+    record.update({key: ctx.get(key) for key in CORE_FIELDS})
+    if not ctx and context:
+        record["source"] = SOURCE_SYSTEM
+    record["result"], record["blocked"] = OUTCOMES.get(name, ("success", False))
     record.update({k: v for k, v in fields.items() if v is not None})
-    log.info(json.dumps(record, ensure_ascii=False, default=str), extra={"audit_noise": noise})
+    log.info(json.dumps(record, ensure_ascii=False, default=str),
+             extra={"audit_noise": noise, "audit_blocked": bool(record["blocked"])})
 
 
 def event(name: str, **fields: Any) -> None:
@@ -246,7 +451,7 @@ class _AnonymousCounter:
         for ip, entry in done:
             _write("anonymous_suppressed", {
                 "ip": ip, "since": entry["since"].isoformat(timespec="seconds"),
-                "counts": entry["suppressed"]}, noise=True)
+                "counts": entry["suppressed"]}, noise=True, context=False)
 
     def flush(self) -> None:
         """Отчёт по всем окнам сразу и чистое состояние (остановка, тесты)."""

@@ -92,7 +92,8 @@ def put_settings(body: SettingsPatch, request: Request, me: auth.Principal = Dep
     """Меняет переданные настройки; если от них зависит промпт, готовые ответы проверок сбрасываются."""
     changes = body.model_dump(exclude_none=True)
     result = settings.update(changes, me.login)
-    audit.event("settings_changed", login=me.login, ip=audit.client_ip(request), changes=changes)
+    audit.event("settings_changed", login=me.login, ip=audit.client_ip(request), object="settings",
+                changes=changes)
     return result
 
 
@@ -125,7 +126,7 @@ def clear_cache(name: str, request: Request, body: Optional[CacheClear] = None,
             log.warning("Сохранённые оценки SMART не удалены: %s", exc)
             raise HTTPException(status_code=503, detail="Память очищена, но оценки в графе не удалены: "
                                 "граф недоступен. Повторите позже") from exc
-    audit.event("cache_cleared", login=me.login, ip=audit.client_ip(request), cache=name,
+    audit.event("cache_cleared", login=me.login, ip=audit.client_ip(request), object="cache:" + name, cache=name,
                 department_id=department_id, entries=entries, stored=stored)
     return {"cache": name, "entries": entries, "stored": stored, "departmentId": department_id}
 
@@ -140,7 +141,7 @@ def post_api_key(body: ApiKeyCreate, request: Request, me: auth.Principal = Depe
     """Новый ключ. Сам ключ (поле key) есть только в этом ответе."""
     created = _handle(apikeys.create, body.name, me.login)
     audit.event("api_key_created", login=me.login, ip=audit.client_ip(request),
-                key_id=created["keyId"], key_name=created["name"])
+                object="api_key:" + created["keyId"], key_id=created["keyId"], key_name=created["name"])
     return created
 
 
@@ -149,5 +150,5 @@ def delete_api_key(key_id: str, request: Request, me: auth.Principal = Depends(a
     """Отзывает ключ: действует со следующего запроса."""
     deleted = _handle(apikeys.delete, key_id)
     audit.event("api_key_revoked", login=me.login, ip=audit.client_ip(request),
-                key_id=deleted["keyId"], key_name=deleted["name"])
+                object="api_key:" + deleted["keyId"], key_id=deleted["keyId"], key_name=deleted["name"])
     return {"deleted": deleted["keyId"]}

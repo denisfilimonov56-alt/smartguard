@@ -107,14 +107,163 @@ def test_signed_in_query_is_truncated(app, caplog):
     assert len(request[0]["query"]) == audit.QUERY_MAX
 
 
-def test_successful_key_check_is_not_audited_but_failure_is(app, monkeypatch, caplog):
-    """Удачная проверка по ключу уже есть в истории проверок; отказ — в журнале."""
+def test_key_check_and_failure_are_audited(app, monkeypatch, caplog):
+    """Проверка по ключу и отказ — в журнале с источником api и именем ключа (13.1)."""
     client = TestClient(app, headers=bearer(SERVICE_KEY))
     with caplog.at_level(logging.INFO, logger="audit"):
         assert client.post("/check-goal", json={"goal": "цель"}).status_code == 200
         assert client.post("/catalog/orders", json={}).status_code == 403
-    paths = [(e["path"], e["status"]) for e in audit_events(caplog) if e["event"] == "request"]
-    assert paths == [("/catalog/orders", 403)]
+    events = [e for e in audit_events(caplog) if e["event"] == "request"]
+    assert [(e["path"], e["status"], e["result"], e["blocked"]) for e in events] == [
+        ("/check-goal", 200, "success", False), ("/catalog/orders", 403, "denied", True)]
+    assert all((e["login"], e["role"], e["source"], e["session_id"]) == ("key:hr", "service", "api", None)
+               for e in events)
+    assert "body" not in events[0], "текст цели в журнал не попадает"
+
+
+def test_every_line_has_the_fields_of_13_1(app, caplog):
+    """Все поля требования ИБ 13.1 есть в каждой строке, даже в отказах без входа."""
+    with caplog.at_level(logging.INFO, logger="audit"):
+        TestClient(app, headers=bearer(token(sid="s-root"))).get("/auth/me")
+        TestClient(app, headers=XHR).post("/catalog/orders", json={})
+    events = audit_events(caplog)
+    assert {e["event"] for e in events} == {"login_ok", "request"}
+    for e in events:
+        assert set(audit.CORE_FIELDS) | {"ts", "event"} <= e.keys(), e
+    login = next(e for e in events if e["event"] == "login_ok")
+    assert (login["login"], login["role"], login["source"], login["session_id"], login["object"]) == (
+        "root", "admin", "ui", "s-root", "session")
+    anonymous = next(e for e in events if e["event"] == "request" and e["login"] is None)
+    assert (anonymous["result"], anonymous["blocked"], anonymous["object"]) == ("denied", True, "/catalog/orders")
+
+
+def test_request_id_comes_from_nginx_or_is_made(app, caplog):
+    """X-Request-ID от nginx — в журнале и в ответе; чужого вида — заменяется своим."""
+    client = TestClient(app, headers=bearer(token()))
+    from_nginx = "0123456789abcdef0123456789abcdef"
+    with caplog.at_level(logging.INFO, logger="audit"):
+        first = client.get("/auth/me", headers={"X-Request-ID": from_nginx})
+        second = client.get("/auth/me", headers={"X-Request-ID": "x; rm -rf"})
+    assert first.headers["X-Request-ID"] == from_nginx
+    assert re.fullmatch(r"[0-9a-f]{32}", second.headers["X-Request-ID"])
+    ids = [e["request_id"] for e in audit_events(caplog) if e["event"] == "request"]
+    assert ids == [from_nginx, second.headers["X-Request-ID"]]
+
+
+def test_polling_is_not_audited_unless_it_fails(app, caplog):
+    """Опрос мониторинга раз в 5 с не вытесняет действия; отказ в нём — в журнале."""
+    client = TestClient(app, headers=bearer(token()))
+    with caplog.at_level(logging.INFO, logger="audit"):
+        assert client.get("/monitoring/now").status_code == 200
+        assert TestClient(app, headers=bearer(SERVICE_KEY)).get("/monitoring/now").status_code == 403
+    assert [(e["path"], e["status"]) for e in audit_events(caplog) if e["event"] == "request"] == [
+        ("/monitoring/now", 403)]
+
+
+def test_event_outside_a_request_is_from_the_system(caplog):
+    with caplog.at_level(logging.INFO, logger="audit"):
+        audit.event("settings_changed", object="settings")
+    [e] = audit_events(caplog)
+    assert (e["source"], e["login"], e["request_id"], e["result"], e["blocked"]) == (
+        "system", None, None, "success", False)
+
+
+def test_suppressed_summary_does_not_take_another_request(monkeypatch, caplog):
+    """Итог по чужому адресу пишется во время другого запроса, но без его входа и идентификатора."""
+    clock = [0.0]
+    monkeypatch.setattr(audit, "_now", lambda: clock[0])
+    with caplog.at_level(logging.INFO, logger="audit"):
+        for _ in range(audit.ANONYMOUS_PER_MINUTE + 1):
+            audit.anonymous("request", "10.0.0.9")
+        clock[0] += audit.ANONYMOUS_WINDOW
+        context = audit.begin(request_id="f" * 32, ip="10.0.0.1")
+        audit.bind(login="ed", role="editor", source="ui")
+        audit.event("logout", object="session")
+        audit.end(context)
+    summary = next(e for e in audit_events(caplog) if e["event"] == "anonymous_suppressed")
+    assert (summary["ip"], summary["login"], summary["request_id"], summary["blocked"]) == (
+        "10.0.0.9", None, None, True)
+
+
+# ------------------------------ 13.1: отправка в SIEM ------------------------------
+
+
+def _record(message, blocked=False):
+    record = logging.LogRecord("audit", logging.INFO, __file__, 1, message, None, None)
+    record.audit_blocked = blocked
+    return record
+
+
+def test_siem_gets_rfc5424_over_tcp_with_octet_counting():
+    import socket as socketlib
+    server = socketlib.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    sink = audit._SyslogSink(f"tcp://127.0.0.1:{server.getsockname()[1]}", hostname="ALB-PH-UCTLLM1")
+    try:
+        sink.emit(_record('{"event": "access_denied"}', blocked=True))
+        conn, _ = server.accept()
+        conn.settimeout(5)
+        data = conn.recv(4096)
+        conn.close()
+    finally:
+        sink.close()
+        server.close()
+    length, _, line = data.partition(b" ")
+    assert int(length) == len(line)
+    text = line.decode()
+    # facility 13 (log audit) × 8 + severity 4 (warning) для заблокированного действия
+    assert re.fullmatch(r'<108>1 \S+Z? ALB-PH-UCTLLM1 goal-checker - AUDIT - \{"event": "access_denied"\}',
+                        text.replace("+00:00", "Z")), text
+
+
+def test_siem_gets_plain_datagram_over_udp():
+    import socket as socketlib
+    server = socketlib.socket(socketlib.AF_INET, socketlib.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    server.settimeout(5)
+    sink = audit._SyslogSink(f"udp://127.0.0.1:{server.getsockname()[1]}", hostname="h")
+    try:
+        sink.emit(_record('{"event": "login_ok"}'))
+        data, _ = server.recvfrom(4096)
+    finally:
+        sink.close()
+        server.close()
+    assert data.startswith(b"<110>1 ") and data.endswith(b'AUDIT - {"event": "login_ok"}')
+
+
+def test_unreachable_siem_drops_lines_with_an_error(caplog):
+    import socket as socketlib
+    probe = socketlib.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()   # порт свободен: соединение отвергается
+    sink = audit._SyslogSink(f"tcp://127.0.0.1:{port}")
+    with caplog.at_level(logging.ERROR, logger="audit_journal"):
+        sink.emit(_record("{}"))
+        sink.emit(_record("{}"))
+    errors = [r.getMessage() for r in caplog.records if r.name == "audit_journal"]
+    assert len(errors) == 1 and "не отправлено строк: 1" in errors[0], "ERROR не чаще раза в минуту"
+    assert sink.lost == 1
+
+
+def test_full_siem_queue_does_not_block_requests():
+    sink = audit._SyslogSink("udp://127.0.0.1:9")
+    handler = audit._SiemQueue(sink)
+    for _ in range(audit.SIEM_QUEUE_SIZE + 3):
+        handler.emit(_record("{}"))
+    # Первая потеря ушла в ERROR (счётчик обнулён), две следующие ждут следующего ERROR.
+    assert handler.queue.qsize() == audit.SIEM_QUEUE_SIZE and sink.lost == 2
+    sink.close()
+
+
+def test_bad_siem_url_is_reported_and_not_used(monkeypatch, caplog):
+    monkeypatch.setenv("AUDIT_SYSLOG_URL", "http://siem:514")
+    before = list(audit.log.handlers)
+    with caplog.at_level(logging.ERROR):
+        audit._setup_siem()
+    assert audit.log.handlers == before
+    assert any("AUDIT_SYSLOG_URL" in r.getMessage() for r in caplog.records)
 
 
 def test_audit_volume_limit_keeps_history_and_raises_error(tmp_path, caplog):

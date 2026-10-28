@@ -1,8 +1,6 @@
-# .env с тестовыми значениями лежит в git, чтобы стек поднимался сразу
-# после pull. Секреты (HF_TOKEN и т. п.) — только в .env.local; compose сам
-# его не читает — scripts/compose.sh (docs/development.md).
-# На сервере .env свой: при обновлении из git его откладывают (docs/release.md).
-.env.local
+# .env стенда лежит в git вместе с секретами (репозиторий закрыт), чтобы стек
+# поднимался сразу после pull. На сервере .env свой: при обновлении из git его
+# откладывают (docs/release.md).
 
 # Веса модели (десятки гигабайт) скачиваются при релизе, в git им
 # не место. dist/ — артефакты сборки.
@@ -27,11 +25,11 @@ __pycache__/
 # ещё лежал в git, молча перезапишет его без ошибки, а переход с неё обратно —
 # удалит. Поэтому перед любым откатом и обновлением файл ОБЯЗАТЕЛЬНО
 # откладывают и после возвращают (docs/release.md, шаг 1 и «Откат»).
-# Образец — neo4j/init/data.example.cypher (docs/data.md).
+# Образец — neo4j/init/data.example.cypher (docs/deployment.md).
 neo4j/init/data.cypher
 neo4j/init/data.cypher.new
 
-# Дампы базы перед миграциями (docs/data.md, «Резервная копия» — в backups/)
+# Дампы базы перед миграциями (docs/deployment.md, «Резервная копия» — в backups/)
 *.dump
 backups/
 

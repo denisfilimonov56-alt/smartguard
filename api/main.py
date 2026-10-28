@@ -269,6 +269,7 @@ class Guard:
         request = Request(scope)
         unsafe = request.method not in SAFE_METHODS
         path = request.url.path
+        rid = audit.request_id(request.headers.get("x-request-id"))
         body = None
         if unsafe and path.startswith("/catalog"):
             # Что именно поменяли — в журнал; тела /auth туда не попадают никогда.
@@ -277,6 +278,8 @@ class Guard:
 
         started = time.monotonic()
         status = 500
+        # Кто, откуда и в каком запросе — во все строки журнала до конца запроса.
+        context = audit.begin(request_id=rid, ip=audit.client_ip(request), object=path[:audit.PATH_MAX])
 
         async def send_with_headers(message: Message) -> None:
             nonlocal status
@@ -285,6 +288,8 @@ class Guard:
                 headers = MutableHeaders(scope=message)
                 headers["Cache-Control"] = "no-store"
                 headers["X-Content-Type-Options"] = "nosniff"
+                # По нему строку журнала находит и пользователь, и внешняя система.
+                headers["X-Request-ID"] = rid
             await send(message)
 
         try:
@@ -298,9 +303,10 @@ class Guard:
             else:
                 await self.app(scope, receive, send_with_headers)
         finally:
-            # Вход и отказ по токену журналируются в auth.py подробнее: с причиной.
-            if unsafe or status == 403:
+            try:
                 _audit_request(request, path, status, started, body)
+            finally:
+                audit.end(context)
 
 
 async def _buffer_body(receive: Receive) -> tuple[Receive, bytes]:
@@ -329,24 +335,32 @@ async def _buffer_body(receive: Receive) -> tuple[Receive, bytes]:
 app.add_middleware(Guard)
 
 
-# Проверки целей: удачная проверка по ключу уже записана в историю проверок,
-# строка журнала на каждую из них только раздувала бы его.
-CHECK_PATHS = {"/check-goal", "/check-goals"}
+# Опрос, который интерфейс повторяет каждые несколько секунд, пока раздел открыт:
+# удачные ответы не журналируются, иначе строки опроса вытеснили бы действия.
+POLL_PATHS = {"/monitoring/now", "/catalog/examples-check"}
 
 
 def _audit_request(request: Request, path: str, status: int, started: float, body: Optional[str]) -> None:
+    """Строка о запросе: у вошедших — каждый запрос, кроме удачного опроса; без входа — изменяющие и 403.
+
+    Вход и отказ по токену или ключу журналируются в auth.py подробнее: с причиной.
+    """
     user = getattr(request.state, "user", None)
+    unsafe = request.method not in SAFE_METHODS
     query = request.url.query or None
+    result, blocked = audit.outcome(status)
     fields = dict(method=request.method, path=path[:audit.PATH_MAX], status=status,
-                  ms=round((time.monotonic() - started) * 1000))
+                  ms=round((time.monotonic() - started) * 1000), result=result, blocked=blocked)
     if not user:
+        if not unsafe and status != 403:
+            return
         # Без входа тело не пишется, строка запроса обрезается сильнее, а строк с
         # одного адреса — не больше audit.ANONYMOUS_PER_MINUTE в минуту: иначе
         # любой без учётной записи наполнял бы журнал килобайтами на запрос.
         audit.anonymous("request", audit.client_ip(request), **fields,
                         query=query[:audit.ANONYMOUS_QUERY_MAX] if query else None)
         return
-    if user.role == auth.SERVICE_ROLE and path.rstrip("/") in CHECK_PATHS and status < 400:
+    if not unsafe and status < 400 and path.rstrip("/") in POLL_PATHS:
         return
     audit.event("request", login=user.login, role=user.role, ip=audit.client_ip(request), **fields,
                 query=query[:audit.QUERY_MAX] if query else None, body=body)

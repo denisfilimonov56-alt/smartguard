@@ -469,7 +469,8 @@ def test_first_request_of_a_keycloak_session_counts_as_login(app, registry, capl
         assert client.get("/auth/me").status_code == 200
         assert client_for(app, "ed", sid="s-1").get("/auth/me").status_code == 200   # обновлённый токен
         assert client_for(app, "ed", sid="s-2").get("/auth/me").status_code == 200   # новый вход
-    assert [(e["event"], e["login"]) for e in audit_events(caplog)] == [("login_ok", "ed"), ("login_ok", "ed")]
+    logins = [e for e in audit_events(caplog) if e["event"] == "login_ok"]
+    assert [(e["login"], e["session_id"]) for e in logins] == [("ed", "s-1"), ("ed", "s-2")]
     assert registry.nodes["ed"]["lastLoginAt"]
 
 
@@ -674,10 +675,11 @@ def test_user_management_is_audited(app, caplog):
     events = [e for e in audit_events(caplog) if e["event"].startswith("user_")]
     assert [(e["event"], e["login"], e["target"]) for e in events] == [
         ("user_created", "root", "new"), ("user_changed", "root", "new"), ("user_deleted", "root", "new")]
-    assert events[0]["role"] == "viewer"
+    # role — роль того, кто действует (13.1); роль учётной записи — target_role.
+    assert (events[0]["role"], events[0]["target_role"], events[0]["object"]) == ("admin", "viewer", "user:new")
     assert events[1]["changes"] == {"role": "editor", "status": "blocked"}
     assert events[1]["before"] == {"role": "viewer", "status": "active"}
-    assert (events[2]["role"], events[2]["status"]) == ("editor", "blocked")
+    assert (events[2]["target_role"], events[2]["status"]) == ("editor", "blocked")
 
 
 def test_changes_are_logged_with_actor(app, caplog):
@@ -690,7 +692,12 @@ def test_changes_are_logged_with_actor(app, caplog):
     assert [(e["method"], e["path"], e["status"], e["login"]) for e in events] == [
         ("POST", "/catalog/departments", 201, "ed"),
         ("DELETE", "/catalog/nodes/4:db:1", 403, "ed"),
-    ], "чтение в журнал не пишется, отказ в правах — пишется"
+        ("GET", "/catalog/tree", 200, "ed"),
+    ], "в журнале и изменения, и чтение, и отказ в правах"
+    assert [(e["result"], e["blocked"]) for e in events] == [
+        ("success", False), ("denied", True), ("success", False)]
+    assert all(e["role"] == "editor" and e["source"] == "ui" and e["session_id"] for e in events)
+    assert len({e["request_id"] for e in events}) == 3
     assert json.loads(events[0]["body"]) == DEPARTMENT
 
 
@@ -758,7 +765,7 @@ def test_token_never_reaches_the_log(app, caplog):
         TestClient(app, headers=bearer(good)).get("/auth/me")
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert good not in text and bad not in text
-    assert [(e["event"], e.get("login")) for e in audit_events(caplog)] == [
+    assert [(e["event"], e.get("login")) for e in audit_events(caplog) if e["event"] != "request"] == [
         ("token_rejected", None), ("login_ok", "root")]
 
 

@@ -1,0 +1,44 @@
+# Надстройка стенда: Keycloak без корпоративного SSO. В боевую сборку не
+# входит — на сервере docker compose читает только docker-compose.yml, а вход
+# идёт через корпоративный Keycloak.
+#
+# На стенде файл подключает .env стенда (COMPOSE_FILE), то есть обычные
+# docker compose up / pull / ps видят оба файла. Явно, с надстройкой для
+# разработки:
+#   docker compose -f docker-compose.yml -f docker-compose.stand.yml \
+#     -f docker-compose.online.yml up -d --build
+#
+# Realm, клиент интерфейса и учётка стенда импортируются из keycloak/ при
+# первом старте; данные (сессии, смена пароля) живут в томе keycloak_data.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-50m}
+    max-file: "${LOG_MAX_FILES:-5}"
+
+services:
+  keycloak:
+    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3}
+    # Стенду можно скачать образ, если его нет; PULL_POLICY=never — запретить.
+    pull_policy: ${PULL_POLICY:-missing}
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?задайте KEYCLOAK_ADMIN_PASSWORD в .env стенда}
+      # Издатель токенов — публичный адрес, тот же, что в KEYCLOAK_URL у api и web.
+      KC_HOSTNAME: ${KEYCLOAK_URL:-}
+      KC_HTTP_ENABLED: "true"
+    ports:
+      # Только с самой машины: у консоли master-realm-а пароль стенда из git.
+      - "127.0.0.1:8180:8080"
+    volumes:
+      # Том — на весь data, а не на data/h2: подкаталога h2 в образе нет, и
+      # docker создал бы его от root, а Keycloak (uid 1000) не смог бы писать базу.
+      - keycloak_data:/opt/keycloak/data
+      - ./keycloak:/opt/keycloak/data/import:ro
+
+volumes:
+  keycloak_data:

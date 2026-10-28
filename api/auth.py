@@ -697,7 +697,10 @@ def _token_user(request: Request, token: str) -> Principal:
     login = None
     try:
         claims = verify_token(token)
+        # Сессия Keycloak — для журнала: по ней собираются все запросы одного входа.
+        audit.bind(session_id=str(claims.get("sid") or "") or None)
         login = token_login(claims)
+        audit.bind(login=login)
         account = resolve_account(login, str(claims.get("sub") or ""))
     except TokenInvalid as exc:
         # Причина — до REASON_MAX символов: без входа строку пишет кто угодно.
@@ -721,7 +724,7 @@ def _token_user(request: Request, token: str) -> Principal:
     sid = str(claims.get("sid") or claims.get("sub") or "")
     if sid and seen_sessions.first_time(sid):
         users.touch_login(login)
-        audit.event("login_ok", login=login, role=account.role, ip=ip)
+        audit.event("login_ok", login=login, role=account.role, ip=ip, object="session")
     return account
 
 
@@ -731,9 +734,12 @@ def current_user(request: Request) -> Principal:
     if not token:
         raise HTTPException(status_code=401, detail=LOGIN_REQUIRED)
     if apikeys.TOKEN_RE.match(token):
+        audit.bind(source=audit.SOURCE_API)
         request.state.user = _key_user(request, token)
     else:
+        audit.bind(source=audit.SOURCE_UI)
         request.state.user = _token_user(request, token)
+    audit.bind(login=request.state.user.login, role=request.state.user.role)
     return request.state.user
 
 
@@ -795,7 +801,7 @@ def get_config():
 def post_logout(request: Request, user: Principal = Depends(current_user)):
     """Отметка выхода в журнале. Саму сессию закрывает Keycloak: интерфейс идёт туда следом."""
     if user.role != SERVICE_ROLE:
-        audit.event("logout", login=user.login, ip=audit.client_ip(request))
+        audit.event("logout", login=user.login, ip=audit.client_ip(request), object="session")
 
 
 @router.get("/me")
@@ -857,8 +863,8 @@ def get_users(_: Principal = Depends(admin)):
 def post_user(body: UserCreate, request: Request, me: Principal = Depends(admin)):
     _guard_builtin(users.normalize_login(body.login))
     created = _handle(users.create, body.login, body.role, body.displayName, me.login)
-    audit.event("user_created", login=me.login, ip=audit.client_ip(request), target=created["login"],
-                role=created["role"])
+    audit.event("user_created", login=me.login, ip=audit.client_ip(request), object="user:" + created["login"],
+                target=created["login"], target_role=created["role"])
     return {**created, "builtin": False}
 
 
@@ -876,7 +882,8 @@ def patch_user(login: str, body: UserPatch, request: Request, me: Principal = De
     before = _handle(users.get, login) or {}
     # Блокировка действует со следующего запроса: роль читается из реестра каждый раз.
     updated = _handle(users.update, login, changes)
-    audit.event("user_changed", login=me.login, ip=audit.client_ip(request), target=login, changes=changes,
+    audit.event("user_changed", login=me.login, ip=audit.client_ip(request), object="user:" + login,
+                target=login, changes=changes,
                 before={k: before.get(k) for k in changes})
     return {**updated, "builtin": False}
 
@@ -889,8 +896,8 @@ def delete_user(login: str, request: Request, me: Principal = Depends(admin)):
         raise HTTPException(status_code=409, detail="Свою учётную запись удалить нельзя")
     before = _handle(users.get, login) or {}
     _handle(users.delete, login)
-    audit.event("user_deleted", login=me.login, ip=audit.client_ip(request), target=login,
-                role=before.get("role"), status=before.get("status"))
+    audit.event("user_deleted", login=me.login, ip=audit.client_ip(request), object="user:" + login,
+                target=login, target_role=before.get("role"), status=before.get("status"))
     return {"deleted": login}
 
 
@@ -903,5 +910,6 @@ def delete_user_binding(login: str, request: Request, me: Principal = Depends(ad
     """
     login = users.normalize_login(login)
     unbound = _handle(users.unbind_sub, login)
-    audit.event("user_unbound", login=me.login, ip=audit.client_ip(request), target=login)
+    audit.event("user_unbound", login=me.login, ip=audit.client_ip(request), object="user:" + login,
+                target=login)
     return {**unbound, "builtin": login in admin_logins()}

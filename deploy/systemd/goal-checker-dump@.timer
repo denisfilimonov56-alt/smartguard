@@ -1,0 +1,11 @@
+# Раз в неделю, в ночь на воскресенье в 03:30 — после ночной копии (02:15).
+# Persistent — пропущенный из-за выключения дамп снимется после включения.
+[Unit]
+Description=goal-checker: дамп базы (воскресенье 03:30)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

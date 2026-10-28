@@ -104,7 +104,7 @@ from naming import normalize_name
 
 log = logging.getLogger(__name__)
 
-MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen3.6-27B-FP8")
+MODEL = os.getenv("VLLM_MODEL", "RedHatAI/Qwen3.8-27B-INT4")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 # Соединение с vLLM либо устанавливается за секунды, либо сервер недоступен:
 # ждать его столько же, сколько ответа, незачем.

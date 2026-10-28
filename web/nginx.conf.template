@@ -82,6 +82,8 @@ server {
 
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
+        # Идентификатор запроса для журнала аудита: всегда свой, пришедший от клиента не принимается.
+        proxy_set_header X-Request-ID $request_id;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         # Пакетная проверка целей ждёт модель минутами. Интерфейс ждёт ответа
         # чуть дольше (610 с), чтобы первым сработал этот таймаут, а не его.

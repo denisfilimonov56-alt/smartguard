@@ -2,6 +2,8 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.online.yml up -d --build
 #
+# Со стендовым Keycloak — ещё -f docker-compose.stand.yml перед этим файлом.
+#
 # Снимает запреты базового файла: образы докачиваются, если их нет локально,
 # а vLLM берёт веса с Hugging Face в кэш-том. Сервер этот файл не использует:
 # образы и веса скачиваются при релизе (docs/release.md), а стек работает без сети.
@@ -15,8 +17,6 @@ services:
     pull_policy: build
   web:
     pull_policy: build
-  keycloak:
-    pull_policy: missing
   autoheal:
     pull_policy: missing
   vllm:
@@ -27,9 +27,9 @@ services:
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
     # command заменяется целиком, поэтому флаги базового файла повторены.
     command: >
-      --model ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
+      --model ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
-      --gpu-memory-utilization 0.90
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
       --language-model-only
     volumes:
       - hf_cache:/root/.cache/huggingface

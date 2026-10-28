@@ -105,12 +105,34 @@ def test_seeder_environment_matches_code():
     _check("seeder", env_reads([API_DIR / name for name in SEEDER_MODULES]), SEEDER_OPTIONAL)
 
 
+STAND_COMPOSE = COMPOSE.parent / "docker-compose.stand.yml"
+
+
 @pytest.mark.parametrize("service", ["neo4j", "seeder", "vllm", "api", "web", "keycloak", "model", "autoheal"])
 def test_logs_are_rotated(service):
-    data = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    path = STAND_COMPOSE if service == "keycloak" else COMPOSE
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     logging_cfg = data["services"][service].get("logging") or {}
     assert logging_cfg.get("driver") == "json-file" and "max-size" in logging_cfg.get("options", {}), (
         f"у сервиса {service} нет ротации логов")
+
+
+def test_stand_keycloak_is_not_in_production_compose():
+    """Keycloak стенда — только в docker-compose.stand.yml: боевой сервер его не видит."""
+    data = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    assert "keycloak" not in data["services"]
+    assert "keycloak_data" not in (data.get("volumes") or {})
+    assert all(not svc.get("profiles") or svc["profiles"] == ["release"] for svc in data["services"].values())
+    assert "keycloak" not in yaml.safe_load((COMPOSE.parent / "docker-compose.online.yml").read_text(encoding="utf-8"))["services"]
+    # .env стенда — единственный: строки стенда собраны в блок, который на сервере удаляют.
+    env = (ROOT / ".env").read_text(encoding="utf-8")
+    stand_block = env.split("# --- Только стенд", 1)[1].split("# ---", 1)[0]
+    assert not (ROOT / ".env.example").exists()
+    for line in env.splitlines():
+        if line.startswith(("COMPOSE_FILE=", "COMPOSE_PROFILES=", "KEYCLOAK_ADMIN_PASSWORD=")):
+            assert line in stand_block, f"{line.split('=')[0]} вне блока «Только стенд»"
+    stand = yaml.safe_load(STAND_COMPOSE.read_text(encoding="utf-8"))
+    assert list(stand["services"]) == ["keycloak"]
 
 
 def test_project_name_is_fixed():
@@ -149,7 +171,7 @@ def _no_duplicate_keys(loader, node, deep=False):
 _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys)
 
 
-@pytest.mark.parametrize("name", ["docker-compose.yml", "docker-compose.online.yml"])
+@pytest.mark.parametrize("name", ["docker-compose.yml", "docker-compose.online.yml", "docker-compose.stand.yml"])
 def test_compose_has_no_duplicate_keys(name):
     path = COMPOSE.parent / name
     yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
@@ -201,7 +223,6 @@ import subprocess
 
 ROOT = API_DIR.parent
 BACKUP_SH = ROOT / "scripts" / "backup.sh"
-COMPOSE_SH = ROOT / "scripts" / "compose.sh"
 DOCS = ROOT / "docs"
 
 FAKE_DOCKER = r'''#!/usr/bin/env bash
@@ -252,7 +273,7 @@ def test_backup_catalog_is_readable_by_seeder(tmp_path):
 
 
 def test_restore_instruction_sets_seeder_readable_mode():
-    text = (DOCS / "data.md").read_text(encoding="utf-8")
+    text = (DOCS / "deployment.md").read_text(encoding="utf-8")
     assert 'cp -p "$d/data.cypher"' not in text
     assert "chmod 0644 neo4j/init/data.cypher" in text
 
@@ -262,7 +283,7 @@ def test_backup_failure_writes_error(tmp_path, fail):
     """N8: любой сбой — ненулевой код, «ОШИБКА» с номером строки в журнале и в stderr (письмо cron)."""
     proc, dest, log = run_backup(tmp_path, FAKE_FAIL=fail)
     assert proc.returncode != 0
-    assert re.search(r"ОШИБКА: строка \d+, код \d+: scripts/compose.sh exec", log), log
+    assert re.search(r"ОШИБКА: строка \d+, код \d+: docker compose exec", log), log
     assert "ОШИБКА" in proc.stderr
     assert "import json" not in log                 # тело heredoc в строку ошибки не попадает
     assert not list(dest.glob("auto-*")) and not list(dest.glob(".*partial"))
@@ -274,14 +295,6 @@ def test_backup_empty_export_reaches_stderr(tmp_path):
     assert proc.returncode == 1
     assert "ОШИБКА: строка" in log and "выгрузка каталога пустая" in log
     assert "ОШИБКА" in proc.stderr
-
-
-def test_backup_uses_compose_wrapper():
-    """Копия идёт через scripts/compose.sh: COMPOSE_PROJECT_NAME и прочее из .env.local
-    действуют и на неё, иначе она искала бы сервис api в другом проекте."""
-    text = BACKUP_SH.read_text(encoding="utf-8")
-    assert not re.search(r"^[^#]*\bdocker compose\b", text, re.M)
-    assert text.count("scripts/compose.sh exec") == 3
 
 
 def test_backup_script_traps_errors():
@@ -302,7 +315,7 @@ def test_backup_tolerates_live_audit_log(tmp_path):
 
 def test_cron_line_does_not_need_backup_dir():
     """N29: перенаправление в несуществующий backups/backup.log не дало бы cron запустить скрипт."""
-    for path in (DOCS / "data.md", BACKUP_SH):
+    for path in (DOCS / "deployment.md", BACKUP_SH):
         for line in path.read_text(encoding="utf-8").splitlines():
             if "scripts/backup.sh" in line and re.search(r"^\s*#?\s*[\d*]+ [\d*]+ ", line):
                 assert ">>" not in line, f"{path.name}: {line}"
@@ -326,41 +339,8 @@ def test_rollback_sets_data_cypher_aside():
     assert "упёрлись бы" not in gitignore and "ОБЯЗАТЕЛЬНО" in gitignore
 
 
-ENV_LOCAL_DOCS = [ROOT / "README.md", ROOT / ".env.example", DOCS / "development.md", ROOT / ".gitignore"]
-
-
-def test_env_local_is_passed_explicitly():
-    """N6: compose сам читает только .env — документация не обещает, что .env.local подхватится сам."""
-    for path in ENV_LOCAL_DOCS:
-        text = path.read_text(encoding="utf-8")
-        assert ".env.local" in text
-        assert "scripts/compose.sh" in text or "--env-file .env.local" in text, path.name
-
-
-def test_compose_wrapper_adds_env_local(tmp_path):
-    if shutil.which("bash") is None:
-        pytest.skip("нет bash")
-    project = tmp_path / "p"
-    (project / "scripts").mkdir(parents=True)
-    shutil.copy(COMPOSE_SH, project / "scripts" / "compose.sh")
-    fake = tmp_path / "bin"
-    fake.mkdir()
-    (fake / "docker").write_text('#!/bin/sh\necho "$@"\n', encoding="utf-8")
-    (fake / "docker").chmod(0o755)
-    env = {"PATH": f"{fake}:/usr/bin:/bin"}
-
-    def run():
-        return subprocess.run(["bash", str(project / "scripts" / "compose.sh"), "up", "-d"], env=env,
-                              cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
-
-    (project / ".env").write_text("A=1\n", encoding="utf-8")
-    assert run() == "compose --env-file .env up -d"
-    (project / ".env.local").write_text("A=2\n", encoding="utf-8")
-    assert run() == "compose --env-file .env --env-file .env.local up -d"
-
-
 NEW_FILES = ["web/docker-entrypoint.d/15-api-rate.envsh", "web/src/api/limits.ts", "scripts/backup.sh",
-             "scripts/compose.sh", "neo4j/init/data.example.cypher"]
+             "neo4j/init/data.example.cypher"]
 
 
 @pytest.mark.parametrize("name", NEW_FILES)
@@ -372,3 +352,24 @@ def test_new_files_are_tracked(name):
     assert tracked.returncode == 0, f"{name} не добавлен в git"
     ignored = subprocess.run(["git", "check-ignore", "-q", name], cwd=ROOT)
     assert ignored.returncode == 1, f"{name} в .gitignore"
+
+
+SYSTEMD_DIR = ROOT / "deploy" / "systemd"
+
+
+@pytest.mark.parametrize("unit", ["goal-checker-backup@", "goal-checker-dump@"])
+def test_backup_timers_run_project_scripts(unit):
+    """Регламентные копии: таймер с Persistent, служба запускает скрипт проекта от пользователя-экземпляра."""
+    service = (SYSTEMD_DIR / f"{unit}.service").read_text(encoding="utf-8")
+    timer = (SYSTEMD_DIR / f"{unit}.timer").read_text(encoding="utf-8")
+    exec_start = re.search(r"^ExecStart=/opt/goal-checker/(\S+)$", service, re.M)
+    assert exec_start and (ROOT / exec_start.group(1)).is_file()
+    assert os.access(ROOT / exec_start.group(1), os.X_OK)
+    assert re.search(r"^User=%i$", service, re.M) and "Type=oneshot" in service
+    assert re.search(r"^OnCalendar=", timer, re.M) and "Persistent=true" in timer
+
+
+def test_backup_and_dump_share_lock():
+    """Дамп останавливает API: ночная копия не должна идти одновременно с ним."""
+    for script in (BACKUP_SH, ROOT / "scripts" / "dump.sh"):
+        assert 'flock -w' in script.read_text(encoding="utf-8") and '"$DEST/.lock"' in script.read_text(encoding="utf-8")

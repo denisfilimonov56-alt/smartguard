@@ -1,0 +1,15 @@
+# Ночная копия без остановки сервиса: scripts/backup.sh (docs/deployment.md,
+# «Регламент резервного копирования»). Экземпляр — пользователь с правом на
+# docker, от него идёт копия: goal-checker-backup@deploy.timer.
+[Unit]
+Description=goal-checker: ночная копия каталога, пользователей и журнала аудита
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/opt/goal-checker
+# BACKUP_DIR, BACKUP_KEEP_DAYS — см. goal-checker-backup.env.example
+EnvironmentFile=-/etc/default/goal-checker-backup
+ExecStart=/opt/goal-checker/scripts/backup.sh

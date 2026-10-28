@@ -9,7 +9,7 @@
 #     Скачивает их при релизе разовый сервис model (профиль release).
 #
 #   * Наружу может быть опубликован только интерфейс (порт 3000, адрес — в
-#     WEB_BIND). Neo4j, vLLM, API и Keycloak стенда слушают 127.0.0.1: у Neo4j
+#     WEB_BIND). Neo4j, vLLM и API слушают 127.0.0.1: у Neo4j
 #     Browser и vLLM своей проверки прав на каталог нет, а API доступен
 #     пользователям через nginx интерфейса (/api). С рабочего места к ним
 #     ходят через SSH-туннель:
@@ -118,10 +118,10 @@ services:
     # --language-model-only: картинки проекту не нужны, энкодер изображений
     # не грузится и не занимает память GPU.
     command: >
-      --model /models/${VLLM_MODEL_DIR:-Qwen3.6-27B-FP8}
-      --served-model-name ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
+      --model /models/${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
+      --served-model-name ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
-      --gpu-memory-utilization 0.90
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
       --language-model-only
     ports:
       - "127.0.0.1:8000:8000"
@@ -133,7 +133,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      # Загрузка весов 27B-модели (~30 ГБ) с диска занимает минуты, поэтому длинный start_period.
+      # Загрузка весов 27B-модели (~19 ГБ) с диска занимает минуты, поэтому длинный start_period.
       start_period: 900s
     deploy:
       # 0 — сервер без GPU, модель на другом сервере (VLLM_URL): сервис vllm
@@ -180,7 +180,7 @@ services:
       # OpenAI-совместимый эндпоинт (и VLLM_REPLICAS=0 в .env).
       VLLM_URL: ${VLLM_URL:-http://vllm:8000/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:-dummy}
-      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
+      VLLM_MODEL: ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
       # Корневой сертификат модели по https://, если он выдан внутренним ЦС
       # (LLM_CA_FILE=/certs/<файл>); пусто — системные сертификаты.
       LLM_CA_FILE: ${LLM_CA_FILE:-}
@@ -233,6 +233,13 @@ services:
       AUDIT_MAX_FILE_MB: ${AUDIT_MAX_FILE_MB:-100}
       # Предел объёма всех файлов журнала; пусто — значение по умолчанию в api/audit.py.
       AUDIT_MAX_TOTAL_MB: ${AUDIT_MAX_TOTAL_MB:-}
+      # Отправка журнала аудита в SIEM (syslog RFC 5424): udp://, tcp:// или tls://хост[:порт];
+      # пусто — не отправляется. CA_FILE — корень внутреннего ЦС для tls:// (/certs/<файл>),
+      # HOSTNAME — имя сервера в строках syslog (по умолчанию — имя контейнера).
+      AUDIT_SYSLOG_URL: ${AUDIT_SYSLOG_URL:-}
+      AUDIT_SYSLOG_CA_FILE: ${AUDIT_SYSLOG_CA_FILE:-}
+      AUDIT_SYSLOG_HOSTNAME: ${AUDIT_SYSLOG_HOSTNAME:-}
+      AUDIT_SYSLOG_APP_NAME: ${AUDIT_SYSLOG_APP_NAME:-goal-checker}
       # Вход в интерфейс: кто пользователь — решает Keycloak, роли — реестр в Neo4j.
       KEYCLOAK_URL: ${KEYCLOAK_URL:-}
       KEYCLOAK_INTERNAL_URL: ${KEYCLOAK_INTERNAL_URL:-}
@@ -247,7 +254,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       # Смонтировано на запись, чтобы export_graph.py мог записать data.cypher
-      # (процесс работает от uid 10001: нужна запись в файл, см. docs/data.md;
+      # (процесс работает от uid 10001: нужна запись в файл, см. docs/deployment.md;
       # без неё выгрузка идёт через --stdout).
       - ./neo4j/init:/init
       # Корневые сертификаты внутреннего ЦС для Keycloak и модели по https
@@ -288,43 +295,13 @@ services:
       # 0.0.0.0 или адрес интерфейса — когда прокси на другой машине.
       - "${WEB_BIND:-0.0.0.0}:3000:80"
 
-  # Keycloak для стенда: поднимается только с профилем idp (COMPOSE_PROFILES=idp
-  # в .env стенда). На боевом сервере вход идёт через корпоративный Keycloak,
-  # и этот сервис не нужен — достаточно не включать профиль. Realm, клиент
-  # интерфейса и учётка стенда импортируются из keycloak/ при первом старте;
-  # данные (сессии, смена пароля) живут в томе keycloak_data.
-  keycloak:
-    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3}
-    pull_policy: ${PULL_POLICY:-never}
-    profiles: ["idp"]
-    restart: unless-stopped
-    logging: *default-logging
-    command: ["start-dev", "--import-realm"]
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
-      # Без «:?»: compose подставляет переменные во всём файле до отбора
-      # профилей, и обязательный пароль ронял бы боевой стек без профиля idp.
-      # Пароль обязателен при включённом idp (docs/release.md).
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
-      # Издатель токенов — публичный адрес, тот же, что в KEYCLOAK_URL у api и web.
-      KC_HOSTNAME: ${KEYCLOAK_URL:-}
-      KC_HTTP_ENABLED: "true"
-    ports:
-      # Только с самой машины: у консоли master-realm-а пароль стенда из git.
-      - "127.0.0.1:8180:8080"
-    volumes:
-      # Том — на весь data, а не на data/h2: подкаталога h2 в образе нет, и
-      # docker создал бы его от root, а Keycloak (uid 1000) не смог бы писать базу.
-      - keycloak_data:/opt/keycloak/data
-      - ./keycloak:/opt/keycloak/data/import:ro
-
   # Автоперезапуск зависших контейнеров. Docker без Swarm по статусу
   # unhealthy не перезапускает: restart: unless-stopped срабатывает, только
   # когда процесс завершился, а зависший vLLM или API живы. autoheal раз в
   # AUTOHEAL_INTERVAL секунд перезапускает контейнеры с меткой autoheal=true
   # (vllm, api), у которых healthcheck в состоянии unhealthy; пока идёт
   # start_period (у vLLM — 15 минут на загрузку весов), unhealthy не бывает.
-  # Образ скачивается при релизе вместе с остальными (шаг 2), тег закреплён.
+  # Образ скачивается при релизе вместе с остальными (шаг 6), тег закреплён.
   # Нужен доступ к docker.sock — это права root на хосте; если так нельзя,
   # AUTOHEAL_REPLICAS=0 и systemd-таймер (docs/deployment.md).
   autoheal:
@@ -358,8 +335,8 @@ services:
     restart: "no"
     logging: *default-logging
     environment:
-      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3.6-27B-FP8}
-      VLLM_MODEL_DIR: ${VLLM_MODEL_DIR:-Qwen3.6-27B-FP8}
+      VLLM_MODEL: ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
+      VLLM_MODEL_DIR: ${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
       HF_TOKEN: ${HF_TOKEN:-}
       HF_HUB_DISABLE_TELEMETRY: "1"
     volumes:
@@ -391,5 +368,4 @@ services:
 
 volumes:
   neo4j_data:
-  keycloak_data:
   api_audit:
