@@ -83,7 +83,16 @@ git status --short                  # кроме .env правок быть не
 - новые переменные, найденные на шаге 1, — если их значения по умолчанию
   не подходят ([таблица переменных](deployment.md#переменные-окружения)).
 
-### 6. Образы Neo4j, vLLM и autoheal
+Переход с vLLM на Strata (первый релиз с сервисом `strata`): удалите
+`VLLM_*`, `MODELS_DIR` и `HF_TOKEN`, задайте `LLM_API_KEY` (`openssl rand
+-hex 24`), а для внешней модели — `LLM_URL` и `STRATA_REPLICAS=0` вместо
+`VLLM_URL` и `VLLM_REPLICAS=0`. Предел `llmMaxConcurrency`, сохранённый в
+«Настройках», остаётся прежним — снизьте его до `STRATA_PARALLEL` (4).
+Контейнер прежнего `vllm` на шаге 9 уберите:
+`docker compose up -d --no-build --remove-orphans`; каталог `models/` с
+весами vLLM после проверки можно удалить.
+
+### 6. Образы Neo4j, Strata и autoheal
 
 ```bash
 PULL_POLICY=always docker compose pull --ignore-buildable
@@ -94,7 +103,7 @@ PULL_POLICY=always docker compose pull --ignore-buildable
 интерфейс — их не скачивают, а собирают на шаге 7
 ([подробнее](deployment.md#шаг-10-образы-сборка-и-веса-модели)).
 
-Модель на другом сервере (`VLLM_REPLICAS=0`) — образ vLLM (около 10 ГБ)
+Модель на другом сервере (`STRATA_REPLICAS=0`) — образ Strata
 не нужен: `PULL_POLICY=always docker compose pull neo4j autoheal`
 (без autoheal, если `AUTOHEAL_REPLICAS=0`).
 
@@ -109,18 +118,19 @@ npm — по `web/package-lock.json`. Ошибка сборки останавл
 работающая версия ещё не тронута — верните код и `.env` к прежней версии
 ([откат](#откат), без `docker compose up`).
 
-### 8. Веса модели
+### 8. Модель
 
 Только для локальной модели:
 
 ```bash
-PULL_POLICY=always docker compose run --rm model
+docker compose up -d --no-build strata
+docker compose ps -a strata         # ждать healthy; ход загрузки — docker compose logs -f strata
 ```
 
-Скачивается только недостающее: если модель в релизе не менялась, команда
-быстро закончится проверкой шардов. Прервалось — запустите ещё раз.
-Закрытая модель — с токеном:
-`HF_TOKEN=hf_… PULL_POLICY=always docker compose run --rm model`.
+Strata запускается заранее, пока сеть ещё есть: если сменились образ или
+`STRATA_MODEL`, он докачивает недостающее в том `strata_data` и грузит
+модель (до 2 часов на первом запуске). Если модель не менялась, это только
+перезапуск с загрузкой из тома. Прервалось — `docker compose restart strata`.
 
 ### 9. Переключение на новую версию
 
@@ -138,7 +148,7 @@ Compose пересоздаёт контейнеры, у которых поме�
 
 ```bash
 docker compose ps -a                # все сервисы running/healthy, seeder — exited (0), autoheal — running
-curl -s localhost:8080/ready        # llm: true — после загрузки весов (до 15 минут)
+curl -s localhost:8080/ready        # llm: true — после загрузки модели
 docker compose logs --tail 50 api   # нет ошибок при старте
 ```
 
@@ -190,7 +200,7 @@ overwritten» (git не охраняет игнорируемые файлы; п
 подставляет оттуда `HTTP_PROXY`/`HTTPS_PROXY` во **все** создаваемые
 контейнеры, в том числе в работающий стек после шага 9. Сервисы стека
 исключают друг друга из прокси сами (`NO_PROXY` в `docker-compose.yml`:
-`vllm`, `keycloak`, `neo4j`, `api`, `web`, `localhost`), но внешний `VLLM_URL`
+`strata`, `keycloak`, `neo4j`, `api`, `web`, `localhost`), но внешний `LLM_URL`
 и корпоративный Keycloak пошли бы через прокси — их адреса тогда нужно
 перечислить в `NO_PROXY_EXTRA` в `.env` (например `.corp.local`). Надёжнее
 давать прокси только тем шагам, которым нужна сеть:
@@ -199,7 +209,7 @@ overwritten» (git не охраняет игнорируемые файлы; п
 |---|---|
 | 6. `docker compose pull` | образы качает демон Docker, а не контейнер: прокси демона — `/etc/systemd/system/docker.service.d/http-proxy.conf` с `Environment="HTTPS_PROXY=http://proxy:3128"`, затем `systemctl daemon-reload && systemctl restart docker` (перезапуск демона перезапустит и стек — делайте до шага 9 или в окно обслуживания). В контейнеры прокси демона не попадает |
 | 7. `docker compose build` | `docker compose build --pull --build-arg HTTP_PROXY=http://proxy:3128 --build-arg HTTPS_PROXY=http://proxy:3128` — переменные действуют только на время сборки (pip, npm) и в образ не записываются |
-| 8. веса модели | `PULL_POLICY=always docker compose run --rm -e HTTPS_PROXY=http://proxy:3128 model` — прокси получает только разовый контейнер `model` |
+| 8. модель | `STRATA_DOWNLOAD_PROXY=http://proxy:3128 docker compose up -d --no-build strata` — прокси получает только контейнер `strata`; на шаге 9 переменной нет, и compose пересоздаёт его без прокси (модель перезагружается из тома) |
 
 Если `proxies` в `config.json` всё же есть, проверьте после шага 9, что
 модель и вход работают: `curl -s localhost:8080/ready` — `llm: true`, вход в
@@ -249,7 +259,6 @@ git status --short                  # лишние файлы старой ве�
 ```bash
 mv /opt/goal-checker /opt/goal-checker.offline
 git clone <репозиторий> /opt/goal-checker
-mv /opt/goal-checker.offline/models /opt/goal-checker/   # если MODELS_DIR=./models
 cp -a /opt/goal-checker.offline/certs/. /opt/goal-checker/certs/ 2>/dev/null || true
 ```
 
@@ -260,7 +269,7 @@ cp -a /opt/goal-checker.offline/certs/. /opt/goal-checker/certs/ 2>/dev/null || 
 cd /opt/goal-checker
 chmod 600 .env   # .env из клона — настройки стенда: заменить значения, убрать блок «только стенд»
 # перенести из ~/goal-checker.env: NEO4J_PASSWORD (тот же — он записан в базе),
-# VLLM_*, MODELS_DIR, APP_VERSION, WEB_BIND, TRUSTED_PROXY, AUTH_ADMIN_LOGINS
+# APP_VERSION, WEB_BIND, TRUSTED_PROXY, AUTH_ADMIN_LOGINS; модель — LLM_API_KEY и STRATA_* (VLLM_* больше нет)
 ```
 
 `LDAP_URL`, `LDAP_USER_TEMPLATE`, `LDAP_CA_FILE`, `LDAP_STARTTLS`,
@@ -269,8 +278,8 @@ chmod 600 .env   # .env из клона — настройки стенда: з�
 Keycloak выдан внутренним ЦС, `KEYCLOAK_CA_FILE` (бывший `LDAP_CA_FILE`
 обычно годится — тот же корневой сертификат домена). Роли пользователей
 сохраняются: логин берётся из `preferred_username` Keycloak, для AD это тот же
-логин без домена. Каталог весов: `VLLM_MODEL_DIR` должен указывать на уже
-скачанный каталог в `MODELS_DIR`, иначе шаг 8 релиза скачает модель заново.
+логин без домена. Модель теперь Strata: прежние веса vLLM не нужны, шаг 8
+релиза скачает её в том `strata_data`.
 
 **5. Шаги релиза 6–10**, затем проверка и выгрузка каталога уже новой
 версией:

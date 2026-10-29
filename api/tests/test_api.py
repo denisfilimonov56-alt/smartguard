@@ -45,7 +45,7 @@ def client(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
     monkeypatch.setattr(diagnostics, "collect", lambda: HEALTHY)
-    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
+    monkeypatch.setattr(monitoring, "llm_alive", lambda timeout=2: True)
     main.app.dependency_overrides[auth.current_user] = lambda: auth.Principal("tester", "admin")
     with TestClient(main.app, headers={"X-Requested-With": "XMLHttpRequest"}) as c:
         yield c
@@ -72,7 +72,7 @@ def test_ready_503_on_errors(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
     monkeypatch.setattr(diagnostics, "collect", lambda: BROKEN)
-    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
+    monkeypatch.setattr(monitoring, "llm_alive", lambda timeout=2: True)
     with TestClient(main.app) as c:
         response = c.get("/ready")
     assert response.status_code == 503
@@ -82,7 +82,7 @@ def test_ready_503_on_errors(monkeypatch):
 def test_ready_503_when_neo4j_down(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: False)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
-    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
+    monkeypatch.setattr(monitoring, "llm_alive", lambda timeout=2: True)
     with TestClient(main.app) as c:
         response = c.get("/ready")
     assert response.status_code == 503
@@ -91,7 +91,7 @@ def test_ready_503_when_neo4j_down(monkeypatch):
 
 def test_ready_503_when_llm_down(client, monkeypatch):
     seen = {}
-    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: seen.setdefault("timeout", timeout) and False)
+    monkeypatch.setattr(monitoring, "llm_alive", lambda timeout=2: seen.setdefault("timeout", timeout) and False)
     response = client.get("/ready")
     assert response.status_code == 503
     body = response.json()
@@ -165,7 +165,7 @@ def test_check_resets_actor_after_request(client, monkeypatch):
 
 def test_thread_limit_counts_model_capacity(monkeypatch):
     monkeypatch.delenv("API_THREADS", raising=False)
-    assert main._thread_limit() == 40 + 2 * 32 + main.BULK_MAX_WORKERS + main.BULK_MAX_REQUESTS
+    assert main._thread_limit() == 40 + 2 * 4 + main.BULK_MAX_WORKERS + main.BULK_MAX_REQUESTS
     monkeypatch.setenv("API_THREADS", "300")
     assert main._thread_limit() == 300
     monkeypatch.setenv("API_THREADS", "5")
@@ -488,10 +488,10 @@ def test_rule_audience_endpoint(client, monkeypatch):
 
 def test_monitoring_now(client, monkeypatch):
     import monitoring
-    monkeypatch.setattr(monitoring, "vllm_state", lambda: {"running": 3.0, "waiting": 0.0})
+    monkeypatch.setattr(monitoring, "engine_state", lambda: {"running": 3.0, "waiting": 0.0})
     body = client.get("/monitoring/now").json()
     assert body["llm"]["running"] == 0 and body["llm"]["capacity"] >= 1
-    assert body["vllm"] == {"running": 3.0, "waiting": 0.0}
+    assert body["engine"] == {"running": 3.0, "waiting": 0.0}
     assert set(body) >= {"checks", "recent", "cache", "history", "neo4j"}
 
 
@@ -548,13 +548,14 @@ def test_monitoring_is_admin_only(client):
         assert client.get(path).status_code == 403
 
 
-def test_vllm_metrics_parser():
+def test_engine_metrics_parser():
     import monitoring
     text = ('# HELP vllm:num_requests_running ...\n'
             'vllm:num_requests_running{model_name="Qwen"} 7.0\n'
             'vllm:num_requests_waiting{model_name="Qwen"} 2.0\n'
-            'vllm:gpu_cache_usage_perc{model_name="Qwen"} 0.25\n')
-    assert monitoring.parse_vllm_metrics(text) == {"running": 7.0, "waiting": 2.0, "kv_cache_usage": 0.25}
+            'vllm:kv_cache_usage_perc{model_name="Qwen"} 0.25\n'
+            'strata:live_tok_s 41.0\n')
+    assert monitoring.parse_engine_metrics(text) == {"running": 7.0, "waiting": 2.0, "kv_cache_usage": 0.25}
 
 
 def test_graph_is_readable_by_viewer_and_catalog_change_drops_cache(client, monkeypatch):

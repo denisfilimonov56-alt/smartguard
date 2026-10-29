@@ -96,7 +96,7 @@ DEFAULTS = {
     "smartCheckBulk": True, "promptExamplesPerKind": 2,
     "checkCache": True, "checkCacheTtlSeconds": 3600, "jobDescriptionsCacheTtlSeconds": 60, "bulkChecks": True,
     "checkRatePerMinute": 600, "goalMaxChars": 4000, "historyEnabled": True, "historyRetentionDays": 365, "apiKeysEnabled": True,
-    "maintenance": False, "llmMaxConcurrency": 32, "llmInteractiveReserve": 4,
+    "maintenance": False, "llmMaxConcurrency": 4, "llmInteractiveReserve": 1,
 }
 
 
@@ -263,7 +263,7 @@ def test_llm_limit_defaults_come_from_environment_and_are_clipped(admin, monkeyp
 
 def test_limits_fall_back_to_defaults_when_graph_is_down(monkeypatch):
     monkeypatch.setattr(settings, "_read", broken)
-    assert settings.llm_limits() == (32, 4)
+    assert settings.llm_limits() == (4, 1)
 
 
 def test_raising_the_limit_wakes_a_waiting_request_without_restart(admin, db):

@@ -320,7 +320,7 @@ function Tile({ label, value, note, tone }: { label: string; value: string; note
 }
 
 function NowCards({ now }: { now: MonitoringNow }) {
-  const { llm, checks, recent, cache, vllm, history } = now;
+  const { llm, checks, recent, cache, engine, history } = now;
   const lookups = cache.hits + cache.misses;
   return (
     <>
@@ -337,9 +337,9 @@ function NowCards({ now }: { now: MonitoringNow }) {
           note={`за последние ${recent.window_seconds / 60} мин, без кэша`} />
         <Tile label="Ушло на ручную проверку" value={num(recent.manual_review)}
           tone={recent.manual_review ? "warn" : undefined} note={`за последние ${recent.window_seconds / 60} мин`} />
-        <Tile label="vLLM" value={vllm ? `${num(vllm.running ?? 0)} в работе` : "нет ответа"} tone={vllm ? undefined : "warn"}
-          note={vllm ? `в его очереди: ${num(vllm.waiting ?? 0)}`
-            + (vllm.kv_cache_usage != null ? ` · KV-кэш ${Math.round(vllm.kv_cache_usage * 100)}%` : "")
+        <Tile label="Strata" value={engine ? `${num(engine.running ?? 0)} в работе` : "нет ответа"} tone={engine ? undefined : "warn"}
+          note={engine ? `в её очереди: ${num(engine.waiting ?? 0)}`
+            + (engine.kv_cache_usage != null ? ` · KV-кэш ${Math.round(engine.kv_cache_usage * 100)}%` : "")
             : "показатели модели недоступны"} />
         <Tile label="Кэш ответов" value={num(cache.entries)}
           note={lookups ? `попаданий: ${share(cache.hits, lookups)}` : "обращений пока не было"} />

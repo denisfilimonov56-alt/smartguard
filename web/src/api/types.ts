@@ -341,8 +341,8 @@ export interface MonitoringNow {
   };
   cache: { entries: number; max_entries: number; ttl_seconds: number; hits: number; misses: number };
   history: { pending: number; dropped: number; retention_days: number; enabled: boolean };
-  /** null — vLLM не ответил. */
-  vllm: { running?: number; waiting?: number; kv_cache_usage?: number } | null;
+  /** null — модель (Strata) не ответила. */
+  engine: { running?: number; waiting?: number; kv_cache_usage?: number } | null;
   neo4j: boolean;
   uptime_seconds: number;
 }

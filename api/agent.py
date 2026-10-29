@@ -104,14 +104,14 @@ from naming import normalize_name
 
 log = logging.getLogger(__name__)
 
-MODEL = os.getenv("VLLM_MODEL", "RedHatAI/Qwen3.8-27B-INT4")
+MODEL = os.getenv("LLM_MODEL", "strata")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
-# Соединение с vLLM либо устанавливается за секунды, либо сервер недоступен:
+# Соединение с моделью либо устанавливается за секунды, либо сервер недоступен:
 # ждать его столько же, сколько ответа, незачем.
 LLM_CONNECT_TIMEOUT = float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "5"))
 # Повторы — только для ошибок соединения и 5xx (см. ask_model). Таймаут чтения
 # не повторяется: зависшая модель не ответит и со второго раза, а повтор заново
-# поставил бы в очередь vLLM тот же длинный промпт.
+# поставил бы в очередь модели тот же длинный промпт.
 LLM_MAX_RETRIES = max(0, int(os.getenv("LLM_MAX_RETRIES", "2")))
 LLM_RETRY_DELAY = 0.5
 # Предохранитель: после стольких таймаутов подряд модель считается зависшей,
@@ -127,12 +127,12 @@ LLM_BREAKER_BULK_WAIT = max(0.0, float(os.getenv("LLM_BREAKER_BULK_WAIT_SECONDS"
 # ей нужен свой, больший таймаут.
 DUTIES_TIMEOUT = max(1.0, float(os.getenv("DUTIES_TIMEOUT_SECONDS", "600")))
 # Пакетная проверка упирается в модель, а не в базу: несколько целей
-# отправляются в vLLM параллельно. Это потолок одного пакета; сколько запросов
+# отправляются в модель параллельно. Это потолок одного пакета; сколько запросов
 # к модели идёт одновременно на весь сервис, ограничивает metrics.gate.
 BULK_MAX_WORKERS = max(1, int(os.getenv("BULK_MAX_WORKERS", "16")))
 # Сколько символов должностных инструкций уходит в один запрос к модели.
-# Окно vLLM — 16384 токена (docker-compose.yml), кириллица — 2–3 символа на
-# токен; остаток окна нужен промпту, цели и ответу.
+# Окно модели — 32k токенов (STRATA_CONTEXT в docker-compose.yml), кириллица —
+# 2–3 символа на токен; остаток окна нужен промпту, цели и ответу.
 JOB_TEXT_MAX_CHARS = max(1000, int(os.getenv("JOB_TEXT_MAX_CHARS", "24000")))
 # Потолок длины ответа: нужный ответ — десятки токенов, а сбившаяся модель
 # без потолка держала бы слот очереди, пока не упрётся в окно.
@@ -144,8 +144,9 @@ DUTIES_CHUNK_CHARS = min(JOB_TEXT_MAX_CHARS, 12000)
 # Примеры из каталога в промпте извлечения (настройка promptExamples): не больше
 # стольких на атрибут каждого вида («есть» и «нет») и не длиннее стольких символов.
 PROMPT_EXAMPLE_MAX_CHARS = max(50, int(os.getenv("PROMPT_EXAMPLE_MAX_CHARS", "300")))
-# vLLM принуждает модель отвечать по JSON-схеме (guided decoding). Если сервер
-# схему не принимает, режим выключается сам — см. ask_model.
+# Ответ просится по JSON-схеме (response_format); Strata проверяет его по схеме
+# и при несовпадении отвечает 502. Если сервер схему не принимает, режим
+# выключается сам — см. ask_model.
 _json_mode = os.getenv("LLM_JSON_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 # Запросы одной цели — извлечение атрибутов и сравнение с инструкциями —
 # независимы и идут одновременно; очередь к модели общая (metrics.gate).
@@ -190,7 +191,7 @@ class Extraction:
 
 
 def llm_url() -> str:
-    return os.getenv("VLLM_URL", "http://vllm:8000/v1")
+    return os.getenv("LLM_URL", "http://strata:8080/v1")
 
 
 def llm_ssl_context() -> Optional[ssl.SSLContext]:
@@ -214,7 +215,7 @@ def internal_url(url: str) -> bool:
     """Адрес внутри сети: имя сервиса docker, localhost или частный IP.
 
     Прокси из окружения (HTTP_PROXY, который docker берёт из ~/.docker/config.json)
-    к таким адресам не применяется: прокси не знает имени vllm и отвечает 502.
+    к таким адресам не применяется: прокси не знает имени strata и отвечает 502.
     """
     host = (urlsplit(url).hostname or "").lower()
     if not host or host == "localhost" or ("." not in host and ":" not in host):
@@ -232,11 +233,11 @@ def check_config() -> None:
     if ca_file and not os.path.isfile(ca_file):
         log.error("LLM_CA_FILE=%s не найден — модель по https не ответит", ca_file)
     elif ca_file and not llm_url().lower().startswith("https://"):
-        log.warning("LLM_CA_FILE задан, но VLLM_URL не https (%s): сертификат не используется", llm_url())
+        log.warning("LLM_CA_FILE задан, но LLM_URL не https (%s): сертификат не используется", llm_url())
 
 
 def get_client() -> OpenAI:
-    """Ленивая инициализация клиента vLLM (OpenAI-совместимый API)."""
+    """Ленивая инициализация клиента модели (OpenAI-совместимый API Strata)."""
     global _client
     if _client is None:
         base_url = llm_url()
@@ -244,7 +245,7 @@ def get_client() -> OpenAI:
         context = llm_ssl_context()
         _client = OpenAI(
             base_url=base_url,
-            api_key=os.getenv("VLLM_API_KEY", "dummy"),
+            api_key=os.getenv("LLM_API_KEY", "dummy"),
             timeout=httpx.Timeout(LLM_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
             # Повторяет ask_model сам и не после таймаута, см. LLM_MAX_RETRIES.
             max_retries=0,
@@ -264,7 +265,7 @@ def _schema(properties: dict[str, Any]) -> dict[str, Any]:
             "additionalProperties": False}
 
 
-# Причины отказа модели для заметок ответа. Текст исключения vLLM/OpenAI в ответ
+# Причины отказа модели для заметок ответа. Текст исключения OpenAI-клиента в ответ
 # и в историю не идёт — только в лог: внешним системам он ни к чему.
 REASON_UNAVAILABLE = "модель недоступна"
 REASON_TIMEOUT = "модель не ответила вовремя"
@@ -272,12 +273,12 @@ REASON_BREAKER = "модель не отвечает, проверка повт�
 REASON_TOO_LONG = "цель вместе с инструкциями не помещается в окно модели"
 REASON_REJECTED = "модель отклонила запрос"
 REASON_MALFORMED = "ответ модели не по форме"
-REASON_CONFIG = "модель отклонила ключ или имя модели — проверьте VLLM_URL, VLLM_MODEL и VLLM_API_KEY"
+REASON_CONFIG = "модель отклонила ключ или адрес — проверьте LLM_URL и LLM_API_KEY"
 REASON_RATE_LIMIT = "модель перегружена: превышен лимит запросов"
 # Пауза перед повтором после 429; Retry-After дольше этого не ждём.
 LLM_RATE_LIMIT_MAX_DELAY = 5.0
 
-# 400 от vLLM бывает не только из-за схемы: прежде всего это переполнение окна.
+# 400 от модели бывает не только из-за схемы: прежде всего это переполнение окна.
 # Режим JSON-схемы выключается, только если сервер прямо говорит, что параметр
 # response_format (json_schema, guided decoding) он не поддерживает. Ошибка
 # компиляции одной схемы («xgrammar: unsupported JSON schema feature») режим
@@ -386,11 +387,19 @@ def reset_breaker() -> None:
 
 
 def _bad_request_reason(exc: BadRequestError) -> str:
-    """Почему vLLM ответил 400: "context", "schema" или "other"."""
+    """Почему модель ответила 400: "context", "schema" или "other"."""
     text = str(exc)
     if _CONTEXT_OVERFLOW.search(text):
         return "context"
     return "schema" if _SCHEMA_UNSUPPORTED.search(text) else "other"
+
+
+def _structured_output_failed(exc: Exception) -> bool:
+    """502 Strata с error.code structured_output_failed: ответ модели не по схеме."""
+    if not isinstance(exc, InternalServerError):
+        return False
+    body = exc.body.get("error", exc.body) if isinstance(exc.body, dict) else None
+    return isinstance(body, dict) and body.get("code") == "structured_output_failed"
 
 
 def _pause(seconds: float) -> None:
@@ -476,6 +485,13 @@ def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
             log.error("Лимит запросов модели исчерпан: %s", exc.message)
             raise ExtractionError(REASON_RATE_LIMIT) from exc
         except (APIConnectionError, InternalServerError) as exc:
+            if _structured_output_failed(exc):
+                # Strata: ответ не прошёл проверку по схеме. Модель жива, а при
+                # temperature=0 повтор дал бы тот же ответ — сразу «не по форме».
+                if breaker is not None:
+                    breaker.answered()
+                log.warning("Ответ модели не прошёл проверку по JSON-схеме: %s", exc)
+                raise ExtractionError(REASON_MALFORMED) from exc
             if attempt < LLM_MAX_RETRIES:
                 attempt += 1
                 log.warning("Сбой связи с моделью, повтор %d из %d: %s", attempt, LLM_MAX_RETRIES, exc)
@@ -898,7 +914,7 @@ def extract_attributes(
 # --------------------------------------------------------------------------
 
 # Инструкции стоят до критерия: запросы по разным атрибутам к одной группе
-# инструкций начинаются одинаково, и vLLM переиспользует посчитанный префикс.
+# инструкций начинаются одинаково, и модель переиспользует посчитанный префикс.
 JOB_SYSTEM = """Ты сравниваешь формулировку цели с должностными инструкциями подразделения.
 
 Должностные инструкции:

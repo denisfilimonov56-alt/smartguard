@@ -1,6 +1,6 @@
 """Проверка целей и модель — пункты аудита 19 октября: M3, M5, M7, M9, M12–M15, M17, M22.
 
-Модель и граф подменяются: локально vLLM не запускается.
+Модель и граф подменяются: локально модель не запускается.
 """
 
 import io
@@ -56,7 +56,7 @@ def spy_client(monkeypatch):
 
 
 def test_llm_ca_file_reaches_openai_client(monkeypatch, spy_client):
-    monkeypatch.setenv("VLLM_URL", "https://llm.corp.local/v1")
+    monkeypatch.setenv("LLM_URL", "https://llm.corp.local/v1")
     monkeypatch.setenv("LLM_CA_FILE", certifi.where())
     agent.get_client()
     assert isinstance(spy_client["verify"], ssl.SSLContext)
@@ -64,7 +64,7 @@ def test_llm_ca_file_reaches_openai_client(monkeypatch, spy_client):
 
 
 def test_internal_llm_url_ignores_proxy_from_environment(monkeypatch, spy_client):
-    monkeypatch.setenv("VLLM_URL", "http://vllm:8000/v1")
+    monkeypatch.setenv("LLM_URL", "http://strata:8080/v1")
     monkeypatch.setenv("LLM_CA_FILE", certifi.where())
     agent.get_client()
     assert spy_client["trust_env"] is False
@@ -72,7 +72,7 @@ def test_internal_llm_url_ignores_proxy_from_environment(monkeypatch, spy_client
 
 
 @pytest.mark.parametrize("url, internal", [
-    ("http://vllm:8000/v1", True), ("http://localhost:8000/v1", True),
+    ("http://strata:8080/v1", True), ("http://localhost:8000/v1", True),
     ("http://127.0.0.1:8000/v1", True), ("http://10.0.0.5:8000/v1", True),
     ("http://[::1]:8000/v1", True), ("https://llm.corp.local/v1", False),
     ("https://api.example.com/v1", False), ("http://8.8.8.8/v1", False),
@@ -82,7 +82,7 @@ def test_internal_url(url, internal):
 
 
 def test_missing_llm_ca_file_is_reported_at_start(monkeypatch, caplog):
-    monkeypatch.setenv("VLLM_URL", "https://llm.corp.local/v1")
+    monkeypatch.setenv("LLM_URL", "https://llm.corp.local/v1")
     monkeypatch.setenv("LLM_CA_FILE", "/certs/нет-такого.pem")
     with caplog.at_level(logging.ERROR, logger="agent"):
         agent.check_config()
@@ -111,56 +111,62 @@ def _capture_opener(monkeypatch, payload=None, error=None):
 
 
 def test_monitoring_uses_ca_and_no_proxy_for_internal_https(monkeypatch):
-    monkeypatch.setenv("VLLM_URL", "https://vllm:8000/v1")
+    monkeypatch.setenv("LLM_URL", "https://strata:8080/v1")
     monkeypatch.setenv("LLM_CA_FILE", certifi.where())
     seen = _capture_opener(monkeypatch, payload={"data": [{"id": agent.MODEL}]})
-    assert monitoring.vllm_alive(2) is True
+    assert monitoring.llm_alive(2) is True
     kinds = {type(h) for h in seen["handlers"]}
     assert urllib.request.ProxyHandler in kinds and urllib.request.HTTPSHandler in kinds
     proxy = next(h for h in seen["handlers"] if isinstance(h, urllib.request.ProxyHandler))
     assert proxy.proxies == {}
-    monitoring.vllm_state()
-    assert seen["request"] == "https://vllm:8000/metrics"
+    monitoring.engine_state()
+    assert seen["request"].full_url == "https://strata:8080/metrics/prometheus"
+    assert seen["request"].get_header("Authorization") == "Bearer dummy", "Strata требует ключ и на /metrics"
 
 
 # ------------------------------ M5: /ready и ошибки модели ------------------------------
 
 
 def test_ready_asks_models_with_key_and_caches(monkeypatch):
-    monkeypatch.setenv("VLLM_URL", "http://vllm:8000/v1")
-    monkeypatch.setenv("VLLM_API_KEY", "секрет")
-    seen = _capture_opener(monkeypatch, payload={"data": [{"id": "other"}, {"id": agent.MODEL}]})
-    assert monitoring.vllm_alive(2) is True
+    monkeypatch.setenv("LLM_URL", "http://strata:8080/v1")
+    monkeypatch.setenv("LLM_API_KEY", "секрет")
+    seen = _capture_opener(monkeypatch, payload={"data": [{"id": "Qwen3.8-Flash-Next"}]})
+    assert monitoring.llm_alive(2) is True, "Strata отвечает на любое имя: имя модели не сверяется"
     request = seen["request"]
-    assert request.full_url == "http://vllm:8000/v1/models" and seen["timeout"] == 2
+    assert request.full_url == "http://strata:8080/v1/models" and seen["timeout"] == 2
     assert request.get_header("Authorization") == "Bearer секрет"
-    assert monitoring.vllm_problem() is None
-    assert monitoring.vllm_alive(2) is True and seen["calls"] == 1, "удачный ответ помнится"
+    assert monitoring.llm_problem() is None
+    assert monitoring.llm_alive(2) is True and seen["calls"] == 1, "удачный ответ помнится"
 
 
-def test_ready_fails_when_model_is_not_served(monkeypatch):
-    seen = _capture_opener(monkeypatch, payload={"data": [{"id": "Qwen/другая"}]})
-    assert monitoring.vllm_alive(2) is False
-    assert "VLLM_MODEL" in monitoring.vllm_problem()
-    monitoring.vllm_alive(2)
+@pytest.mark.parametrize("payload, reason", [
+    ({"data": []}, "нет ни одной модели"),
+    ({"data": [{"id": "unloaded"}]}, "не загружена"),
+    ({"data": [{"id": "strata", "status": "unloaded"}]}, "не загружена"),
+])
+def test_ready_fails_when_model_is_not_loaded(monkeypatch, payload, reason):
+    seen = _capture_opener(monkeypatch, payload=payload)
+    assert monitoring.llm_alive(2) is False
+    assert reason in monitoring.llm_problem()
+    monitoring.llm_alive(2)
     assert seen["calls"] == 2, "неудачный ответ не кэшируется"
 
 
 def test_ready_fails_on_wrong_key(monkeypatch):
-    error = urllib.error.HTTPError("http://vllm:8000/v1/models", 401, "Unauthorized", {}, None)
+    error = urllib.error.HTTPError("http://strata:8080/v1/models", 401, "Unauthorized", {}, None)
     _capture_opener(monkeypatch, error=error)
-    assert monitoring.vllm_alive(2) is False
-    assert "VLLM_API_KEY" in monitoring.vllm_problem()
+    assert monitoring.llm_alive(2) is False
+    assert "LLM_API_KEY" in monitoring.llm_problem()
 
 
 def test_ready_fails_when_model_down(monkeypatch):
     _capture_opener(monkeypatch, error=OSError("connection refused"))
-    assert monitoring.vllm_alive(2) is False
+    assert monitoring.llm_alive(2) is False
 
 
 def _status_error(cls, status, headers=None):
     response = httpx.Response(status, headers=headers or {},
-                              request=httpx.Request("POST", "http://vllm:8000/v1/chat/completions"))
+                              request=httpx.Request("POST", "http://strata:8080/v1/chat/completions"))
     return cls(f"Error code: {status}", response=response, body=None)
 
 
@@ -581,7 +587,7 @@ def _cancel_during(monkeypatch, stop):
 
 @pytest.mark.parametrize("error", [
     lambda: _status_error(RateLimitError, 429, {"retry-after": "1"}),
-    lambda: agent.APIConnectionError(request=httpx.Request("POST", "http://vllm:8000/v1")),
+    lambda: agent.APIConnectionError(request=httpx.Request("POST", "http://strata:8080/v1")),
 ])
 def test_stopped_work_does_not_retry_model(monkeypatch, error):
     """Остановили во время запроса: повтора и паузы нет — сразу Cancelled."""

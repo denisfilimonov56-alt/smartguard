@@ -891,7 +891,7 @@ def test_model_call_counts_towards_check_stats(monkeypatch):
 # ------------------ JSON-схема, обязанности, параллельные запросы ------------
 
 
-_REQUEST = httpx.Request("POST", "http://vllm:8000/v1/chat/completions")
+_REQUEST = httpx.Request("POST", "http://strata:8080/v1/chat/completions")
 SCHEMA_UNSUPPORTED = "response_format json_schema is not supported by this server"
 CONTEXT_OVERFLOW = ("This model's maximum context length is 16384 tokens. However, you requested "
                     "17000 tokens. Please reduce the length of the messages or completion.")
@@ -1064,6 +1064,23 @@ def test_connection_errors_and_5xx_are_retried(monkeypatch, error):
     monkeypatch.setattr(agent, "LLM_MAX_RETRIES", 2)
     assert extract_attributes("цель", TARGETS).attributes == ["проект"]
     assert len(client.calls) == 3
+
+
+@pytest.mark.parametrize("body", [
+    {"code": "structured_output_failed", "message": "answer does not match the schema"},
+    {"error": {"code": "structured_output_failed"}},
+])
+def test_strata_schema_failure_is_malformed_without_retry(monkeypatch, body):
+    """502 Strata «ответ не по схеме»: модель жива, повтор при temperature=0 бесполезен."""
+    error = agent.InternalServerError("Bad Gateway", response=httpx.Response(502, request=_REQUEST), body=body)
+    client = _RecordingClient('{"attributes": []}', errors=[error] * 3)
+    monkeypatch.setattr(agent, "get_client", lambda: client)
+    monkeypatch.setattr(agent, "_json_mode", True)
+    monkeypatch.setattr(agent, "LLM_MAX_RETRIES", 2)
+    with pytest.raises(ExtractionError) as failure:
+        extract_attributes("цель", TARGETS)
+    assert str(failure.value) == agent.REASON_MALFORMED and len(client.calls) == 1
+    assert agent._json_mode is True, "режим схемы не выключается"
 
 
 def test_retries_are_limited_and_reason_is_generic(monkeypatch):
