@@ -7,7 +7,7 @@ import pkg from "./package.json" with { type: "json" };
 
 /* В разработке интерфейс ходит в API по относительному пути /api:
      npm run dev        — прокси на настоящий API (VITE_API_TARGET, по умолчанию :8080)
-     npm run dev:mock   — фейковый API в памяти, без Neo4j и Strata
+     npm run dev:mock   — фейковый API в памяти, без Neo4j и vLLM
    В собранном виде /api проксирует nginx интерфейса (nginx.conf.template). */
 
 /* Тело запроса: JSON — разобранным, форма фейкового Keycloak — строкой. */

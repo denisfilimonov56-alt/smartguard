@@ -67,7 +67,7 @@ def app(monkeypatch):
     monkeypatch.setattr(graph, "verify_connectivity", lambda: True)
     monkeypatch.setattr(graph, "close_driver", lambda: None)
     monkeypatch.setattr(diagnostics, "collect", lambda: {"ready": True, "problems": [], "check_targets": 1})
-    monkeypatch.setattr(monitoring, "llm_alive", lambda timeout=2: True)
+    monkeypatch.setattr(monitoring, "vllm_alive", lambda timeout=2: True)
     monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None:
                         {"goal": goal, "status": "ALLOWED", "allowed": True})
     monkeypatch.setattr(auth, "_skew", {})

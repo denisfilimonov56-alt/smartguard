@@ -4,9 +4,9 @@
 #
 # Со стендовым Keycloak — ещё -f docker-compose.stand.yml перед этим файлом.
 #
-# Снимает запреты базового файла: образы докачиваются, если их нет локально.
-# Сервер этот файл не использует: образы скачиваются при релизе
-# (docs/release.md), а стек работает без сети.
+# Снимает запреты базового файла: образы докачиваются, если их нет локально,
+# а vLLM берёт веса с Hugging Face в кэш-том. Сервер этот файл не использует:
+# образы и веса скачиваются при релизе (docs/release.md), а стек работает без сети.
 
 services:
   neo4j:
@@ -19,5 +19,20 @@ services:
     pull_policy: build
   autoheal:
     pull_policy: missing
-  strata:
+  vllm:
     pull_policy: missing
+    environment:
+      HF_HUB_OFFLINE: "0"
+      TRANSFORMERS_OFFLINE: "0"
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    # command заменяется целиком, поэтому флаги базового файла повторены.
+    command: >
+      --model ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      --language-model-only
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+
+volumes:
+  hf_cache:

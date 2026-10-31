@@ -108,7 +108,7 @@ def test_seeder_environment_matches_code():
 STAND_COMPOSE = COMPOSE.parent / "docker-compose.stand.yml"
 
 
-@pytest.mark.parametrize("service", ["neo4j", "seeder", "strata", "api", "web", "keycloak", "autoheal"])
+@pytest.mark.parametrize("service", ["neo4j", "seeder", "vllm", "api", "web", "keycloak", "model", "autoheal"])
 def test_logs_are_rotated(service):
     path = STAND_COMPOSE if service == "keycloak" else COMPOSE
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -142,11 +142,11 @@ def test_project_name_is_fixed():
 
 
 # Сервисы стека, которые сами ходят к другим сервисам: без NO_PROXY прокси из
-# ~/.docker/config.json перехватил бы запросы к strata, keycloak и 127.0.0.1.
-STACK_HOSTS = {"strata", "keycloak", "neo4j", "api", "web", "localhost", "127.0.0.1"}
+# ~/.docker/config.json перехватил бы запросы к vllm, keycloak и 127.0.0.1.
+STACK_HOSTS = {"vllm", "keycloak", "neo4j", "api", "web", "localhost", "127.0.0.1"}
 
 
-@pytest.mark.parametrize("service", ["api", "seeder", "strata"])
+@pytest.mark.parametrize("service", ["api", "seeder", "vllm"])
 def test_internal_traffic_bypasses_proxy(service):
     env = compose_environment(service)
     for name in ("NO_PROXY", "no_proxy"):

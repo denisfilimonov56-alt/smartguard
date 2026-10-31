@@ -9,7 +9,7 @@
 import os
 
 # До импорта модулей проекта: они читают окружение при импорте (main.DOCS, auth, agent).
-_ENV_PREFIXES = ("KEYCLOAK_", "AUTH_", "LLM_", "NEO4J_", "ADVICE_", "AUDIT_", "DUTIES_")
+_ENV_PREFIXES = ("KEYCLOAK_", "AUTH_", "LLM_", "NEO4J_", "VLLM_", "ADVICE_", "AUDIT_", "DUTIES_")
 _ENV_NAMES = {"ENABLE_DOCS", "MAX_GOALS_PER_REQUEST", "BULK_MAX_WORKERS", "BULK_MAX_REQUESTS", "API_THREADS",
               "CHECK_CACHE_MAX_ENTRIES", "CHECK_RATE_PER_MINUTE", "HISTORY_RETENTION_DAYS",
               "PROMPT_EXAMPLES_PER_KIND", "PROMPT_EXAMPLE_MAX_CHARS", "JOB_TEXT_MAX_CHARS"}

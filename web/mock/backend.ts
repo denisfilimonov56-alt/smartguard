@@ -926,7 +926,7 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
           ttl_seconds: settings.checkCache ? settings.checkCacheTtlSeconds : 0, hits: 0, misses: 0 },
         history: { pending: 0, dropped: 0, retention_days: settings.historyRetentionDays,
           enabled: settings.historyEnabled },
-        engine: { running: 0, waiting: 0, kv_cache_usage: 0.02 }, neo4j: true, uptime_seconds: 3600,
+        vllm: { running: 0, waiting: 0, kv_cache_usage: 0.02 }, neo4j: true, uptime_seconds: 3600,
       };
     }
     const start = Date.parse(query.get("start") ?? ""), end = Date.parse(query.get("end") ?? "");

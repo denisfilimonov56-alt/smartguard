@@ -586,9 +586,9 @@ async def health():
     return {"status": "ok"}
 
 
-# Сколько /ready ждёт ответов Neo4j и модели вместе; модели — не дольше LLM_READY_TIMEOUT.
+# Сколько /ready ждёт ответов Neo4j и vLLM вместе; vLLM — не дольше VLLM_READY_TIMEOUT.
 READY_TIMEOUT_SECONDS = 15
-LLM_READY_TIMEOUT = 2
+VLLM_READY_TIMEOUT = 2
 READY_THREADS = 4
 
 
@@ -603,7 +603,7 @@ def _not_ready(problem: str, **fields: Any) -> JSONResponse:
 async def ready(request: Request):
     """Readiness: зависимости доступны, граф заполнен и внутренне непротиворечив.
 
-    Neo4j и модель опрашиваются одновременно в своих потоках (отдельный лимит,
+    Neo4j и vLLM опрашиваются одновременно в своих потоках (отдельный лимит,
     не общий пул маршрутов) и не дольше READY_TIMEOUT_SECONDS вместе.
 
     Открыт без входа — для оркестратора и для проверки с самого сервера.
@@ -613,9 +613,9 @@ async def ready(request: Request):
     Дубликаты написаний, атрибуты без описания, правила без атрибутов и узлы
     без идентификаторов делают проверку целей молча неполной, поэтому это
     тоже «не готов», а не предупреждение. Развёрнутый разбор с указанием
-    конкретных узлов — в /catalog/diagnostics. Поле llm — ответила ли модель
-    на GET /v1/models с ключом за LLM_READY_TIMEOUT с и загружена ли она
-    (ответ кэшируется на 45 с); без модели проверка целей не
+    конкретных узлов — в /catalog/diagnostics. Поле llm — ответил ли vLLM
+    на GET /v1/models с ключом за VLLM_READY_TIMEOUT с и есть ли в списке
+    VLLM_MODEL (ответ кэшируется на 45 с); без модели проверка целей не
     работает, поэтому это тоже «не готов».
     """
     limiter = getattr(request.app.state, "ready_limiter", None) or anyio.CapacityLimiter(READY_THREADS)
@@ -636,7 +636,7 @@ async def ready(request: Request):
     with anyio.move_on_after(READY_TIMEOUT_SECONDS) as scope:
         async with anyio.create_task_group() as group:
             group.start_soon(run, "graph", graph_state)
-            group.start_soon(run, "llm", lambda: monitoring.llm_alive(LLM_READY_TIMEOUT))
+            group.start_soon(run, "llm", lambda: monitoring.vllm_alive(VLLM_READY_TIMEOUT))
     llm = found.get("llm", False)
     if scope.cancelled_caught and "graph" not in found:
         return _not_ready(f"Neo4j не ответил за {READY_TIMEOUT_SECONDS} с", llm=llm)
@@ -649,7 +649,7 @@ async def ready(request: Request):
 
     problems = list(report["problems"])
     if not llm:
-        problems.append("Модель недоступна: " + (monitoring.llm_problem() or "нет ответа"))
+        problems.append("Модель недоступна: " + (monitoring.vllm_problem() or "нет ответа"))
     ok = report["ready"] and llm
     payload = {
         "status": "ready" if ok else "not_ready",

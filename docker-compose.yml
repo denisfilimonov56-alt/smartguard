@@ -1,15 +1,17 @@
 # Работающий стек в интернет не ходит. Сеть нужна только при релизе
 # (docs/release.md): скачать образы, собрать API и интерфейс (pip и npm)
-# и при первом запуске Strata скачать модель в том strata_data.
+# и докачать веса модели — после этого стек поднимается без сети.
 #
 #   * pull_policy: ${PULL_POLICY:-never} — compose сам в реестр не ходит;
 #     образы скачиваются только при релизе: PULL_POLICY=always docker compose pull.
-#   * Модель Strata скачивает в том strata_data один раз, при первом
-#     запуске; дальше читает её оттуда.
+#   * Веса модели читаются из локального каталога ${MODELS_DIR}, а не
+#     скачиваются с Hugging Face; HF_HUB_OFFLINE запрещает любые попытки.
+#     Скачивает их при релизе разовый сервис model (профиль release).
+#
 #   * Наружу может быть опубликован только интерфейс (порт 3000, адрес — в
-#     WEB_BIND). Neo4j, Strata и API слушают 127.0.0.1: у Neo4j
-#     Browser своей проверки прав на каталог нет, у Strata — только общий
-#     ключ, а API доступен пользователям через nginx интерфейса (/api). С рабочего места к ним
+#     WEB_BIND). Neo4j, vLLM и API слушают 127.0.0.1: у Neo4j
+#     Browser и vLLM своей проверки прав на каталог нет, а API доступен
+#     пользователям через nginx интерфейса (/api). С рабочего места к ним
 #     ходят через SSH-туннель:
 #       ssh -L 7474:localhost:7474 -L 7687:localhost:7687 <сервер>
 #   * Логи всех контейнеров ротируются (json-file, LOG_MAX_SIZE × LOG_MAX_FILES);
@@ -69,8 +71,8 @@ services:
     command: ["python", "seed.py"]
     environment:
       # Мимо прокси — см. комментарий у NO_PROXY сервиса api.
-      NO_PROXY: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
-      no_proxy: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
@@ -89,60 +91,55 @@ services:
       neo4j:
         condition: service_healthy
 
-  # Модель — Qwen3.8-Flash-Next на движке Strata (github.com/Niko1221/Strata):
-  # OpenAI-совместимый API на порту 8080 контейнера. Эксперты MoE лежат в ОЗУ,
-  # остальное — на GPU: IQ3_XXS занимает около 47 ГБ ОЗУ и видеопамяти вместе.
-  strata:
+  vllm:
     # Тег зафиксирован: «latest» означал бы «что скачалось при последнем
-    # релизе», а версия должна быть видна в конфигурации. cuda13 — драйвер 580+.
-    image: ${STRATA_IMAGE:-ghcr.io/niko1221/strata:0.2.7-cuda13}
+    # релизе», а версия должна быть видна в конфигурации.
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
     pull_policy: ${PULL_POLICY:-never}
     restart: unless-stopped
     logging: *default-logging
     labels:
-      # Зависшую модель (healthcheck образа unhealthy) перезапускает autoheal.
+      # Зависший vLLM (healthcheck unhealthy) перезапускает сервис autoheal.
       autoheal: "true"
     environment:
       # Мимо прокси — см. комментарий у NO_PROXY сервиса api.
-      NO_PROXY: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
-      no_proxy: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
-      # Прокси только для первого запуска, когда Strata скачивает модель
-      # (docs/release.md, шаг 8). Пустое значение перекрывает и прокси из
-      # ~/.docker/config.json: работающая модель в интернет не ходит.
-      HTTP_PROXY: ${STRATA_DOWNLOAD_PROXY:-}
-      HTTPS_PROXY: ${STRATA_DOWNLOAD_PROXY:-}
-      FAMILY: qwen
-      MODEL: ${STRATA_MODEL:-IQ3_XXS}
-      # Окно модели в токенах (32k, 64k, 128k или число); согласовано с JOB_TEXT_MAX_CHARS.
-      CONTEXT: ${STRATA_CONTEXT:-32k}
-      # Сколько запросов модель считает одновременно (1–8); не меньше llmMaxConcurrency.
-      PARALLEL: ${STRATA_PARALLEL:-4}
-      # Картинки проекту не нужны: энкодер изображений не скачивается и не грузится.
-      VISION: "off"
-      TUNE: ${STRATA_TUNE:-skip}
-      # Ключ, который API шлёт в Authorization: Bearer (не короче 16 символов).
-      # Пустой Strata заменил бы своим, и API получал бы 401.
-      API_KEY: ${LLM_API_KEY:?задайте LLM_API_KEY в .env (openssl rand -hex 24)}
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      # Запрет на любые обращения к Hugging Face и телеметрию.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+    # Веса лежат в ${MODELS_DIR}/${VLLM_MODEL_DIR}; наружу модель представляется
+    # под именем ${VLLM_MODEL}, чтобы API не зависел от пути на диске.
+    # Промпты (тексты целей, должностные инструкции) vLLM в лог не пишет:
+    # с v0.30 это по умолчанию, флаг --enable-log-requests сюда не добавлять.
+    # --language-model-only: картинки проекту не нужны, энкодер изображений
+    # не грузится и не занимает память GPU.
+    command: >
+      --model /models/${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
+      --served-model-name ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      --language-model-only
     ports:
-      # Только с самого сервера; API ходит по сети compose (strata:8080).
-      - "127.0.0.1:8000:8080"
+      - "127.0.0.1:8000:8000"
     volumes:
-      # Пакет модели (~40 ГБ), слой черновика (~6 ГБ), настройки и ключ Strata.
-      # Скачиваются при первом запуске (docs/release.md) и переживают обновления.
-      - strata_data:/data
-    # Healthcheck — из образа: GET /v1/models с ключом, start_period 2 ч
-    # (порт открывается только после загрузки модели в память).
-    ulimits:
-      # Движок закрепляет в ОЗУ десятки гигабайт экспертов.
-      memlock: { soft: -1, hard: -1 }
-    shm_size: 2gb
-    # При остановке модель дорабатывает запросы и выгружается.
-    stop_grace_period: 2m
+      - ${MODELS_DIR:-./models}:/models:ro
+    healthcheck:
+      # В образе может не быть curl — проверяем средствами Python.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Загрузка весов 27B-модели (~19 ГБ) с диска занимает минуты, поэтому длинный start_period.
+      start_period: 900s
     deploy:
-      # 0 — сервер без GPU, модель на другом сервере (LLM_URL): сервис strata
+      # 0 — сервер без GPU, модель на другом сервере (VLLM_URL): сервис vllm
       # не запускается при docker compose up -d.
-      # Настройка в .env постоянная, в отличие от --scale strata=0.
-      replicas: ${STRATA_REPLICAS:-1}
+      # Настройка в .env постоянная, в отличие от --scale vllm=0.
+      replicas: ${VLLM_REPLICAS:-1}
       resources:
         reservations:
           devices:
@@ -168,23 +165,22 @@ services:
     environment:
       # Обращения между сервисами — мимо прокси. Docker подставляет в
       # контейнеры HTTP_PROXY/HTTPS_PROXY из раздела proxies в
-      # ~/.docker/config.json, и без NO_PROXY запросы к strata, keycloak и даже
+      # ~/.docker/config.json, и без NO_PROXY запросы к vllm, keycloak и даже
       # к 127.0.0.1 (healthcheck, /ready) ушли бы на корпоративный прокси,
       # который этих имён не знает. Явное значение здесь перекрывает
       # подстановку из config.json. Свои адреса, которые тоже надо исключить
-      # (внешний LLM_URL, корпоративный Keycloak), — в NO_PROXY_EXTRA через
+      # (внешний VLLM_URL, корпоративный Keycloak), — в NO_PROXY_EXTRA через
       # запятую. Как дать сеть релизу — docs/release.md.
-      NO_PROXY: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
-      no_proxy: strata,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      NO_PROXY: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
+      no_proxy: vllm,keycloak,neo4j,api,web,localhost,127.0.0.1,${NO_PROXY_EXTRA:-}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-      # Модель: по умолчанию Strata из этого же compose; без GPU — внешний
-      # OpenAI-совместимый эндпоинт (и STRATA_REPLICAS=0 в .env).
-      LLM_URL: ${LLM_URL:-http://strata:8080/v1}
-      LLM_API_KEY: ${LLM_API_KEY:-dummy}
-      # Strata отвечает на любое имя модели; имя видно только в журналах.
-      LLM_MODEL: ${LLM_MODEL:-strata}
+      # Модель: по умолчанию vLLM из этого же compose; без GPU — внешний
+      # OpenAI-совместимый эндпоинт (и VLLM_REPLICAS=0 в .env).
+      VLLM_URL: ${VLLM_URL:-http://vllm:8000/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:-dummy}
+      VLLM_MODEL: ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
       # Корневой сертификат модели по https://, если он выдан внутренним ЦС
       # (LLM_CA_FILE=/certs/<файл>); пусто — системные сертификаты.
       LLM_CA_FILE: ${LLM_CA_FILE:-}
@@ -209,15 +205,15 @@ services:
       CHECK_MAX_PENDING: ${CHECK_MAX_PENDING:-}
       # Потоков обработчиков API; пусто — по ёмкости модели.
       API_THREADS: ${API_THREADS:-}
-      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-4}
-      LLM_INTERACTIVE_RESERVE: ${LLM_INTERACTIVE_RESERVE:-1}
+      LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-32}
+      LLM_INTERACTIVE_RESERVE: ${LLM_INTERACTIVE_RESERVE:-4}
       CHECK_CACHE_TTL_SECONDS: ${CHECK_CACHE_TTL_SECONDS:-3600}
       CHECK_CACHE_MAX_ENTRIES: ${CHECK_CACHE_MAX_ENTRIES:-20000}
       SMART_CACHE_TTL_SECONDS: ${SMART_CACHE_TTL_SECONDS:-86400}
       JOB_DESCRIPTIONS_CACHE_TTL_SECONDS: ${JOB_DESCRIPTIONS_CACHE_TTL_SECONDS:-60}
       HISTORY_RETENTION_DAYS: ${HISTORY_RETENTION_DAYS:-365}
       SMART_SCORE_RETENTION_DAYS: ${SMART_SCORE_RETENTION_DAYS:-365}
-      # Согласовано с окном модели (STRATA_CONTEXT): меняйте вместе.
+      # Согласовано с окном модели (VLLM_MAX_MODEL_LEN): меняйте вместе.
       JOB_TEXT_MAX_CHARS: ${JOB_TEXT_MAX_CHARS:-24000}
       # Выписка обязанностей из инструкции идёт в фоне, со своим таймаутом.
       DUTIES_MAX_TOKENS: ${DUTIES_MAX_TOKENS:-4096}
@@ -272,9 +268,9 @@ services:
       seeder:
         condition: service_completed_successfully
       # Модель API не нужна для старта: каталог, вход и настройки работают,
-      # пока Strata грузит модель, а готовность модели видна в /ready.
-      # required: false — стек поднимается и без сервиса strata (STRATA_REPLICAS=0).
-      strata:
+      # пока vLLM грузит веса, а готовность модели видна в /ready.
+      # required: false — стек поднимается и без сервиса vllm (VLLM_REPLICAS=0).
+      vllm:
         condition: service_started
         required: false
 
@@ -301,10 +297,10 @@ services:
 
   # Автоперезапуск зависших контейнеров. Docker без Swarm по статусу
   # unhealthy не перезапускает: restart: unless-stopped срабатывает, только
-  # когда процесс завершился, а зависшие Strata или API живы. autoheal раз в
+  # когда процесс завершился, а зависший vLLM или API живы. autoheal раз в
   # AUTOHEAL_INTERVAL секунд перезапускает контейнеры с меткой autoheal=true
-  # (strata, api), у которых healthcheck в состоянии unhealthy; пока идёт
-  # start_period (у Strata — 2 часа на загрузку модели), unhealthy не бывает.
+  # (vllm, api), у которых healthcheck в состоянии unhealthy; пока идёт
+  # start_period (у vLLM — 15 минут на загрузку весов), unhealthy не бывает.
   # Образ скачивается при релизе вместе с остальными (шаг 6), тег закреплён.
   # Нужен доступ к docker.sock — это права root на хосте; если так нельзя,
   # AUTOHEAL_REPLICAS=0 и systemd-таймер (docs/deployment.md).
@@ -326,7 +322,50 @@ services:
     deploy:
       replicas: ${AUTOHEAL_REPLICAS:-1}
 
+  # Разовый сервис релиза: скачивает (докачивает) веса модели с Hugging Face
+  # в ${MODELS_DIR}/${VLLM_MODEL_DIR} и проверяет, что все шарды на месте.
+  # Профиль release: при docker compose up не запускается, только явно —
+  #   PULL_POLICY=always docker compose run --rm model
+  # Закрытая модель — HF_TOKEN=<токен> перед командой.
+  model:
+    # Тот же базовый образ, что у API (api/Dockerfile).
+    image: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+    pull_policy: ${PULL_POLICY:-never}
+    profiles: ["release"]
+    restart: "no"
+    logging: *default-logging
+    environment:
+      VLLM_MODEL: ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
+      VLLM_MODEL_DIR: ${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    # hf download идемпотентен: скачанное не качает заново, прерванное
+    # докачивает. config.json появляется первым, шарды — последними, поэтому
+    # после загрузки сверяются все файлы из model.safetensors.index.json.
+    command:
+      - bash
+      - -ec
+      - |
+        pip install --quiet --disable-pip-version-check --root-user-action=ignore "huggingface_hub[cli]"
+        hf download "$$VLLM_MODEL" --local-dir "/models/$$VLLM_MODEL_DIR" \
+          --exclude "*.pth" --exclude "original/*" --exclude "*.gguf"
+        python - <<'PY'
+        import json, os, pathlib, sys
+        d = pathlib.Path("/models", os.environ["VLLM_MODEL_DIR"])
+        index = d / "model.safetensors.index.json"
+        if index.is_file():
+            shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        else:
+            shards = sorted(p.name for p in d.glob("*.safetensors"))
+        bad = [s for s in shards if not (d / s).is_file() or (d / s).stat().st_size == 0]
+        if not (d / "config.json").is_file() or not shards or bad:
+            sys.exit(f"веса в {d} неполные: {bad or 'нет config.json или *.safetensors'} — запустите ещё раз")
+        size = sum((d / s).stat().st_size for s in shards) / 2**30
+        print(f"веса на месте: {d}, шардов {len(shards)}, {size:.1f} ГБ")
+        PY
+
 volumes:
   neo4j_data:
   api_audit:
-  strata_data:

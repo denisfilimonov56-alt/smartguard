@@ -26,35 +26,31 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/monitoring", tags=["monitoring"], dependencies=[Depends(auth.admin)])
 
-# Показатели самой модели (Prometheus): Strata отдаёт их под именами vLLM.
-ENGINE_GAUGES = {
+# Показатели самого vLLM (Prometheus): сколько запросов он считает и держит в очереди.
+VLLM_GAUGES = {
     "vllm:num_requests_running": "running",
     "vllm:num_requests_waiting": "waiting",
+    "vllm:gpu_cache_usage_perc": "kv_cache_usage",
     "vllm:kv_cache_usage_perc": "kv_cache_usage",
 }
 
 
-def parse_engine_metrics(text: str) -> dict[str, float]:
+def parse_vllm_metrics(text: str) -> dict[str, float]:
     found: dict[str, float] = {}
     for line in text.splitlines():
         name = line.split("{", 1)[0].split(" ", 1)[0]
-        if name in ENGINE_GAUGES:
+        if name in VLLM_GAUGES:
             try:
-                found[ENGINE_GAUGES[name]] = float(line.rsplit(" ", 1)[1])
+                found[VLLM_GAUGES[name]] = float(line.rsplit(" ", 1)[1])
             except (IndexError, ValueError):
                 continue
     return found
 
 
-def _engine_url(path: str) -> str:
-    """Служебный адрес модели (/metrics): LLM_URL без суффикса /v1."""
+def _vllm_url(path: str) -> str:
+    """Служебный адрес vLLM (/metrics): VLLM_URL без суффикса /v1."""
     base = agent.llm_url().rstrip("/")
     return (base[:-3] if base.endswith("/v1") else base) + path
-
-
-def _auth() -> dict[str, str]:
-    """Strata требует ключ и на служебных адресах (/v1/models, /metrics)."""
-    return {"Authorization": f"Bearer {os.getenv('LLM_API_KEY', 'dummy')}"}
 
 
 def _open(request: urllib.request.Request | str, timeout: float):
@@ -70,44 +66,42 @@ def _open(request: urllib.request.Request | str, timeout: float):
 
 
 # Готовность модели для /ready: сколько секунд помнить удачный ответ /v1/models.
-LLM_READY_CACHE_SECONDS = 45.0
+VLLM_READY_CACHE_SECONDS = 45.0
 _ready_lock = threading.Lock()
 _ready_until = 0.0
 _problem: Optional[str] = None
 
 
-def llm_problem() -> Optional[str]:
-    """Почему последняя проверка llm_alive не прошла; None — прошла."""
+def vllm_problem() -> Optional[str]:
+    """Почему последняя проверка vllm_alive не прошла; None — прошла."""
     return _problem
 
 
 def _models_problem(timeout: float) -> Optional[str]:
-    request = urllib.request.Request(agent.llm_url().rstrip("/") + "/models", headers=_auth())
+    request = urllib.request.Request(
+        agent.llm_url().rstrip("/") + "/models",
+        headers={"Authorization": f"Bearer {os.getenv('VLLM_API_KEY', 'dummy')}"})
     try:
         with _open(request, timeout) as response:
             data = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            return f"модель отклонила ключ (HTTP {exc.code}): проверьте LLM_API_KEY"
+            return f"модель отклонила ключ (HTTP {exc.code}): проверьте VLLM_API_KEY"
         return f"GET /v1/models ответил HTTP {exc.code}"
     except Exception as exc:  # noqa: BLE001
         return f"не ответила на GET /v1/models: {exc}"
     models = data.get("data") if isinstance(data, dict) else None
     ids = [m.get("id") for m in models if isinstance(m, dict)] if isinstance(models, list) else []
-    # Strata отвечает на любое имя модели, поэтому имя не сверяется; пока модель
-    # не загружена, в списке она значится как unloaded.
-    if not ids:
-        return "в списке /v1/models нет ни одной модели"
-    if any("unloaded" in (m.get("id"), m.get("status")) for m in models if isinstance(m, dict)):
-        return "модель ещё не загружена"
+    if agent.MODEL not in ids:
+        return f'модели "{agent.MODEL}" (VLLM_MODEL) нет в списке /v1/models'
     return None
 
 
-def llm_alive(timeout: float = 2.0) -> bool:
-    """Готова ли модель (для /ready): GET /v1/models с ключом LLM_API_KEY отвечает
-    и модель в нём загружена. Так виден неверный ключ, а не только живой процесс.
-    Удачный ответ помнится LLM_READY_CACHE_SECONDS, неудачный — нет. Причина
-    отказа — llm_problem(). Не бросает исключений.
+def vllm_alive(timeout: float = 2.0) -> bool:
+    """Готова ли модель (для /ready): GET /v1/models с ключом VLLM_API_KEY отвечает
+    и в списке есть VLLM_MODEL. Так видны неверный ключ и имя модели, а не только
+    живой процесс. Удачный ответ помнится VLLM_READY_CACHE_SECONDS, неудачный —
+    нет. Причина отказа — vllm_problem(). Не бросает исключений.
     """
     global _ready_until, _problem
     with _ready_lock:
@@ -116,7 +110,7 @@ def llm_alive(timeout: float = 2.0) -> bool:
     problem = _models_problem(timeout)
     with _ready_lock:
         _problem = problem
-        _ready_until = time.monotonic() + LLM_READY_CACHE_SECONDS if problem is None else 0.0
+        _ready_until = time.monotonic() + VLLM_READY_CACHE_SECONDS if problem is None else 0.0
     if problem is not None:
         log.warning("Модель не готова: %s", problem)
     return problem is None
@@ -129,14 +123,14 @@ def reset_ready_cache() -> None:
         _ready_until, _problem = 0.0, None
 
 
-def engine_state() -> Optional[dict[str, float]]:
-    """Состояние модели или None, если она не ответила: мониторинг от неё не зависит."""
-    request = urllib.request.Request(_engine_url("/metrics/prometheus"), headers=_auth())
+def vllm_state() -> Optional[dict[str, float]]:
+    """Состояние vLLM или None, если он не ответил: мониторинг от него не зависит."""
+    url = _vllm_url("/metrics")
     try:
-        with _open(request, timeout=2) as response:
-            return parse_engine_metrics(response.read().decode("utf-8", "replace"))
+        with _open(url, timeout=2) as response:
+            return parse_vllm_metrics(response.read().decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001
-        log.debug("Показатели модели недоступны: %s", exc)
+        log.debug("Показатели vLLM недоступны: %s", exc)
         return None
 
 
@@ -154,7 +148,7 @@ def _handle(func, *args, **kwargs) -> Any:
 @router.get("/now")
 def get_now():
     """Очередь, загрузка и показатели за последние минуты."""
-    return {**metrics.snapshot(), "history": history.state(), "engine": engine_state(),
+    return {**metrics.snapshot(), "history": history.state(), "vllm": vllm_state(),
             "neo4j": graph.verify_connectivity()}
 
 
