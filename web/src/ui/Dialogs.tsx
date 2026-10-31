@@ -346,6 +346,9 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
 }) {
   const id = "f_" + f.name;
   const hint = f.hint ? <div className="hint">{f.hint}</div> : null;
+  // Отмеченное при открытии — в начале списка: иначе оно уходит ниже видимой
+  // части, и кажется, что ничего не выбрано. Порядок не меняется по щелчку.
+  const [pinned] = useState(() => new Set(Array.isArray(value) ? value : []));
 
   if (f.type === "checkbox") {
     return (
@@ -369,9 +372,10 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
     );
   } else if (f.type === "multi") {
     const selected = value as string[];
+    const options = [...f.options].sort((a, b) => Number(pinned.has(b.value)) - Number(pinned.has(a.value)));
     control = (
       <div className="optlist" id={id}>
-        {f.options.length ? f.options.map((o, i) => (
+        {options.length ? options.map((o, i) => (
           <label key={o.value}>
             <input type="checkbox" value={o.value} checked={selected.includes(o.value)}
               autoFocus={autoFocus && i === 0}

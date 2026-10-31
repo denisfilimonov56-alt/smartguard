@@ -590,7 +590,7 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .unsaved-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 26px;background:var(--warn-soft);color:var(--warn);
   font-size:13px;font-weight:500}
 .unsaved-bar > span{flex:1}
-.optlist{border:1px solid var(--line);border-radius:14px;max-height:220px;overflow:auto;padding:4px}
+.optlist{border:1px solid var(--line);border-radius:14px;max-height:min(50vh,440px);overflow:auto;padding:4px}
 .optlist label{display:flex;gap:9px;align-items:flex-start;padding:7px 9px;border-radius:10px;cursor:pointer}
 .optlist label:hover{background:var(--soft)}
 .optlist input{margin-top:3px;flex:none}
