@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 
-import type { BatchCheck as BatchResult, CheckStatus, Department } from "../../api/types";
+import type { CheckResult, CheckStatus, Department } from "../../api/types";
 import { columnName, downloadFile, openWorkbook, XlsxError, type Sheet, type WorkbookSheet } from "../../lib/xlsx";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
@@ -8,7 +8,9 @@ import { useCheckForm, type BatchRow, type BatchSnapshot } from "../../state/che
 import { ruleApplies } from "../../state/scope";
 import { activeRuleRefs } from "../../state/tree";
 import { Spinner } from "../../ui/common";
+import { copyText } from "../../ui/clipboard";
 import { Overlay, useDialogs } from "../../ui/Dialogs";
+import { useMenu, type MenuItem } from "../../ui/Menu";
 import { Select, type SelectOption } from "../../ui/Select";
 import { errorText, useToast } from "../../ui/Toasts";
 import type { BatchItemProgress } from "../../api/client";
@@ -16,18 +18,17 @@ import { useAdviceDialog } from "./AdviceDialog";
 import { BatchProgress, RowLive } from "./BatchProgress";
 import { seconds } from "./CheckProgress";
 import {
-  MAX_ROWS, SHEET_MAX_ROWS, STATUS_CLASS, STATUS_LABEL, detectColumns, emptyRow, hasErrors, plural, resultsWorkbook,
-  ruleKey, rowsFromSheet, sameRow, sheetWidth, summaryOf, templateWorkbook, unverifiedCount, validateRows,
-  failedTemporarily, UNCHECKED_LABEL, type Columns, type Issue,
+  MAX_ROWS, SHEET_MAX_ROWS, detectColumns, emptyRow, hasErrors, plural, resultsWorkbook,
+  ruleKey, rowsFromSheet, sameRow, sheetWidth, summaryOf, templateWorkbook, validateRows,
+  failedTemporarily, type Columns, type Issue,
 } from "./batch";
-import { JsonBlock } from "./JsonBlock";
 import { Verdict } from "./Verdict";
 
-/* Проверка нескольких целей сразу: таблица строк «цель — подразделение —
-   студент — идентификатор», которую заполняют вручную или из файла Excel. Перед отправкой
-   строки проверяются здесь же: пустая цель, неизвестное подразделение и т. п.
-   не дают нажать «Проверить». Ответ — по строке на цель, с развёрнутым
-   вердиктом как у одиночной проверки, и выгружается обратно в Excel.
+/* Проверка нескольких целей сразу: список целей «цель — подразделение —
+   студент — идентификатор», который заполняют вручную или из файла Excel. Слева —
+   все цели со статусом, справа — выбранная: её поля и разбор как у одиночной проверки.
+   Перед отправкой строки проверяются здесь же: пустая цель, неизвестное подразделение
+   и т. п. не дают нажать «Проверить». Ответ выгружается обратно в Excel.
    Сам пакет идёт в state/checkForm.tsx: уход со страницы его не прерывает. */
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -44,13 +45,21 @@ export function BatchCheck() {
   const { openCustom } = useDialogs();
   const { canEdit, goalMaxChars } = useAuth();
   const openAdvice = useAdviceDialog();
-  const { orders, departments, targets, setSection, setTrace, goToNode } = useCatalog();
+  const catalog = useCatalog();
+  const { departments } = catalog;
   const { checkForm, setCheckForm, batchRun } = useCheckForm();
   const { rows, departmentId: fallback, batch } = checkForm;
   const fileInput = useRef<HTMLInputElement>(null);
+  const openMenu = useMenu();
+  // Выбранная цель; если её убрали — первая.
+  const [selected, setSelected] = useState<string | null>(null);
+  const currentIndex = Math.max(0, rows.findIndex((r) => r.key === selected));
+  const current = rows[currentIndex] as BatchRow | undefined;
 
   const options = useMemo(() => departmentOptions(departments), [departments]);
-  const fallbackName = options.find((o) => o.value === fallback)?.label;
+  const names = useMemo(() => new Map(options.map((o) => [o.value, o.label])), [options]);
+  const fallbackName = names.get(fallback);
+  const verdictProps = useVerdictProps(catalog, canEdit, openAdvice);
   const issues = useMemo(() => validateRows(rows, departments, fallback, goalMaxChars),
     [rows, departments, fallback, goalMaxChars]);
   const broken = rows.filter((r) => hasErrors(issues.get(r.key))).length;
@@ -61,7 +70,20 @@ export function BatchCheck() {
     setCheckForm((prev) => ({ rows: update(prev.rows) })), [setCheckForm]);
   const patch = useCallback((key: string, change: Partial<BatchRow>) =>
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...change } : r))), [setRows]);
-  const remove = useCallback((key: string) => setRows((prev) => prev.filter((r) => r.key !== key)), [setRows]);
+  const remove = useCallback((key: string) => {
+    // Выбор переходит на соседнюю цель: следующую, а у последней — предыдущую.
+    const at = rows.findIndex((r) => r.key === key);
+    setSelected((rows[at + 1] ?? rows[at - 1])?.key ?? null);
+    setRows((prev) => prev.filter((r) => r.key !== key));
+  }, [rows, setRows]);
+  // Только что добавленная цель: в её поле сразу ставится курсор.
+  const [added, setAdded] = useState<string | null>(null);
+  const add = () => {
+    const row = emptyRow();
+    setRows((prev) => [...prev, row]);
+    setSelected(row.key);
+    setAdded(row.key);
+  };
 
   // Ответ по строке — только пока строка та же, что проверялась: после правки цели,
   // подразделения, признака студента или идентификатора прежний статус к ней не относится.
@@ -90,6 +112,7 @@ export function BatchCheck() {
         onImport={(imported) => {
           // Пустые строки-заготовки загруженные вытесняют, заполненные остаются.
           setRows((prev) => [...prev.filter((r) => r.goal.trim() || r.departmentId || r.id), ...imported]);
+          if (imported[0]) setSelected(imported[0].key);
           toast(`Загружено: ${plural(imported.length, ["строка", "строки", "строк"])}`, "ok");
         }} />
     ));
@@ -151,6 +174,7 @@ export function BatchCheck() {
       <div className="card batch-card" id="batchRows" style={{ marginTop: 16 }}>
         <div className="row wrap batch-head">
           <span className="mid">{rows.length ? plural(rows.length, ["цель", "цели", "целей"]) : "Целей пока нет"}</span>
+          {batch && <BatchSummary batch={batch} />}
           {broken > 0 && <span className="badge err">с ошибками: {broken}</span>}
           {tooMany && <span className="badge err">не более {MAX_ROWS} целей за раз</span>}
           <div className="spacer" />
@@ -159,54 +183,209 @@ export function BatchCheck() {
               Убрать строки с ошибками
             </button>
           )}
-          {rows.length > 0 && (
-            <button className="btn sm ghost" disabled={busy} onClick={() => { setRows(() => []); setCheckForm({ batch: null }); }}>Очистить</button>
+          {batch && (
+            <button className="btn sm" onClick={() => downloadFile(resultsWorkbook(batch.rows, batch.result), "результат-проверки.xlsx")}>
+              Скачать Excel
+            </button>
           )}
-          <button className="btn sm" onClick={() => setRows((prev) => [...prev, emptyRow()])}>+ Строка</button>
+          {(batch || (rows.length > 0 && !busy)) && (
+            <button className="btn sm menu-btn" id="batchMenu" aria-haspopup="menu" aria-label="Ещё" title="Ещё"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => openMenu(e.currentTarget, menuItems())}>⋯</button>
+          )}
         </div>
-        {rows.length > 0 && (
-          <table className="batch-table">
-            <thead>
-              <tr><th className="n">№</th><th>Цель</th><th>Подразделение</th><th className="student">Студент</th><th>Идентификатор</th><th className="status">Результат</th><th /></tr>
-            </thead>
-            <tbody>
-              {rows.map((row, i) => (
-                <BatchTableRow key={row.key} row={row} index={i} issues={issues.get(row.key)} outcome={outcomeOf(row)}
-                  live={batchRun.live?.items[row.key]}
-                  options={options} fallbackName={fallbackName} onPatch={patch} onRemove={remove} />
-              ))}
-            </tbody>
-          </table>
+        {current ? (
+          <div className="batch-split">
+            <BatchList rows={rows} current={current.key} issues={issues} outcomeOf={outcomeOf} checked={checked} live={batchRun.live?.items}
+              names={names} fallbackName={fallbackName} onSelect={setSelected} onAdd={add} />
+            <BatchDetail key={current.key} row={current} index={currentIndex} issues={issues.get(current.key)}
+              outcome={outcomeOf(current)} result={checked.get(current.key)?.result} live={batchRun.live?.items[current.key]}
+              options={options} fallbackName={fallbackName} onPatch={patch} onRemove={remove}
+              verdict={verdictProps} autoFocus={current.key === added} />
+          </div>
+        ) : (
+          <div className="batch-empty">
+            <div className="muted">Добавьте цель вручную или загрузите файл Excel.</div>
+            <button className="btn sm" onClick={add}>+ Добавить цель</button>
+          </div>
         )}
       </div>
-
-      {batch && <BatchResults batch={batch} canEdit={canEdit} orders={orders} targets={targets} setSection={setSection}
-        setTrace={setTrace} goToNode={goToNode} openAdvice={openAdvice} />}
-      {batch && <JsonBlock id="batchJson" value={batch.result} />}
     </>
+  );
+
+  function menuItems(): MenuItem[] {
+    const items: MenuItem[] = [];
+    if (batch) {
+      items.push({ label: "Показать ответ API (JSON)", run: () => openCustom((close) => <JsonDialog value={batch.result} close={close} />) });
+      items.push({ label: "Скопировать ответ API (JSON)", run: async () => {
+        if (await copyText(JSON.stringify(batch.result, null, 2))) toast("JSON скопирован", "ok");
+        else toast("Не удалось скопировать — откройте ответ API и скопируйте вручную", "err");
+      } });
+    }
+    if (rows.length && !busy) {
+      if (items.length) items.push(null);
+      items.push({ label: "Очистить список", danger: true, run: () => { setRows(() => []); setCheckForm({ batch: null }); } });
+    }
+    return items;
+  }
+}
+
+/** Ответ API целиком — по пункту меню «⋯»: он нужен разработчикам, а не тем, кто проверяет цели. */
+function JsonDialog({ value, close }: { value: unknown; close: () => void }) {
+  const text = useMemo(() => JSON.stringify(value, null, 2), [value]);
+  return (
+    <Overlay onClose={close}>
+      <div className="modal wide" role="dialog" aria-modal="true" aria-label="Ответ API (JSON)" id="batchJson">
+        <h3>Ответ API (JSON)</h3>
+        <div className="content"><pre className="mono json">{text}</pre></div>
+        <div className="foot"><button type="button" className="btn" onClick={close}>Закрыть</button></div>
+      </div>
+    </Overlay>
   );
 }
 
-const sameIssues = (a: Issue[] | undefined, b: Issue[] | undefined) =>
-  a === b || (!!a && !!b && a.length === b.length && a.every((x, i) => x.level === b[i].level && x.text === b[i].text));
+/** Сводка ответа в шапке: только ненулевые счётчики. Непроверенные цели (unchecked) — отдельно, не в «ручной проверке». */
+function BatchSummary({ batch }: { batch: BatchSnapshot }) {
+  const s = useMemo(() => summaryOf(batch.result.results), [batch]);
+  const parts: [string, number, string, string?][] = [
+    ["ok", s.allowed, "без нарушений"],
+    ["err", s.violations, "нужно доработать"],
+    ["warn", s.manual_review, "ручная проверка"],
+    ["", s.unchecked ?? 0, "не проверено", "batchUnchecked"],
+  ];
+  return (
+    <span className="batch-sum" id="batchSummary" data-checked={s.total - (s.unchecked ?? 0)}>
+      {parts.filter(([, n]) => n > 0).map(([cls, n, label, id]) => (
+        <span key={label} id={id} title={id ? "Пакет не дошёл до этих целей: они не проверены, отправьте их снова" : undefined}>
+          <i className={`st-dot ${cls}`} /><b>{n}</b> {label}
+        </span>
+      ))}
+    </span>
+  );
+}
 
-interface RowProps {
+type Checked = Map<string, { row: BatchRow; result: CheckResult | undefined }>;
+
+/** Что показать о строке в списке: текст и цвет точки. Пока ответа части нет, статус берётся из хода пакета. */
+function statusOf(outcome: Outcome, result: CheckResult | undefined, broken: boolean,
+  live: BatchItemProgress | undefined): { cls: string; text: string } {
+  if (broken) return { cls: "err", text: "ошибка в строке" };
+  if (!outcome && live?.status === "queued") return { cls: "none", text: "в очереди" };
+  if (!outcome && live?.status === "running")
+    return { cls: "run", text: `проверяется…${live.seconds != null ? " " + seconds(live.seconds) : ""}` };
+  if (!outcome && live?.status === "done" && live.verdict) outcome = live.verdict;
+  switch (outcome) {
+    case "stale": return { cls: "", text: "изменено, не проверено" };
+    case "unchecked": return { cls: "", text: "не проверено, отправьте снова" };
+    case "failed": return { cls: "warn", text: "сбой, отправьте снова" };
+    case "NEEDS_MANUAL_REVIEW": return { cls: "warn", text: "ручная проверка" };
+    case "ALLOWED": return { cls: "ok", text: "нарушений нет" };
+    case "VIOLATIONS_FOUND": {
+      const rules = result ? new Set(result.violations.map(ruleKey)).size : 0;
+      return { cls: "err", text: rules ? `нарушено правил: ${rules}` : "нужно доработать" };
+    }
+    default: return { cls: "none", text: "" };
+  }
+}
+
+interface ListProps {
+  rows: BatchRow[];
+  current: string;
+  issues: Map<string, Issue[]>;
+  outcomeOf: (row: BatchRow) => Outcome;
+  checked: Checked;
+  live: Record<string, BatchItemProgress> | undefined;
+  names: Map<string, string>;
+  fallbackName: string | undefined;
+  onSelect: (key: string) => void;
+  onAdd: () => void;
+}
+
+/** Список целей: номер, начало формулировки, подразделение и статус. Стрелки ходят по списку. */
+function BatchList({ rows, current, issues, outcomeOf, checked, live, names, fallbackName, onSelect, onAdd }: ListProps) {
+  const list = useRef<HTMLOListElement>(null);
+  function onKey(event: KeyboardEvent<HTMLOListElement>) {
+    const step = ({ ArrowDown: 1, ArrowUp: -1 } as Record<string, number>)[event.key];
+    if (!step) return;
+    event.preventDefault();
+    const at = rows.findIndex((r) => r.key === current);
+    const next = rows[Math.min(rows.length - 1, Math.max(0, at + step))];
+    onSelect(next.key);
+    requestAnimationFrame(() => list.current?.querySelector<HTMLElement>(`[data-key="${next.key}"]`)?.focus());
+  }
+  return (
+    <div className="batch-side">
+      <ol className="batch-list" ref={list} onKeyDown={onKey} aria-label="Цели">
+        {rows.map((row, i) => {
+          const department = row.departmentId ? names.get(row.departmentId) ?? row.departmentId
+            : fallbackName ?? "без подразделения";
+          const outcome = outcomeOf(row);
+          const item = live?.[row.key];
+          return (
+            <BatchListItem key={row.key} row={row} index={i} active={row.key === current} department={department}
+              status={statusOf(outcome, checked.get(row.key)?.result, hasErrors(issues.get(row.key)), item)}
+              time={outcome !== "stale" ? timeOf(item) : ""} onSelect={onSelect} />
+          );
+        })}
+      </ol>
+      <button className="batch-add" onClick={onAdd}>+ Добавить цель</button>
+    </div>
+  );
+}
+
+/** Пункт списка перерисовывается, только когда меняется он сам: ввод в одной цели не трогает остальные сотни. */
+const BatchListItem = memo(function BatchListItem({ row, index, active, department, status, time, onSelect }: {
+  row: BatchRow; index: number; active: boolean; department: string;
+  status: { cls: string; text: string }; time: string; onSelect: (key: string) => void;
+}) {
+  return (
+    <li data-row={index + 1}>
+      <button type="button" data-key={row.key} aria-current={active} tabIndex={active ? 0 : -1} onClick={() => onSelect(row.key)}>
+        <span className="n">{index + 1}</span>
+        <span className={`g${row.goal.trim() ? "" : " blank"}`}>{row.goal.trim() || "Формулировка не заполнена"}</span>
+        <span className="m">
+          <i className={`st-dot ${status.cls}`} />
+          <span className="dep">{department}{row.isStudent ? " · студент" : ""}</span>
+          {status.text && <span className={`s ${status.cls}`}>{status.text}</span>}
+          {time && <span className="t" title={time === "кэш" ? "Ответ из кэша" : "Сколько проверялась цель"}>{time}</span>}
+        </span>
+      </button>
+    </li>
+  );
+}, (a, b) => a.row === b.row && a.index === b.index && a.active === b.active && a.department === b.department
+  && a.status.cls === b.status.cls && a.status.text === b.status.text && a.time === b.time && a.onSelect === b.onSelect);
+
+/** Сколько проверялась готовая цель: «2,9 с» или «кэш». */
+const timeOf = (item: BatchItemProgress | undefined) =>
+  item?.status !== "done" || item.seconds == null ? "" : item.cached ? "кэш" : seconds(item.seconds);
+
+type Catalog = ReturnType<typeof useCatalog>;
+
+interface VerdictProps {
+  totalFor: (departmentId: string | null, isStudent: boolean | null) => number;
+  onTrace: (result: CheckResult) => void;
+  onAttribute: (name: string) => void;
+  onDispute?: (result: CheckResult, attribute: string) => void;
+}
+
+interface DetailProps {
   row: BatchRow;
   index: number;
   issues: Issue[] | undefined;
   outcome: Outcome;
+  result: CheckResult | undefined;
   /** Ход цели в идущем или последнем пакете. */
   live: BatchItemProgress | undefined;
   options: SelectOption[];
   fallbackName: string | undefined;
   onPatch: (key: string, change: Partial<BatchRow>) => void;
   onRemove: (key: string) => void;
+  verdict: VerdictProps;
+  autoFocus: boolean;
 }
 
-/** Строка таблицы: перерисовывается, только когда меняется она сама, — ввод в одной строке
-    не перерисовывает остальные сотни. validateRows каждый раз даёт новые массивы, поэтому
-    замечания сравниваются по содержимому. */
-const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome, live, options, fallbackName, onPatch, onRemove }: RowProps) {
+/** Выбранная цель: её поля и разбор — как у одиночной проверки, пока ответ относится к строке. */
+function BatchDetail({ row, index, issues, outcome, result, live, options, fallbackName, onPatch, onRemove, verdict, autoFocus }: DetailProps) {
   const known = options.some((o) => o.value === row.departmentId);
   const rowOptions = useMemo(() => [
     { value: "", label: fallbackName ? `По умолчанию (${fallbackName})` : "Не указано" },
@@ -214,137 +393,71 @@ const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome,
     ...options,
   ], [options, fallbackName, row.departmentId, known]);
   const n = index + 1;
+  const note = outcome === "stale" ? "Цель изменили после проверки: прежний ответ к ней не относится. Проверьте её снова."
+    : outcome === "unchecked" ? "Пакет не уложился в отведённое время: цель не проверена. «Проверить оставшиеся» отправит её снова."
+    : outcome === "failed" ? "Проверка сорвалась из-за временного сбоя. «Проверить оставшиеся» отправит цель снова."
+    : !outcome && !live ? "Цель ещё не проверялась." : null;
+  const time = outcome !== "stale" ? timeOf(live) : "";
   return (
-    <tr className={hasErrors(issues) ? "bad" : ""} data-row={n}>
-      <td className="n">{n}</td>
-      <td className="goal">
-        <textarea rows={2} value={row.goal} aria-label={`Цель ${n}`} placeholder="Формулировка цели"
-          onChange={(e) => onPatch(row.key, { goal: e.target.value })} />
-        <Issues items={issues ?? []} />
-      </td>
-      <td data-label="Подразделение">
-        <Select ariaLabel={`Подразделение ${n}`} value={row.departmentId}
-          onChange={(next) => onPatch(row.key, { departmentId: next })} options={rowOptions} />
-      </td>
-      <td className="student" data-label="Студент">
-        <input type="checkbox" checked={row.isStudent} aria-label={`Студент ${n}`}
-          title="Цель ставит студент: проверяются и правила только для студентов"
-          onChange={(e) => onPatch(row.key, { isStudent: e.target.checked, studentText: undefined })} />
-      </td>
-      <td data-label="Идентификатор">
-        <input type="text" value={row.id} aria-label={`Идентификатор ${n}`} placeholder="необязательно"
-          onChange={(e) => onPatch(row.key, { id: e.target.value })} />
-      </td>
-      <td className="status" data-label="Результат">
-        {outcome === "stale"
-          ? <span className="badge" title="Строку изменили после проверки: прежний ответ к ней не относится">изменено, не проверено</span>
-          : outcome === "unchecked"
-          ? <span className="badge" title="Пакет не уложился в отведённое время: цель не проверена, отправьте её снова">не проверено, отправьте снова</span>
-          : outcome === "failed"
-          ? <span className="badge warn" title="Проверка сорвалась из-за временного сбоя: «Проверить оставшиеся» отправит цель снова">сбой, отправьте снова</span>
-          : outcome ? <span className={`badge ${STATUS_CLASS[outcome]}`}>{STATUS_LABEL[outcome]}</span>
-          // Ответ части ещё не пришёл, а ход уже знает итог цели — показать его сразу.
-          : live?.status === "done" && live.verdict ? <span className={`badge ${STATUS_CLASS[live.verdict]}`}>{STATUS_LABEL[live.verdict]}</span>
-          : live && <RowLive item={live} />}
-        {outcome !== "stale" && live?.status === "done" && live.seconds != null && (
-          <span className="bp-row-time" title={live.cached ? "Ответ из кэша" : "Сколько проверялась цель"}>
-            {live.cached ? "кэш" : seconds(live.seconds)}</span>
-        )}
-      </td>
-      <td className="x">
-        <button className="close-x" aria-label={`Удалить строку ${n}`} title="Удалить строку"
-          onClick={() => onRemove(row.key)}>×</button>
-      </td>
-    </tr>
+    <section className="batch-detail" aria-label={`Разбор цели ${n}`} data-detail={n}>
+      <div className="row batch-detail-head">
+        <span className="dim">Цель {n}</span>
+        <div className="spacer" />
+        <button className="btn sm ghost" aria-label={`Удалить строку ${n}`} title="Удалить цель" onClick={() => onRemove(row.key)}>Удалить</button>
+      </div>
+      <textarea rows={3} value={row.goal} aria-label={`Цель ${n}`} autoFocus={autoFocus} placeholder="Формулировка цели"
+        onChange={(e) => onPatch(row.key, { goal: e.target.value })} />
+      <Issues items={issues ?? []} />
+      <div className="batch-fields">
+        <div>
+          <div className="lbl">Подразделение</div>
+          <Select ariaLabel={`Подразделение ${n}`} value={row.departmentId}
+            onChange={(next) => onPatch(row.key, { departmentId: next })} options={rowOptions} />
+        </div>
+        <div>
+          <div className="lbl">Идентификатор</div>
+          <input type="text" value={row.id} aria-label={`Идентификатор ${n}`} placeholder="необязательно"
+            onChange={(e) => onPatch(row.key, { id: e.target.value })} />
+        </div>
+        <label className="check" title="Цель ставит студент: проверяются и правила только для студентов">
+          <input type="checkbox" checked={row.isStudent} aria-label={`Студент ${n}`}
+            onChange={(e) => onPatch(row.key, { isStudent: e.target.checked, studentText: undefined })} /> Цель студента
+        </label>
+      </div>
+      {note && <div className={outcome === "failed" ? "alert batch-note" : "dim batch-note"}>{note}</div>}
+      {!outcome && live && live.status !== "done" && <div className="batch-note"><RowLive item={live} /></div>}
+      {!outcome && live?.status === "done" && <div className="dim batch-note">Цель проверена, разбор появится с ответом части пакета.</div>}
+      {result && !note && time && <div className="dim batch-time">{time === "кэш" ? "Ответ из кэша" : `Проверялась ${time}`}</div>}
+      {!note && result && (
+        <Verdict result={result} total={verdict.totalFor(result.department?.id ?? null, result.is_student)}
+          onTrace={() => verdict.onTrace(result)} onAttribute={verdict.onAttribute}
+          onDispute={verdict.onDispute && result.status !== "NEEDS_MANUAL_REVIEW"
+            ? (attribute) => verdict.onDispute!(result, attribute) : undefined} />
+      )}
+    </section>
   );
-}, (a, b) => a.row === b.row && a.index === b.index && a.outcome === b.outcome && a.options === b.options
-  && a.live?.status === b.live?.status && a.live?.seconds === b.live?.seconds && a.live?.verdict === b.live?.verdict
-  && a.fallbackName === b.fallbackName && a.onPatch === b.onPatch && a.onRemove === b.onRemove && sameIssues(a.issues, b.issues));
-
-type Catalog = ReturnType<typeof useCatalog>;
-
-interface ResultsProps {
-  batch: BatchSnapshot;
-  canEdit: boolean;
-  orders: Catalog["orders"];
-  targets: Catalog["targets"];
-  setSection: Catalog["setSection"];
-  setTrace: Catalog["setTrace"];
-  goToNode: Catalog["goToNode"];
-  openAdvice: ReturnType<typeof useAdviceDialog>;
 }
 
-/** Ответ пакета. Вердикт строится только у раскрытых целей: у свёрнутого <details> React
-    всё равно рендерит содержимое, а сотни вердиктов с анимацией SMART тормозят страницу.
-    Ввод в таблицу этот блок не перерисовывает: batch при вводе не меняется. */
-const BatchResults = memo(function BatchResults({ batch, canEdit, orders, targets, setSection, setTrace, goToNode, openAdvice }: ResultsProps) {
-  const [open, setOpen] = useState<Set<number>>(() => new Set());
-  // Новый ответ — всё свёрнуто заново.
-  useEffect(() => setOpen(new Set()), [batch]);
-  const toggle = (i: number, isOpen: boolean) => setOpen((prev) => {
-    if (prev.has(i) === isOpen) return prev;
-    const next = new Set(prev);
-    if (isOpen) next.add(i); else next.delete(i);
-    return next;
-  });
-
+/** Обработчики вердикта: сколько правил проверялось, переход на граф и в словарь, «Не согласен». */
+function useVerdictProps({ orders, targets, setSection, setTrace, goToNode }: Pick<Catalog,
+  "orders" | "targets" | "setSection" | "setTrace" | "goToNode">, canEdit: boolean,
+  openAdvice: ReturnType<typeof useAdviceDialog>): VerdictProps {
   // Сколько правил проверяется для подразделения и студента — та же логика, что в графе и у одиночной проверки.
   const active = useMemo(() => activeRuleRefs(orders), [orders]);
-  const totalFor = (departmentId: string | null, isStudent: boolean | null) =>
-    active.filter(({ rule }) => ruleApplies(rule, departmentId, isStudent !== false)).length;
-  const openAttribute = (name: string) => {
-    const target = targets.find((t) => t.name === name);
-    if (target) void goToNode(target.nodeId, "CheckTarget");
-    else setSection("targets");
+  return {
+    totalFor: (departmentId, isStudent) =>
+      active.filter(({ rule }) => ruleApplies(rule, departmentId, isStudent !== false)).length,
+    onTrace: (result) => { setTrace(result); setSection("graph"); },
+    onAttribute: (name) => {
+      const target = targets.find((t) => t.name === name);
+      if (target) void goToNode(target.nodeId, "CheckTarget");
+      else setSection("targets");
+    },
+    onDispute: canEdit
+      ? (result, attribute) => openAdvice({ result, departmentId: result.department?.id ?? null, attribute, onApplied: () => undefined })
+      : undefined,
   };
-  // Сводка — по ответам: непроверенные цели (unchecked) отдельно, не в «ручной проверке».
-  const summary = useMemo(() => summaryOf(batch.result.results), [batch]);
-  const dispute = canEdit
-    ? (result: BatchResult["results"][number], attribute: string) =>
-      openAdvice({ result, departmentId: result.department?.id ?? null, attribute, onApplied: () => undefined })
-    : undefined;
-
-  return (
-    <div className="card verdict" id="batchResult" style={{ marginTop: 16 }}>
-      <div className="row wrap" style={{ paddingBottom: 12 }}>
-        <span className="badge count">Проверено целей: {summary.total - (summary.unchecked ?? 0)}</span>
-        <span className="badge ok">нарушений нет: {summary.allowed}</span>
-        <span className="badge err">нужно доработать: {summary.violations}</span>
-        <span className="badge warn">ручная проверка: {summary.manual_review}</span>
-        {!!summary.unchecked && <span className="badge" id="batchUnchecked"
-          title="Пакет не дошёл до этих целей: они не проверены, отправьте их снова">не проверено: {summary.unchecked}</span>}
-        <div className="spacer" />
-        <button className="btn sm" onClick={() => downloadFile(resultsWorkbook(batch.rows, batch.result), "результат-проверки.xlsx")}>
-          Скачать Excel
-        </button>
-      </div>
-      {batch.result.results.map((result, i) => {
-        const rules = new Set(result.violations.map(ruleKey)).size;
-        const unverified = unverifiedCount(result);
-        return (
-          <details key={batch.rows[i]?.key ?? i} className="batch-item" onToggle={(e) => toggle(i, e.currentTarget.open)}>
-            <summary>
-              {result.unchecked
-                ? <span className="badge" title="Пакет не дошёл до цели: она не проверена, отправьте её снова">{UNCHECKED_LABEL}</span>
-                : <span className={`badge ${STATUS_CLASS[result.status]}`}>{STATUS_LABEL[result.status]}</span>}
-              {result.id && <span className="mono">{result.id}</span>}
-              <span className="goal">{result.goal}</span>
-              <span className="dim">{result.department ? result.department.name || result.department.id : "подразделение не определено"}
-                {result.is_student ? " · студент" : ""}
-                {rules ? ` · нарушено правил: ${rules}` : ""}
-                {unverified ? ` · ? не проверено правил: ${unverified}` : ""}</span>
-            </summary>
-            {open.has(i) && (
-              <Verdict result={result} total={totalFor(result.department?.id ?? null, result.is_student)}
-                onTrace={() => { setTrace(result); setSection("graph"); }} onAttribute={openAttribute}
-                onDispute={dispute && result.status !== "NEEDS_MANUAL_REVIEW" ? (attribute) => dispute(result, attribute) : undefined} />
-            )}
-          </details>
-        );
-      })}
-    </div>
-  );
-});
+}
 
 function Issues({ items }: { items: Issue[] }) {
   if (!items.length) return null;

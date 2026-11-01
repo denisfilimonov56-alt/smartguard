@@ -175,7 +175,7 @@ test("пакет, закончившийся во время обучения, �
   await app.route("**/api/check-goals", async (route) => { await held; await route.fallback(); });
   await go(app, "Проверка цели");
   await app.locator("#checkMode").getByRole("button", { name: "Несколько целей" }).click();
-  await app.getByRole("button", { name: "+ Строка" }).click();
+  await app.getByRole("button", { name: "+ Добавить цель" }).click();
   await app.getByLabel("Цель 1").fill("Снизить долю просроченных заявок до 5% к 31.12.2025");
   await choose(app.getByLabel("Подразделение 1"), "УЦТ");
   await app.locator("#batchRun").click();
@@ -188,5 +188,5 @@ test("пакет, закончившийся во время обучения, �
   await expect(app.locator("#batchRun")).toBeEnabled();
   await app.keyboard.press("Escape");
   await expect(tour(app)).toHaveCount(0);
-  await expect(app.locator("#batchResult").getByText("Проверено целей: 1")).toBeVisible();
+  await expect(app.locator("#batchSummary")).toHaveAttribute("data-checked", "1");
 });

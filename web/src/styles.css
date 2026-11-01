@@ -824,64 +824,53 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 }
 
 /* --------------------------- пакетная проверка ---------------------------- */
-/* Строки целей — сетка, а не узкие колонки таблицы: формулировка занимает
-   всё свободное место и растёт по мере ввода, подразделение, идентификатор и
-   результат стоят справа. На узком экране они переезжают под формулировку,
-   а шапка прячется — подписи полей появляются над ними. */
+/* Слева — список всех целей со статусом, справа — выбранная цель: её поля и
+   разбор. Список прокручивается сам, чтобы сотни целей не уводили разбор вниз. */
 .check-page.batch{grid-template-columns:minmax(0,1fr)}
-.batch-head{padding:16px 22px;gap:10px}
-.batch-table{display:block}
-.batch-table thead,.batch-table tbody{display:block}
-.batch-table tr{display:grid;grid-template-columns:36px minmax(0,1fr) 230px 64px 150px 150px 32px;gap:8px 14px;align-items:start;
-  padding:14px 18px 14px 14px;border-top:1px solid var(--line-soft)}
-.card > .batch-table th,.card > .batch-table td{display:block;padding:0;border:0;text-align:left;min-width:0;background:none}
-.batch-table thead tr{padding:10px 18px 10px 14px;background:var(--panel-2);border-top:0}
-.batch-table th{font-size:12px;font-weight:500;color:var(--ink-2);line-height:18px}
-.batch-table td.n{color:var(--ink-3);font-size:12px;line-height:16px;padding-top:12px;text-align:center}
-.batch-table th.n{text-align:center}
-.batch-table textarea{width:100%;min-height:58px;padding:9px 12px;font-size:14px;line-height:20px;resize:vertical;field-sizing:content}
-.batch-table .select{width:100%;min-height:40px;padding:7px 12px;font-size:13.5px}
-.batch-table input[type=text]{width:100%;padding:9px 12px;font-size:13.5px}
-.batch-table td.status{padding-top:8px}
-.batch-table th.student{text-align:center}
-.batch-table td.student{text-align:center;padding-top:11px}
-.batch-table td.student input{cursor:pointer}
-.batch-table td.x{text-align:right;padding-top:4px}
-.batch-table td::before{display:none;content:attr(data-label);font-size:12px;color:var(--ink-3);margin-bottom:4px}
-.batch-table tr.bad{background:var(--row-bad)}
+.batch-head{padding:16px 22px;gap:10px;border-bottom:1px solid var(--line-soft)}
+.batch-sum{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:13px;color:var(--ink-2)}
+.batch-sum > span{display:inline-flex;align-items:center;gap:6px}
+.batch-sum b{color:var(--ink);font-weight:600}
+.st-dot{flex:none;display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ink-3)}
+.st-dot.ok{background:var(--ok)} .st-dot.err{background:var(--danger)} .st-dot.warn{background:var(--warn)}
+.st-dot.none{background:transparent;box-shadow:inset 0 0 0 1.5px var(--line)}
+.batch-split{display:grid;grid-template-columns:minmax(240px,320px) minmax(0,1fr);align-items:start}
+.batch-side{border-right:1px solid var(--line-soft);align-self:stretch}
+.batch-list{list-style:none;margin:0;padding:0;max-height:min(70vh,720px);overflow:auto}
+.batch-list button{display:grid;grid-template-columns:22px minmax(0,1fr);gap:4px 8px;width:100%;padding:12px 16px 12px 14px;
+  border:0;border-bottom:1px solid var(--line-soft);background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.batch-list button:hover{background:var(--panel-2)}
+.batch-list button[aria-current="true"]{background:var(--row-selected);box-shadow:inset 3px 0 0 var(--brand)}
+.batch-list button:focus-visible{outline:2px solid var(--brand);outline-offset:-2px}
+.batch-list .n{color:var(--ink-3);font-size:12px;line-height:20px;text-align:right}
+.batch-list .g{font-size:13.5px;line-height:20px;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden}
+.batch-list .g.blank{color:var(--ink-3)}
+.batch-list .m{grid-column:2;display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;line-height:16px;color:var(--ink-3)}
+.batch-list .dep{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.batch-list .s{flex:none;margin-left:auto}
+.batch-list .s.err{color:var(--danger)} .batch-list .s.warn{color:var(--warn)} .batch-list .s.ok{color:var(--ok)}
+.batch-list .s.run{color:var(--brand-2)}
+.batch-list .t{flex:none;font-variant-numeric:tabular-nums}
+.st-dot.run{background:var(--brand);animation:pulse 1s ease-in-out infinite}
+.batch-add{display:block;width:100%;padding:12px 16px;border:0;background:none;color:var(--brand);font:inherit;
+  font-size:13.5px;font-weight:500;text-align:left;cursor:pointer}
+.batch-add:hover{background:var(--panel-2)}
+.batch-detail{padding:18px 24px 22px;min-width:0}
+.batch-detail-head{margin-bottom:8px}
+.batch-detail textarea{width:100%;min-height:84px;padding:10px 14px;font-size:15px;line-height:22px;resize:vertical;field-sizing:content}
+.batch-fields{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto;gap:12px 14px;align-items:end;margin-top:14px}
+.batch-fields .lbl{font-size:12px;color:var(--ink-3);margin-bottom:6px}
+.batch-fields .select{width:100%}
+.batch-fields input[type=text]{width:100%}
+.batch-fields .check{min-height:40px;white-space:nowrap}
+.batch-note{margin-top:18px}
+.batch-time{margin-top:14px;font-size:12.5px}
+.batch-detail > .verdict{margin:18px 0 0;padding:0;border:0;border-radius:0;box-shadow:none;background:none}
+.batch-empty{display:flex;flex-direction:column;align-items:flex-start;gap:12px;padding:22px}
 .row-issues{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:6px;font-size:12.5px;line-height:18px}
 .row-issues .error{color:var(--danger)}
 .row-issues .warning{color:var(--warn)}
-@media (max-width:1320px){
-  .batch-table thead{display:none}
-  .batch-table tr{grid-template-columns:36px minmax(0,1fr) minmax(0,1fr) 32px;gap:10px 14px}
-  .batch-table td.goal{grid-column:2 / 4}
-  .batch-table td.x{grid-row:1;grid-column:4}
-  .batch-table td[data-label="Подразделение"]{grid-column:2}
-  .batch-table td.student{grid-column:3;text-align:left;padding-top:0}
-  .batch-table td[data-label="Идентификатор"]{grid-column:2}
-  .batch-table td.status{grid-column:2 / 4}
-  .batch-table td[data-label]::before{display:block}
-  .batch-table td.status{padding-top:0}
-  .batch-table td.status:empty{display:none}
-}
-@media (max-width:760px){
-  .batch-table tr{grid-template-columns:36px minmax(0,1fr) 32px}
-  .batch-table td.goal{grid-column:2 / 3}
-  .batch-table td.x{grid-column:3}
-  .batch-table td[data-label],.batch-table td.status{grid-column:2}
-}
-.batch-item{border-top:1px solid var(--line-soft);padding:6px 0}
-.batch-item > summary{display:flex;align-items:center;gap:10px;padding:8px 4px;border-radius:10px;list-style:none;cursor:pointer}
-.batch-item > summary::-webkit-details-marker{display:none}
-.batch-item > summary::before{content:"";width:0;height:0;border:5px solid transparent;border-left:7px solid var(--ink-3);
-  flex:none;transition:transform .15s}
-.batch-item[open] > summary::before{transform:rotate(90deg)}
-.batch-item > summary:hover{background:var(--panel-2)}
-.batch-item > summary .badge{flex:none;min-width:142px;justify-content:center}
-.batch-item > summary .goal{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
-.batch-item > summary .dim{flex:none;white-space:nowrap}
-.batch-item > .verdict{margin:4px 0 10px;box-shadow:none;border-color:var(--line-soft)}
 .import-cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 14px}
 .import-summary{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px}
 .import-issues{margin-top:10px;max-height:180px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:8px 12px;
