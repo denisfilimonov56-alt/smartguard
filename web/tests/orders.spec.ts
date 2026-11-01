@@ -79,19 +79,19 @@ test("перенос пункта в другой приказ", async ({ app })
   await choose(modal(app).getByLabel("Приказ", { exact: true }), "ПР-01");
   await modal(app).getByRole("button", { name: "Сохранить" }).click();
   await expect(toast(app, "Пункт перенесён")).toBeVisible();
-  await expect(orderItem(app, "ПР-01")).toContainText("3 п. · 3 прав.");
-  await expect(orderItem(app, "ПР-02")).toContainText("1 п. · 1 прав.");
+  await expect(orderItem(app, "ПР-01")).toContainText("3 пункта · 3 правила");
+  await expect(orderItem(app, "ПР-02")).toContainText("1 пункт · 1 правило");
 });
 
-test("удаление активного пункта без предварительного архивирования", async ({ app }) => {
+test("удаление активного пункта без отправки в архив", async ({ app }) => {
   await go(app, "Приказы");
   await menu(clauseBlock(app, "2.4"), "Удалить");
   const dialog = app.getByRole("dialog");
-  await expect(dialog).toContainText("вместе с 1 правил(а), 1 пример(ов)");
+  await expect(dialog).toContainText("вместе с 1 правилом, 1 примером");
   await dialog.getByRole("button", { name: "Удалить" }).click();
   await expect(toast(app, "Удалено")).toBeVisible();
   await expect(clauseBlock(app, "2.4")).toHaveCount(0);
-  await expect(orderItem(app, "ПР-01")).toContainText("1 п. · 1 прав.");
+  await expect(orderItem(app, "ПР-01")).toContainText("1 пункт · 1 правило");
 });
 
 test("новый пункт и архив приказа", async ({ app }) => {
@@ -111,12 +111,12 @@ test("новый пункт и архив приказа", async ({ app }) => {
 
 test("ввод экранируется, а не исполняется как HTML", async ({ app }) => {
   await go(app, "Приказы");
-  await app.getByRole("button", { name: "+ Добавить приказ" }).click();
+  await app.getByRole("button", { name: "+ Приказ" }).click();
   await modal(app).getByLabel("Номер").fill("ПР-99");
   await modal(app).getByLabel("Заголовок").fill("<b>жирный</b><img src=x onerror=\"window.__xss=1\">");
   await modal(app).getByRole("button", { name: "Создать" }).click();
   // Созданный приказ сразу открыт.
-  const title = orderDoc(app).locator("h1");
+  const title = orderDoc(app).locator("h2");
   await expect(title).toContainText("ПР-99 · <b>жирный</b>");
   await expect(title.locator("b")).toHaveCount(0);
   await expect(orderDoc(app).locator("img")).toHaveCount(0);
@@ -144,7 +144,7 @@ test("меню действий: одно на экране, шире кнопк
 
 test("пустое обязательное поле не отправляется", async ({ app }) => {
   await go(app, "Приказы");
-  await app.getByRole("button", { name: "+ Добавить приказ" }).click();
+  await app.getByRole("button", { name: "+ Приказ" }).click();
   await modal(app).getByRole("button", { name: "Создать" }).click();
   await expect(toast(app, "Заполните поле «Номер»")).toBeVisible();
 });

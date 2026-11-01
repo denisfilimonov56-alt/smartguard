@@ -5,9 +5,10 @@ import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { scopeSummary } from "../../state/scope";
 import { normalizeQuery, orderMatches } from "../../state/tree";
-import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge } from "../../ui/common";
+import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge, PageHead } from "../../ui/common";
 import { MenuButton, useMenu } from "../../ui/Menu";
 import { useActions } from "../actions";
+import { plural } from "../check/batch";
 
 /* Приказ читается как документ: пункт, под ним правила простыми словами.
    Слева — список приказов, клик по правилу открывает его панель. */
@@ -25,12 +26,16 @@ export function OrdersView() {
 
   return (
     <section id="tab-orders">
+      {/* Шапка — как у остальных разделов: название, пояснение, «+ Приказ» справа. */}
+      <PageHead title="Приказы" sub="Приказ читается как документ: пункты, а под ними правила простыми словами.">
+        {canEdit && <button className="btn primary" onClick={actions.addOrder}>+ Приказ</button>}
+      </PageHead>
       <div className="orders">
         <div>
           <input type="search" className="pill" placeholder="Поиск по приказам…" value={search}
             onChange={(e) => setSearch(e.target.value)} />
           <div className="row between" style={{ margin: "16px 6px 2px" }}>
-            <span className="small mid muted">ПРИКАЗЫ</span>
+            <span className="small muted">{plural(visible.length, ["приказ", "приказа", "приказов"])}</span>
             <label className="check small">
               <input type="checkbox" checked={showArchived}
                 onChange={(e) => void reload({ showArchived: e.target.checked })} /> Архив
@@ -43,19 +48,18 @@ export function OrdersView() {
                 <div className="n">{o.number || "(без номера)"}</div>
                 <div className="mid">{o.title}</div>
                 <div className="small dim" style={{ marginTop: 4 }}>
-                  {o.clauses.length} п. · {o.clauses.reduce((n, c) => n + c.rules.length, 0)} прав.
+                  {plural(o.clauses.length, ["пункт", "пункта", "пунктов"])} · {plural(o.clauses.reduce((n, c) => n + c.rules.length, 0), ["правило", "правила", "правил"])}
                 </div>
               </button>
             ))}
           </div>
           {!visible.length && <div className="dim" style={{ padding: "12px 14px" }}>{search ? "Ничего не найдено." : "Приказов пока нет."}</div>}
-          {canEdit && <button className="btn ghost" style={{ marginTop: 10 }} onClick={actions.addOrder}>+ Добавить приказ</button>}
         </div>
 
         {order ? <OrderDocument order={order} /> : (
           search ? <Empty icon="search" title="Ничего не найдено">Измените запрос или включите архив.</Empty>
             : <Empty icon="list" title="Приказов пока нет"
-              action={canEdit && <button className="btn primary" onClick={actions.addOrder}>+ Добавить приказ</button>}>
+              action={canEdit && <button className="btn primary" onClick={actions.addOrder}>+ Приказ</button>}>
               Приказ — источник пунктов и правил, по которым проверяются цели.
             </Empty>
         )}
@@ -73,7 +77,7 @@ function OrderDocument({ order }: { order: Order }) {
       <div className="row top between">
         <div className="grow">
           <div className="small dim">{order.date ? `Приказ от ${order.date}` : "Приказ"}</div>
-          <h1>{order.number || "(без номера)"} · {order.title}</h1>
+          <h2>{order.number || "(без номера)"} · {order.title}</h2>
           <div className="row" style={{ marginTop: 6 }}>
             <IdBadge value={order.orderId} name="orderId" /><ArchivedBadge status={order.status} />
           </div>

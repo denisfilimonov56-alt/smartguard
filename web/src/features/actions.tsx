@@ -119,19 +119,22 @@ export function useActions() {
 
   const remove = (nodeId: string) => run(async () => {
     const counts = await api.descendants(nodeId);
+    // «вместе с 1 пунктом», «вместе с 3 пунктами»: творительный падеж, единственное число — только на 1, кроме 11.
+    const withCount = (n: number | undefined, one: string, many: string) =>
+      n ? <><b>{n}</b> {n % 10 === 1 && n % 100 !== 11 ? one : many}</> : null;
     const parts = [
-      counts.clauses ? <><b>{counts.clauses}</b> пункт(ов)</> : null,
-      counts.rules ? <><b>{counts.rules}</b> правил(а)</> : null,
-      counts.examples ? <><b>{counts.examples}</b> пример(ов)</> : null,
-      counts.jobDescriptions ? <><b>{counts.jobDescriptions}</b> должностн(ая/ых) инструкци(я/й)</> : null,
+      withCount(counts.clauses, "пунктом", "пунктами"),
+      withCount(counts.rules, "правилом", "правилами"),
+      withCount(counts.examples, "примером", "примерами"),
+      withCount(counts.jobDescriptions, "должностной инструкцией", "должностными инструкциями"),
     ].filter(Boolean);
     const ok = await confirm({
       title: "Удалить навсегда?", danger: true, confirmLabel: "Удалить",
       message: <>
         <p>Узел будет удалён из базы{parts.length ? <> вместе с {parts.map((p, i) =>
           <span key={i}>{i ? ", " : ""}{p}</span>)}</> : null}.</p>
-        <p className="muted">Это необратимо и не требует предварительного архивирования.
-          Если нужно просто отключить узел от проверок — используйте «В архив», это обратимо.</p>
+        <p className="muted">Это необратимо. Отправлять узел в архив перед удалением не нужно.
+          Чтобы только отключить узел от проверок, используйте «В архив» — это обратимо.</p>
       </>,
     });
     if (!ok) return;
@@ -347,7 +350,7 @@ export function useActions() {
         hint: "Написание с пробелом и с подчёркиванием считается одним атрибутом — двойник создать не получится." },
       { name: "description", maxLength: limitOf("CheckTarget", "description"), label: "Описание для модели", type: "textarea", required: true,
         placeholder: "в цели указан проверяемый срок: конкретная дата, месяц, квартал или год",
-        hint: "Это перечисление признаков, по которым модель решает, есть атрибут в цели или нет." },
+        hint: "Перечислите признаки, по которым модель решит, есть ли атрибут в цели." },
       { name: "source", label: "Как определяется", type: "select", value: "", options: SOURCE_OPTIONS,
         hint: SOURCE_HINT },
     ],
