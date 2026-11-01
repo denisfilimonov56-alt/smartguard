@@ -264,6 +264,7 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
     const text = goal.trim();
     if (!text) { toast("Введите формулировку цели", "err"); return false; }
     if (text.length > goalMaxChars) { toast(`Цель длиннее ${goalMaxChars} символов: сократите формулировку`, "err"); return false; }
+    if (!departmentId) { toast("Выберите подразделение: без него проверка не запускается", "err"); return false; }
     if (busyRef.current) return false;
     busyRef.current = true;
     setBusy(true);
@@ -287,7 +288,7 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
     };
     void poll();
     try {
-      const result = await api.checkGoal(text, departmentId || null, isStudent, undefined, checkId);
+      const result = await api.checkGoal(text, departmentId, isStudent, undefined, checkId);
       polling = false;
       // Финальный снимок: все шаги завершены, видно время каждого.
       try {

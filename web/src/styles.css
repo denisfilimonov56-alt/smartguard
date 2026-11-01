@@ -527,8 +527,10 @@ mark.hl:hover::after,mark.hl:focus-visible::after{opacity:1;transform:translate(
 mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible;transition-delay:0s}
 @media (prefers-reduced-motion:reduce){mark.hl::after,mark.hl::before{transition:none}}
 /* Оценка по SMART: пять кругов, доля заполнения — оценка 0–100. */
-.smart{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
-.smart .ring{display:flex;flex-direction:column;align-items:center;text-align:center;width:118px;padding:6px 4px;border-radius:var(--r-md)}
+/* Пять букв — равными колонками на всю ширину ответа; на узкой карточке — по три в ряд. */
+.smart{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:12px}
+.smart .ring{display:flex;flex-direction:column;align-items:center;text-align:center;min-width:0;padding:14px 12px 16px;
+  border-radius:var(--r-md);background:var(--panel-2)}
 .smart .ring svg{width:56px;height:56px;display:block}
 .smart .ring circle{fill:none;stroke-width:5}
 .smart .ring circle.track{stroke:var(--mute-bg)}
@@ -537,16 +539,16 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .smart .ring.ok circle.val,.smart .ring.ok .score{stroke:var(--ok);color:var(--ok)}
 .smart .ring.warn circle.val,.smart .ring.warn .score{stroke:var(--warn);color:var(--warn)}
 .smart .ring.bad circle.val,.smart .ring.bad .score{stroke:var(--danger);color:var(--danger)}
-.smart .name{margin-top:6px;font-size:12px;font-weight:500;color:var(--ink)}
+.smart .name{margin-top:8px;font-size:13px;font-weight:600;color:var(--ink)}
 .smart .score{font-weight:700;margin-left:2px}
-.smart .why{margin-top:2px;font-size:11px;line-height:14px;color:var(--ink-3)}
-.smart.compact .ring{width:72px}
+.smart .why{margin-top:4px;font-size:12px;line-height:16px;color:var(--ink-2)}
+.smart.compact{grid-template-columns:repeat(auto-fit,minmax(72px,1fr))}
 .ico.smart-ico{background:var(--soft);color:var(--brand)}
-/* SMART в конце ответа: строка оценок-меток; «Подробнее» раскрывает круги с пояснениями. */
-.smart-block{padding:14px 0 2px;border-top:1px solid var(--line-soft)}
+/* SMART в конце ответа — всегда целиком: круги с пояснениями. */
+.smart-block{padding:14px 0 2px;border-top:1px solid var(--line-soft);container-type:inline-size}
+@container (max-width:680px){.smart{grid-template-columns:repeat(3,minmax(0,1fr))}}
 .smart-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .smart-head .dim{margin-right:4px}
-.smart-head .btn{margin-left:auto}
 /* Число в круге растёт от нуля: ширина под три цифры, иначе подпись и соседние круги дёргаются. */
 .smart .score{display:inline-block;min-width:3ch;text-align:left;font-variant-numeric:tabular-nums}
 /* Недавние проверки под ответом: формулировка в одну строку, статус, когда, «Повторить». */
@@ -805,8 +807,10 @@ details.tech .dim{margin-top:6px}
 .chart svg{display:block;width:100%;height:auto;margin-top:8px}
 .chart text{font-size:11px;fill:var(--ink-3)}
 .chart .grid{stroke:var(--line-soft)}
-.chart .bar{fill:var(--brand-3)}
-.chart .bar.active{fill:var(--brand)}
+.chart .line{fill:none;stroke:var(--brand);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.chart .area{fill:var(--brand);opacity:.08}
+.chart .hover line{stroke:var(--line)}
+.chart .hover circle{fill:var(--panel);stroke:var(--brand);stroke-width:2}
 .chart-tip{font-size:13px;color:var(--ink-2);min-height:20px}
 .scroll-x{overflow-x:auto}
 th.r,td.r{text-align:right !important;white-space:nowrap}
@@ -1020,7 +1024,8 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .graph-legend > span{display:flex;align-items:center;gap:8px}
 
 /* Правило в справочниках — синяя метка с текстом правила; длинный текст переносится. */
-.rule-badge{white-space:normal;text-align:left;line-height:17px;padding:4px 10px;height:auto}
+/* Многострочная метка — не «таблетка»: скругление как у карточек поменьше; верх текста — вровень с соседними ячейками. */
+.rule-badge{white-space:normal;text-align:left;line-height:18px;padding:4px 10px;height:auto;border-radius:10px;margin-top:-4px}
 .graph-side .graph-link{flex-direction:row;align-items:baseline;gap:10px;margin-top:2px;padding:6px 8px}
 .graph-side .graph-link .dim{flex:none;font-size:13px}
 .issue-fix{margin-left:auto;font-weight:400}

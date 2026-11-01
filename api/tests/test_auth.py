@@ -574,7 +574,7 @@ DEPARTMENT = {"departmentId": "UCT", "name": "УЦТ"}
 def test_role_matrix(app, login, read, check, edit, delete, repair, manage):
     client = client_for(app, login)
     assert client.get("/catalog/tree").status_code == read
-    assert client.post("/check-goal", json={"goal": "цель"}).status_code == check
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == check
     assert client.post("/catalog/departments", json=DEPARTMENT).status_code == edit
     assert client.request("DELETE", "/catalog/nodes/4:db:1").status_code == delete
     assert client.post("/catalog/repair-identifiers").status_code == repair

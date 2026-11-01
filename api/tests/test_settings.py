@@ -160,7 +160,7 @@ def test_unknown_settings_close_service_for_non_admins(admin, outside, monkeypat
     response = outside.get("/catalog/tree", headers=XHR)
     assert response.status_code == 503 and response.json()["detail"] == auth.SETTINGS_UNAVAILABLE
     main.app.dependency_overrides.clear()
-    by_key = outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key))
+    by_key = outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key))
     assert by_key.status_code == 503 and by_key.json()["detail"] == auth.SETTINGS_UNAVAILABLE
 
 
@@ -180,17 +180,17 @@ def test_smart_check_bulk_switch(admin, db):
 def test_goal_max_chars_setting(admin, outside, db):
     """Предел длины цели — настройка: действует сразу на проверку, пакет и /auth/me."""
     assert admin.get("/auth/me").json()["limits"]["goalMaxChars"] == 4000
-    assert admin.post("/check-goal", json={"goal": "ц" * 4000}).status_code == 200
+    assert admin.post("/check-goal", json={"goal": "ц" * 4000, "department_id": "UCT"}).status_code == 200
 
     response = admin.put("/settings", json={"goalMaxChars": 100})
     assert response.status_code == 200 and response.json()["goalMaxChars"] == 100
     assert db.settings == {"goalMaxChars": 100}
     assert admin.get("/auth/me").json()["limits"]["goalMaxChars"] == 100
 
-    assert admin.post("/check-goal", json={"goal": "ц" * 100}).status_code == 200
+    assert admin.post("/check-goal", json={"goal": "ц" * 100, "department_id": "UCT"}).status_code == 200
     # Пробелы по краям в длину не входят — как и до настройки.
-    assert admin.post("/check-goal", json={"goal": "  " + "ц" * 100 + "  "}).status_code == 200
-    too_long = admin.post("/check-goal", json={"goal": "ц" * 101})
+    assert admin.post("/check-goal", json={"goal": "  " + "ц" * 100 + "  ", "department_id": "UCT"}).status_code == 200
+    too_long = admin.post("/check-goal", json={"goal": "ц" * 101, "department_id": "UCT"})
     assert too_long.status_code == 422
     error = too_long.json()["detail"][0]
     assert error["type"] == "string_too_long" and error["ctx"] == {"max_length": 100}
@@ -203,8 +203,8 @@ def test_goal_max_chars_bounds(admin, outside, db):
     for bad in (99, 8001, "4000", 4000.0):
         assert admin.put("/settings", json={"goalMaxChars": bad}).status_code == 422, bad
     assert admin.put("/settings", json={"goalMaxChars": 8000}).status_code == 200
-    assert admin.post("/check-goal", json={"goal": "ц" * 8000}).status_code == 200
-    assert admin.post("/check-goal", json={"goal": "ц" * 8001}).status_code == 422
+    assert admin.post("/check-goal", json={"goal": "ц" * 8000, "department_id": "UCT"}).status_code == 200
+    assert admin.post("/check-goal", json={"goal": "ц" * 8001, "department_id": "UCT"}).status_code == 422
 
 
 def test_number_defaults_come_from_environment(admin, db, monkeypatch):
@@ -466,28 +466,28 @@ def test_bulk_checks_can_be_switched_off(admin, monkeypatch):
     admin.put("/settings", json={"bulkChecks": False})
     batch = [{"goal": "цель", "department_id": "UCT"}]
     assert admin.post("/check-goals", json=batch).status_code == 503
-    assert admin.post("/check-goal", json={"goal": "цель"}).status_code == 200
+    assert admin.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 200
 
 
 def test_api_keys_can_be_switched_off(admin, outside):
     key = admin.post("/settings/api-keys", json={"name": "HR"}).json()["key"]
     admin.put("/settings", json={"apiKeysEnabled": False})
     main.app.dependency_overrides.clear()
-    response = outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key))
+    response = outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key))
     assert response.status_code == 403 and "отключена" in response.json()["detail"]
 
 
 def test_maintenance_leaves_the_service_to_admins(admin, outside, monkeypatch):
     key = admin.post("/settings/api-keys", json={"name": "HR"}).json()["key"]
     admin.put("/settings", json={"maintenance": True})
-    assert admin.post("/check-goal", json={"goal": "цель"}).status_code == 200
+    assert admin.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 200
     assert admin.get("/settings").status_code == 200
 
     main.app.dependency_overrides.clear()
-    by_key = outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key))
+    by_key = outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key))
     assert by_key.status_code == 503 and by_key.headers["Retry-After"]
     main.app.dependency_overrides[auth.current_user] = lambda: auth.Principal("ed", "editor")
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=XHR).status_code == 503
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=XHR).status_code == 503
     assert outside.get("/catalog/tree", headers=XHR).status_code == 503
     assert outside.get("/auth/me", headers=XHR).status_code == 200, "интерфейс должен узнать, кто вошёл"
     main.app.dependency_overrides.clear()
@@ -530,7 +530,7 @@ def test_key_checks_goals_without_session_or_csrf_header(admin, outside):
     key = admin.post("/settings/api-keys", json={"name": "HR"}).json()["key"]
     main.app.dependency_overrides.clear()
 
-    single = outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key))
+    single = outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key))
     assert single.status_code == 200 and single.json()["status"] == "ALLOWED"
     many = outside.post("/check-goals", json=[{"goal": "цель", "department_id": "UCT"}], headers=bearer(key))
     assert many.status_code == 200 and len(many.json()["results"]) == 1
@@ -551,13 +551,13 @@ def test_key_actor_reaches_history(admin, outside, monkeypatch):
     main.app.dependency_overrides.clear()
     seen = []
     monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None: seen.append(metrics.actor()) or ANSWER)
-    outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key))
+    outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key))
     assert seen == ["key:HR"]
 
 
 @pytest.mark.parametrize("token", ["", "gc_deadbeef_" + "x" * 43, "not a key at all", "gc_zz"])
 def test_wrong_key_is_rejected(outside, token):
-    response = outside.post("/check-goal", json={"goal": "цель"}, headers={"Authorization": f"Bearer {token}"})
+    response = outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers={"Authorization": f"Bearer {token}"})
     assert response.status_code in (401, 403)
     assert response.json().get("status") != "ALLOWED"
 
@@ -566,25 +566,25 @@ def test_tampered_secret_is_rejected(admin, outside):
     key = admin.post("/settings/api-keys", json={"name": "HR"}).json()["key"]
     main.app.dependency_overrides.clear()
     forged = key[:-1] + ("A" if key[-1] != "A" else "B")
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(forged)).status_code == 401
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(forged)).status_code == 401
 
 
 def test_revoked_key_stops_working_at_once(admin, outside):
     created = admin.post("/settings/api-keys", json={"name": "HR"}).json()
     main.app.dependency_overrides.clear()
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(created["key"])).status_code == 200
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(created["key"])).status_code == 200
 
     main.app.dependency_overrides[auth.current_user] = lambda: auth.Principal("root", "admin")
     assert admin.delete(f"/settings/api-keys/{created['keyId']}").json() == {"deleted": created["keyId"]}
     assert admin.delete(f"/settings/api-keys/{created['keyId']}").status_code == 404
     main.app.dependency_overrides.clear()
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(created["key"])).status_code == 401
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(created["key"])).status_code == 401
 
 
 def test_last_use_is_recorded(admin, outside, db):
     created = admin.post("/settings/api-keys", json={"name": "HR"}).json()
     main.app.dependency_overrides.clear()
-    outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(created["key"]))
+    outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(created["key"]))
     assert db.keys[created["keyId"]].get("lastUsedAt")
 
 
@@ -592,7 +592,7 @@ def test_unknown_key_ids_do_not_grow_memory_or_evict_real_keys(admin, outside, d
     """Поток выдуманных keyId: память ограничена, настоящий ключ остаётся в кэше."""
     key = admin.post("/settings/api-keys", json={"name": "HR"}).json()["key"]
     main.app.dependency_overrides.clear()
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(key)).status_code == 200
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(key)).status_code == 200
     for n in range(apikeys.MISS_CACHE_MAX * 3):
         assert apikeys.resolve(f"gc_{n:08x}_" + "x" * 30) is None
     assert len(apikeys._misses) <= apikeys.MISS_CACHE_MAX
@@ -623,7 +623,7 @@ def test_rate_limit_counts_goals_per_caller(admin, outside, monkeypatch):
     assert outside.post("/check-goals", json=batch, headers=bearer(first)).status_code == 200
     limited = outside.post("/check-goals", json=batch, headers=bearer(first))
     assert limited.status_code == 429 and int(limited.headers["Retry-After"]) > 0
-    assert outside.post("/check-goal", json={"goal": "цель"}, headers=bearer(first)).status_code == 200
+    assert outside.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}, headers=bearer(first)).status_code == 200
     assert outside.post("/check-goals", json=batch, headers=bearer(second)).status_code == 200, "у каждого свой счёт"
 
 

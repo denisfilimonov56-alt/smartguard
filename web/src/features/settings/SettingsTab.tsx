@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../../api/client";
 import type { ApiKey, ApiKeyCreated, CacheId, CacheStats, Settings } from "../../api/types";
@@ -210,6 +210,7 @@ function Detail({ short, text }: { short: string; text: string }) {
 
 export function SettingsTab() {
   const [tocActive, setTocActive] = useState(0);
+  const tocRef = useRef<HTMLElement>(null);
   const { openForm, confirm } = useDialogs();
   const toast = useToast();
   const { departments } = useCatalog();
@@ -261,6 +262,40 @@ export function SettingsTab() {
   }
 
   useEffect(() => { void load(); }, [load]);
+
+  // Оглавление следит за прокруткой: подсвечен блок, чей заголовок последним ушёл под верх области.
+  // После щелчка по пункту он держится до ручной прокрутки — иначе последние короткие блоки,
+  // до которых не доскроллить, перебивал бы предпоследний.
+  const ready = state.kind === "ready";
+  const pinned = useRef<number | null>(null);
+  useEffect(() => {
+    if (!ready) return;
+    const scroller = tocRef.current?.closest<HTMLElement>(".main") ?? null;
+    const target: HTMLElement | Window = scroller ?? window;
+    const count = GROUPS.length + 2;
+    const update = () => {
+      if (pinned.current !== null) { setTocActive(pinned.current); return; }
+      const top = (scroller?.getBoundingClientRect().top ?? 0) + 120;
+      const atBottom = scroller
+        ? scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4
+        : window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4;
+      let active = 0;
+      for (let i = 0; i < count; i++) {
+        const el = document.getElementById(`settings-${i}`);
+        if (el && el.getBoundingClientRect().top <= top) active = i;
+      }
+      setTocActive(atBottom ? count - 1 : active);
+    };
+    const release = () => { pinned.current = null; };
+    const input = ["wheel", "touchmove", "keydown"] as const;
+    target.addEventListener("scroll", update, { passive: true });
+    for (const type of input) target.addEventListener(type, release, { passive: true });
+    update();
+    return () => {
+      target.removeEventListener("scroll", update);
+      for (const type of input) target.removeEventListener(type, release);
+    };
+  }, [ready]);
 
   /** Сохранить настройку; ответ — значение на сервере после сохранения, null — ошибка. */
   async function save<K extends keyof Settings>(key: K, value: Settings[K]): Promise<Settings[K] | null> {
@@ -331,10 +366,10 @@ export function SettingsTab() {
       {state.kind === "ready" && (
         <div className="settings-layout">
           {/* Оглавление: щелчок прокручивает к группе. */}
-          <nav className="settings-toc" aria-label="Группы настроек">
+          <nav className="settings-toc" aria-label="Группы настроек" ref={tocRef}>
             {[...GROUPS.map((g) => g.title), "Кэш проверки", "Ключи API"].map((title, i) => (
               <a key={title} href={`#settings-${i}`} aria-current={tocActive === i ? "true" : undefined}
-                onClick={(e) => { e.preventDefault(); setTocActive(i);
+                onClick={(e) => { e.preventDefault(); pinned.current = i; setTocActive(i);
                   document.getElementById(`settings-${i}`)?.scrollIntoView({ behavior: "smooth", block: "start" }); }}>
                 {title}
               </a>

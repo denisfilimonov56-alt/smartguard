@@ -50,7 +50,7 @@ def _blank_as_none(value: Any) -> Any:
 # срезаются, длина ограничена — строка уходит в ключ кэша ответов и в notes.
 DepartmentId = Annotated[str, BeforeValidator(_id_as_text),
                          StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-# Необязательное подразделение (/check-goal, советчик): пустая строка — None.
+# Необязательное подразделение (советчик): пустая строка — None.
 OptionalDepartmentId = Annotated[Optional[DepartmentId], BeforeValidator(_blank_as_none)]
 
 

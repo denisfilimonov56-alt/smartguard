@@ -139,13 +139,14 @@ export async function openRule(page: Page, rule: string) {
 }
 
 /** Проверить цель на главном экране; возвращает карточку результата. */
-export async function check(page: Page, goal: string, department: string | null = null, student = false) {
+/** Подразделение обязательно — по умолчанию UCT, где действуют все правила примера. */
+export async function check(page: Page, goal: string, department = "UCT", student = false) {
   await go(page, "Проверка цели");
   // После ответа ввод свёрнут в строку — раскрываем его кнопкой «Изменить».
   const summary = page.locator("#goalSummary");
   if (await summary.count()) await summary.getByRole("button", { name: "Изменить" }).click();
   await page.getByLabel("Формулировка цели").fill(goal);
-  await choose(page.locator("#departmentInput"), { value: department ?? "" });
+  await choose(page.locator("#departmentInput"), { value: department });
   await page.locator("#studentInput").setChecked(student);
   await page.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
   return page.locator("#checkResult");

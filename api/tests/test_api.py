@@ -110,7 +110,7 @@ def test_queue_timeout_is_503_with_retry_after(client, monkeypatch):
     monkeypatch.setattr(agent.settings, "_read", lambda: {"smartCheck": False})
     monkeypatch.setattr(metrics.gate, "acquire", lambda bulk, timeout=None: (_ for _ in ()).throw(
         metrics.QueueTimeout(120)))
-    response = client.post("/check-goal", json={"goal": "цель"})
+    response = client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"})
     assert response.status_code == 503 and response.headers["Retry-After"] == "30"
     assert "перегружена" in response.json()["detail"]
 
@@ -158,7 +158,7 @@ def test_check_resets_actor_after_request(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None:
                         seen.setdefault("actor", metrics.actor()) and {"status": "ALLOWED"})
-    client.post("/check-goal", json={"goal": "цель"})
+    client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"})
     assert seen["actor"] == "tester"
     assert metrics.actor() is None
 
@@ -304,10 +304,10 @@ def test_repair_identifiers(client, monkeypatch):
 def test_check_goal_passes_through(client, monkeypatch):
     monkeypatch.setattr(main, "check_goal", lambda goal, department_id=None, is_student=None: {
         "goal": goal, "status": "ALLOWED", "allowed": True, "seen_department": department_id})
-    response = client.post("/check-goal", json={"goal": "цель"})
+    response = client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"})
     assert response.status_code == 200
     assert response.json()["allowed"] is True
-    assert response.json()["seen_department"] is None, "в одиночной проверке подразделение необязательно"
+    assert response.json()["seen_department"] == "UCT"
 
 
 def test_suggest_goal_returns_model_text_and_maps_failures(client, monkeypatch):
@@ -333,12 +333,21 @@ def test_check_goal_passes_department(client, monkeypatch):
     assert response.json()["seen_department"] == "UCT"
 
 
-def test_check_goal_department_is_limited_and_blank_is_none(client, monkeypatch):
+def test_check_goal_requires_department(client, monkeypatch):
+    """Подразделение обязательно, как и в пакете: без поля, пустое или из пробелов — 422."""
+    monkeypatch.setattr(main, "check_goal",
+                        lambda goal, department_id=None, is_student=None: {"seen_department": department_id})
+    assert client.post("/check-goal", json={"goal": "цель"}).status_code == 422
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": None}).status_code == 422
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": ""}).status_code == 422
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": "  "}).status_code == 422
+
+
+def test_check_goal_department_is_limited_and_trimmed(client, monkeypatch):
     monkeypatch.setattr(main, "check_goal",
                         lambda goal, department_id=None, is_student=None: {"seen_department": department_id})
     assert client.post("/check-goal", json={"goal": "цель", "department_id": "x" * 101}).status_code == 422
-    response = client.post("/check-goal", json={"goal": "цель", "department_id": "  "})
-    assert response.json()["seen_department"] is None
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": 42}).json()["seen_department"] == "42"
     response = client.post("/check-goal", json={"goal": "цель", "department_id": " UCT "})
     assert response.json()["seen_department"] == "UCT"
 
@@ -348,9 +357,9 @@ def test_check_goal_requires_goal_field(client):
 
 
 @pytest.mark.parametrize("payload,expected", [
-    ({"goal": "цель"}, None),
-    ({"goal": "цель", "is_student": True}, True),
-    ({"goal": "цель", "is_student": False}, False),
+    ({"goal": "цель", "department_id": "UCT"}, None),
+    ({"goal": "цель", "department_id": "UCT", "is_student": True}, True),
+    ({"goal": "цель", "department_id": "UCT", "is_student": False}, False),
 ])
 def test_check_goal_passes_student_flag(client, monkeypatch, payload, expected):
     monkeypatch.setattr(main, "check_goal",
@@ -359,7 +368,7 @@ def test_check_goal_passes_student_flag(client, monkeypatch, payload, expected):
 
 
 def test_check_goal_rejects_non_boolean_student_flag(client):
-    assert client.post("/check-goal", json={"goal": "цель", "is_student": "студент"}).status_code == 422
+    assert client.post("/check-goal", json={"goal": "цель", "is_student": "студент", "department_id": "UCT"}).status_code == 422
 
 
 # --------------------------- пакетная проверка ------------------------------

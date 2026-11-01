@@ -49,10 +49,10 @@ test("после проверки формулировка остаётся в �
   await expect(app.locator("#goalInput")).toHaveCount(0);
   await expect(app.locator("#tab-check .hero").getByRole("button", { name: "Проверить" })).toBeVisible();
 
-  // SMART свёрнут в строку оценок; «Подробнее» раскрывает пять кругов: срок в цели назван, значимость не видна.
-  await expect(result.locator("#checkSmart")).toHaveCount(0);
-  await result.locator(".smart-block").getByRole("button", { name: "Подробнее" }).click();
+  // SMART всегда целиком — пять кругов с пояснениями, без «Подробнее»: срок в цели назван, значимость не видна.
+  await expect(result.locator(".smart-block button")).toHaveCount(0);
   const smart = result.locator("#checkSmart .ring");
+  await expect(smart.locator(".why")).toHaveCount(5);
   await expect(smart).toHaveCount(5);
   await expect(smart.filter({ hasText: "В срок" })).toHaveClass(/\bok\b/);
   await expect(smart.filter({ hasText: "Значимая" })).toHaveClass(/\bbad\b/);
@@ -89,10 +89,18 @@ test("после правки формулировки прежний ответ
   await expect(app.locator("#checkResult")).toHaveCount(0);
 });
 
-test("без подразделения применяются все правила, причина — в заметках", async ({ app }) => {
-  const result = await check(app, "Улучшить работу с заявками");
-  await expect(result.getByText(/Подразделение не передано: применены все правила/)).toBeVisible();
-  await expect(result.locator(".violation")).toHaveCount(2);
+test("без подразделения проверка не запускается", async ({ app }) => {
+  await go(app, "Проверка цели");
+  await app.getByLabel("Формулировка цели").fill("Улучшить работу с заявками");
+  const run = app.locator("#tab-check").getByRole("button", { name: "Проверить" });
+  await expect(run).toBeDisabled();
+  await expect(app.locator("#tab-check .hero")).toContainText("без него проверка не запускается");
+  // Ctrl+Enter тоже не отправляет.
+  await app.getByLabel("Формулировка цели").press("Control+Enter");
+  await expect(toast(app, "Выберите подразделение: без него проверка не запускается")).toBeVisible();
+  await expect(app.locator("#checkResult")).toHaveCount(0);
+  await choose(app.locator("#departmentInput"), { value: "UCT" });
+  await expect(run).toBeEnabled();
 });
 
 test("правило «только в» не применяется к другому подразделению", async ({ app }) => {
@@ -140,6 +148,7 @@ test("главный экран показывает, что ждёт решен
 });
 
 test("пустая цель не отправляется", async ({ app }) => {
+  await choose(app.locator("#departmentInput"), { value: "UCT" });
   await app.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
   await expect(toast(app, "Введите формулировку цели")).toBeVisible();
 });

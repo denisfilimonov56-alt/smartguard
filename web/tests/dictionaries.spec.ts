@@ -163,7 +163,7 @@ test("архивное подразделение уходит из провер
   await menu(departmentRow(app, "FIN"), "В архив");
   await expect(departmentRow(app, "FIN")).toHaveCount(0);
   await go(app, "Проверка цели");
-  expect(await optionsOf(app.locator("#departmentInput"))).toEqual(["Подразделение не указано", "АГД", "УЦТ"]);
+  expect(await optionsOf(app.locator("#departmentInput"))).toEqual(["Выберите подразделение", "АГД", "УЦТ"]);
   await go(app, "Правила");
   await expect(app.locator("#tab-rules thead th")).toHaveText(["Правило", "АГД", "УЦТ"]);
 });
