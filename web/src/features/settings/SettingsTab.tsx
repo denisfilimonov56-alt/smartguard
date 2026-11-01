@@ -136,27 +136,34 @@ const GROUPS: { title: string; sub: string; items: Item[] }[] = [
   },
 ];
 
-/** Кэши проверки, которые очищаются по отдельности; scoped — можно очистить для одного подразделения. */
-const CACHES: { id: CacheId; title: string; detail: string; scoped?: boolean; confirm?: boolean }[] = [
+/** Кэши проверки, которые очищаются по отдельности; scoped — можно очистить для одного подразделения.
+ *  consequence — что будет после очистки, для окна подтверждения. */
+const CACHES: { id: CacheId; title: string; detail: string; consequence: string; scoped?: boolean }[] = [
   {
     id: "results", title: "Ответы проверок", scoped: true,
     detail: "Готовые ответы на уже проверенные цели. Очистите, когда нужен свежий ответ модели на те же "
       + "формулировки — например, после правки базы в обход сервиса.",
+    consequence: "Готовые ответы удалятся. Цели, которые уже проверяли, модель проверит заново — "
+      + "первые проверки после очистки будут медленнее.",
   },
   {
     id: "jobDescriptions", title: "Должностные инструкции", scoped: true,
     detail: "Инструкции подразделений и правила на них, прочитанные из графа для проверки. "
       + "Очистите, если инструкции поменяли в обход интерфейса, а ждать срока кэша не хочется.",
+    consequence: "Инструкции и правила на них перечитаются из графа при следующей проверке.",
   },
   {
-    id: "smart", title: "Оценки по SMART", confirm: true,
+    id: "smart", title: "Оценки по SMART",
     detail: "Оценки формулировок в памяти и в графе. После очистки модель оценит каждую цель заново — "
       + "это ещё один запрос к модели на каждую проверку.",
+    consequence: "Оценки удалятся и из памяти, и из графа. Модель оценит каждую цель заново при следующей "
+      + "проверке — по одному дополнительному запросу на цель.",
   },
   {
     id: "lookups", title: "Справочники каталога",
     detail: "Настройки и примеры для промпта, которые проверка держит под рукой до минуты. "
       + "Очистка заставляет перечитать их из графа сразу.",
+    consequence: "Настройки и примеры для промпта перечитаются из графа при следующей проверке.",
   },
 ];
 
@@ -238,18 +245,15 @@ export function SettingsTab() {
 
   async function clearCache(item: (typeof CACHES)[number]) {
     const scopedTo = item.scoped && cacheDepartment ? cacheDepartment : undefined;
-    if (item.confirm) {
-      const ok = await confirm({
-        title: `Очистить «${item.title}»?`, danger: true, confirmLabel: "Очистить",
-        message: <p>Оценки удалятся и из памяти, и из графа. Модель оценит каждую цель заново при следующей
-          проверке — по одному дополнительному запросу на цель.</p>,
-      });
-      if (!ok) return;
-    }
+    const where = scopedTo ? ` для «${cacheDepartmentName ?? scopedTo}»` : "";
+    const ok = await confirm({
+      title: `Очистить «${item.title}»${where}?`, danger: true, confirmLabel: "Очистить",
+      message: <p>{item.consequence}</p>,
+    });
+    if (!ok) return;
     setClearing(item.id);
     try {
       const done = await api.clearCache(item.id, scopedTo);
-      const where = scopedTo ? ` для «${cacheDepartmentName ?? scopedTo}»` : "";
       const stored = done.stored === null ? "" : `, оценок в графе: ${done.stored}`;
       toast(`Кэш «${item.title}» очищен${where}: записей ${done.entries}${stored}`, "ok");
       const { caches } = await api.caches();
