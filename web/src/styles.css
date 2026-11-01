@@ -786,6 +786,8 @@ details.tech .dim{margin-top:6px}
 .chart .hover circle{fill:var(--panel);stroke:var(--brand);stroke-width:2}
 .chart-tip{font-size:13px;color:var(--ink-2);min-height:20px}
 .scroll-x{overflow-x:auto}
+/* Цель в истории: слово без пробелов переносится где угодно, а не растягивает колонку. */
+td.goal-cell{overflow-wrap:anywhere;min-width:240px}
 th.r,td.r{text-align:right !important;white-space:nowrap}
 .meter{height:8px;border-radius:4px;background:var(--line-soft);overflow:hidden;margin-bottom:4px}
 .meter span{display:block;height:100%;background:var(--brand);border-radius:4px}
