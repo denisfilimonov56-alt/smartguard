@@ -5,26 +5,31 @@ import type { CheckResult, GraphEdge, GraphNode, NodeKind } from "../../api/type
 import { useCatalog } from "../../state/catalog";
 import { attributeTitle, Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
 import { errorText } from "../../ui/Toasts";
-import { layoutGraph } from "./layout";
+import { type Box, layoutColumns } from "./layout";
 
 /* Каталог как граф: приказы, пункты, правила, атрибуты, подразделения и
    должностные инструкции со связями между ними. Только просмотр — правка
-   остаётся в разделах. Цвет узла — его тип; тип продублирован в легенде и
-   в карточке узла, так что цвет не единственный признак.
+   остаётся в разделах.
+
+   Узлы стоят колонками слева направо — так, как одно следует из другого:
+   приказ → пункт → правило → атрибут и подразделение. Узел — карточка с
+   названием и второй строкой (название приказа, номер правила); тип узла
+   назван заголовком колонки, цветная точка его только дублирует. Наведение
+   или выбор узла подсвечивает всю его цепочку: откуда он и что из него следует.
 
    Трассировка проверки открывается с экрана проверки («Показать на графе»):
-   цель появляется узлом, и от неё шаг за шагом проявляется путь — найденные
-   атрибуты, сработавшие правила, их пункты и приказы. Роль узла в проверке
-   показана цветом обводки и значком (✓ ✕ –). */
+   цель появляется узлом справа, и от неё шаг за шагом проявляется путь —
+   найденные атрибуты, сработавшие правила, их пункты и приказы. Роль узла
+   в проверке показана цветом обводки и значком (✓ ✕). */
 
-const KINDS: { kind: NodeKind; name: string; color: string; r: number }[] = [
-  { kind: "Order", name: "Приказы", color: "#0c6ff1", r: 11 },
-  { kind: "Clause", name: "Пункты", color: "#eb6834", r: 8 },
-  { kind: "Rule", name: "Правила", color: "#1baf7a", r: 8 },
-  { kind: "CheckTarget", name: "Атрибуты", color: "#eda100", r: 8 },
-  { kind: "Department", name: "Подразделения", color: "#e87ba4", r: 10 },
-  { kind: "JobDescription", name: "Должностные инструкции", color: "#008300", r: 7 },
-  { kind: "ViolationExample", name: "Примеры", color: "#4a3aa7", r: 6 },
+const KINDS: { kind: NodeKind; name: string; color: string; col: number; band: number }[] = [
+  { kind: "Order", name: "Приказы", color: "#0c6ff1", col: 0, band: 0 },
+  { kind: "Clause", name: "Пункты", color: "#eb6834", col: 1, band: 0 },
+  { kind: "Rule", name: "Правила", color: "#1baf7a", col: 2, band: 0 },
+  { kind: "CheckTarget", name: "Атрибуты", color: "#eda100", col: 3, band: 0 },
+  { kind: "Department", name: "Подразделения", color: "#e87ba4", col: 3, band: 1 },
+  { kind: "ViolationExample", name: "Примеры", color: "#4a3aa7", col: 3, band: 2 },
+  { kind: "JobDescription", name: "Должностные инструкции", color: "#008300", col: 4, band: 0 },
 ];
 const KIND = Object.fromEntries(KINDS.map((k) => [k.kind, k])) as Record<NodeKind, (typeof KINDS)[number]>;
 const KIND_ONE: Record<NodeKind, string> = {
@@ -38,7 +43,13 @@ const EDGE_NAMES: Record<string, string> = {
 };
 /** Разделы каталога, куда можно перейти от узла. */
 const OPENABLE: NodeKind[] = ["Order", "Clause", "Rule", "ViolationExample", "CheckTarget", "Department"];
-const LABELS_ALWAYS = 120;   // при большем числе узлов подписи — только у крупных и выделенных
+/** Ширина карточек колонки: у правил текст длиннее всего; последняя колонка — цель проверки. */
+const WIDTHS: Record<number, number> = { 0: 160, 1: 180, 2: 280, 3: 200, 4: 220, 5: 96 };
+const NODE_H = 46;
+const GOAL_COL = 5;
+/** Поля вокруг схемы и место над ней под заголовки колонок, px схемы. */
+const PAD = 32;
+const HEAD = 36;
 
 const GOAL = "__goal";
 /** Роль узла или связи в проверке: найдено / нарушение / просто на пути. */
@@ -117,9 +128,12 @@ function buildTrace(result: CheckResult, nodes: GraphNode[], edges: GraphEdge[])
 
 type LoadState = { kind: "loading" } | { kind: "error"; message: string }
   | { kind: "ready"; nodes: GraphNode[]; edges: GraphEdge[] };
+/** Сдвиг схемы в пикселях холста и масштаб. */
 interface View { x: number; y: number; scale: number }
 
 const short = (text: string, max = 22) => (text.length > max ? text.slice(0, max - 1) + "…" : text);
+/** Сколько знаков влезает в строку карточки шириной w: Inter 13px — около 7px на знак. */
+const clip = (text: string, w: number, px = 7) => short(text, Math.max(6, Math.floor((w - 40) / px)));
 
 /** Правило на графе — без общего начала «Цель обязана содержать…»: иначе обрезанные подписи не различить. */
 const ruleShort = (text: string) => {
@@ -133,11 +147,63 @@ const nameOf = (n: GraphNode) =>
     : n.label === "Clause" ? `п. ${n.title}`
     : n.label === "CheckTarget" ? attributeTitle(n.title) : n.title;
 
+/** Вторая строка карточки: название приказа, текст пункта, номер и вид правила. */
+const subOf = (n: GraphNode) =>
+  n.label === "Rule" ? [n.title, n.type === "PROHIBITION" ? "запрет" : n.type ? "требование" : ""].filter(Boolean).join(" · ")
+    : n.label === "JobDescription" ? "" : n.detail;
+
+/** Связь карточек — плавная кривая от краёв, обращённых друг к другу; внутри колонки — дуга справа. */
+function curve(a: Box, b: Box): string {
+  if (a.col === b.col) {
+    const x = a.x + a.w;
+    const bend = 28 + Math.min(80, Math.abs(b.y - a.y) * 0.2);
+    return `M${x} ${a.y} C${x + bend} ${a.y} ${x + bend} ${b.y} ${x} ${b.y}`;
+  }
+  const forward = a.col < b.col;
+  const x1 = forward ? a.x + a.w : a.x;
+  const x2 = forward ? b.x : b.x + b.w;
+  const mid = (x1 + x2) / 2;
+  return `M${x1} ${a.y} C${mid} ${a.y} ${mid} ${b.y} ${x2} ${b.y}`;
+}
+
+/** Связи «вниз» по каталогу: приказ → пункт → правило → атрибут, подразделение, пример, инструкция. */
+const DOWN = new Set(["CONTAINS", "DEFINES", "APPLIES_TO", "ONLY_IN", "HAS_EXAMPLE", "HAS_JOB_DESCRIPTION"]);
+
+/** Цепочка узла: из чего он следует, что следует из него, и прямые соседи (ссылки между пунктами). */
+function lineage(focus: string, edges: GraphEdge[]) {
+  const down = new Map<string, GraphEdge[]>();
+  const up = new Map<string, GraphEdge[]>();
+  for (const e of edges) if (DOWN.has(e.type)) {
+    down.set(e.source, [...(down.get(e.source) ?? []), e]);
+    up.set(e.target, [...(up.get(e.target) ?? []), e]);
+  }
+  const ids = new Set([focus]);
+  const keys = new Set<string>();
+  const walk = (index: Map<string, GraphEdge[]>, end: (e: GraphEdge) => string) => {
+    const seen = new Set([focus]);
+    for (let queue = [focus]; queue.length;)
+      for (const e of index.get(queue.shift()!) ?? []) {
+        keys.add(edgeKey(e.source, e.target));
+        const other = end(e);
+        ids.add(other);
+        if (!seen.has(other)) { seen.add(other); queue.push(other); }
+      }
+  };
+  walk(up, (e) => e.source);
+  walk(down, (e) => e.target);
+  for (const e of edges) if (e.source === focus || e.target === focus) {
+    keys.add(edgeKey(e.source, e.target)); ids.add(e.source); ids.add(e.target);
+  }
+  return { ids, keys };
+}
+
 export function GraphTab() {
   const { goToNode, trace: traced, setTrace } = useCatalog();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [off, setOff] = useState<Set<NodeKind>>(() => new Set<NodeKind>(["ViolationExample"]));
   const [archived, setArchived] = useState(false);
+  // При трассировке по умолчанию виден только путь проверки: остальной каталог — по флажку.
+  const [onlyPath, setOnlyPath] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   // Поиск узла по названию: Enter переходит к следующему найденному.
   const [query, setQuery] = useState("");
@@ -146,8 +212,7 @@ export function GraphTab() {
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 1 });
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const box = useRef<HTMLDivElement>(null);
-  // Размер холста: от него зависит, во сколько раз вписанный граф уменьшен, а значит — размер подписей.
-  const [boxSize, setBoxSize] = useState({ w: 800, h: 560 });
+  const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
   useEffect(() => {
     const el = box.current;
     if (!el) return;
@@ -178,39 +243,65 @@ export function GraphTab() {
     () => (traced && state.kind === "ready" ? buildTrace(traced, state.nodes, state.edges) : null),
     [traced, state]);
 
-  // Раскладка — один раз на весь граф (со всеми типами и архивом): кнопки типов и флажок
-  // «Архив» только скрывают узлы, а не пересчитывают O(n²) раскладку на основном потоке.
-  const layout = useMemo(() => (state.kind !== "ready" ? null : layoutGraph(
-    [...state.nodes.map((n) => n.id), ...(trace ? [GOAL] : [])],
-    [...state.edges.map((e): [string, string] => [e.source, e.target]),
-      ...(trace?.goalEdges ?? []).map((e): [string, string] => [GOAL, e.target])])), [state, trace]);
-
+  // Раскладка колонками линейна по числу узлов и связей, поэтому пересчитывается
+  // на каждый фильтр: скрытые типы не оставляют пустых мест.
   const graph = useMemo(() => {
-    if (state.kind !== "ready" || !layout) return null;
+    if (state.kind !== "ready") return null;
+    const visible = (n: GraphNode) => !off.has(n.label) && (archived || n.status !== "archived");
     // Узлы на пути проверки видны всегда, даже если их тип выключен.
-    const nodes = state.nodes.filter((n) => trace?.nodes.has(n.id)
-      || (!off.has(n.label) && (archived || n.status !== "archived")));
+    const nodes = state.nodes.filter((n) => trace?.nodes.has(n.id) || ((!trace || !onlyPath) && visible(n)));
     const shown = new Set(nodes.map((n) => n.id));
     const edges = state.edges.filter((e) => shown.has(e.source) && shown.has(e.target));
     const goalEdges = (trace?.goalEdges ?? []).filter((e) => shown.has(e.target));
-    const positions = layout;
-    // Рамка — по видимым узлам: скрытые не оставляют пустых полей по краям.
-    const points = [...nodes.map((n) => layout.get(n.id)!), ...(trace ? [layout.get(GOAL)!] : [])];
-    const pad = 80;
-    const minX = Math.min(...points.map((p) => p.x), 0) - pad;
-    const minY = Math.min(...points.map((p) => p.y), 0) - pad;
-    // Справа запас больше: подписи узлов стоят правее точки.
-    const width = Math.max(...points.map((p) => p.x), 0) + pad + 90 - minX;
-    const height = Math.max(...points.map((p) => p.y), 0) + pad - minY;
-    // Вписанный в холст граф уменьшен: точки и подписи растут обратно, чтобы на экране
-    // подпись оставалась около 13px, а точка — заметной.
-    const fit = Math.min(boxSize.w / width, boxSize.h / height);
-    const k = Math.min(4, Math.max(1, 1 / fit));
-    return { nodes, edges, goalEdges, positions, k, viewBox: { minX, minY, width, height }, byId: new Map(nodes.map((n) => [n.id, n])) };
-  }, [state, layout, off, archived, trace, boxSize]);
+    const layout = layoutColumns(
+      [...nodes.map((n) => ({ id: n.id, col: KIND[n.label].col, band: KIND[n.label].band, key: n.title, h: NODE_H })),
+        ...(trace ? [{ id: GOAL, col: GOAL_COL, band: 0, key: "", h: NODE_H }] : [])],
+      [...edges.map((e): [string, string] => [e.source, e.target]),
+        ...goalEdges.map((e): [string, string] => [GOAL, e.target])],
+      WIDTHS);
+    return { nodes, edges, goalEdges, layout, byId: new Map(nodes.map((n) => [n.id, n])) };
+  }, [state, off, archived, trace, onlyPath]);
 
-  // Новая трассировка — показать граф целиком. Обновление данных масштаб не трогает.
-  useEffect(() => { setView({ x: 0, y: 0, scale: 1 }); }, [traced]);
+  /** Показать схему: целиком, если она так читается; иначе — по ширине, с начала. */
+  const fitView = useCallback((whole: boolean) => {
+    if (!graph || !boxSize.w) return;
+    const width = graph.layout.width + PAD * 2;
+    const height = graph.layout.height + HEAD + PAD * 2;
+    const all = Math.min(1, boxSize.w / width, boxSize.h / height);
+    const scale = whole || all >= 0.6 ? all : Math.min(1, boxSize.w / width);
+    setView({
+      scale,
+      x: (boxSize.w - width * scale) / 2 + PAD * scale,
+      y: height * scale <= boxSize.h ? (boxSize.h - height * scale) / 2 + (PAD + HEAD) * scale : (PAD + HEAD) * scale,
+    });
+  }, [graph, boxSize]);
+  // Другой набор узлов — показать его заново. Обновление данных масштаб не трогает.
+  const ready = !!graph && boxSize.w > 0;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (ready) fitView(false); }, [ready, traced, off, archived, onlyPath]);
+
+  const zoomAt = (factor: number, cx: number, cy: number) => setView((v) => {
+    const scale = Math.min(2.5, Math.max(0.15, v.scale * factor));
+    const k = scale / v.scale;
+    return { scale, x: cx - (cx - v.x) * k, y: cy - (cy - v.y) * k };
+  });
+  const zoom = (factor: number) => zoomAt(factor, boxSize.w / 2, boxSize.h / 2);
+
+  // Колесо прокручивает схему, с Ctrl (и щипок на тачпаде) — масштабирует под курсором.
+  // Обработчик не пассивный: иначе вместе со схемой прокрутилась бы страница.
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) {
+        const rect = el.getBoundingClientRect();
+        zoomAt(Math.exp(-e.deltaY * 0.01), e.clientX - rect.left, e.clientY - rect.top);
+      } else setView((v) => ({ ...v, x: v.x - (e.shiftKey ? e.deltaY : e.deltaX), y: v.y - (e.shiftKey ? 0 : e.deltaY) }));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [ready]);
 
   const counts = useMemo(() => {
     const result = new Map<NodeKind, number>();
@@ -220,16 +311,9 @@ export function GraphTab() {
     return result;
   }, [state, archived]);
 
-  const neighbours = useMemo(() => {
-    const focus = hover?.id ?? selected;
-    if (!graph || !focus) return null;
-    const ids = new Set([focus]);
-    for (const e of graph.edges) {
-      if (e.source === focus) ids.add(e.target);
-      if (e.target === focus) ids.add(e.source);
-    }
-    return ids;
-  }, [graph, hover, selected]);
+  const focus = hover?.id ?? selected;
+  const lit = useMemo(
+    () => (graph && focus && graph.byId.has(focus) ? lineage(focus, graph.edges) : null), [graph, focus]);
 
   const toggle = (kind: NodeKind) => setOff((current) => {
     const next = new Set(current);
@@ -241,21 +325,18 @@ export function GraphTab() {
     const q = query.trim().toLowerCase();
     return q && graph ? graph.nodes.filter((n) => [n.title, n.detail ?? "", nameOf(n)].some((t) => t.toLowerCase().includes(q))) : [];
   }, [query, graph]);
-  /** Выделить найденный узел и поставить его в центр холста, приблизив. */
+  /** Выделить найденный узел и поставить его в центр холста. */
   const jump = (index: number) => {
     if (!graph || !matches.length) return;
     const node = matches[index % matches.length];
-    const p = graph.positions.get(node.id)!;
-    const { minX, minY, width, height } = graph.viewBox;
+    const b = graph.layout.boxes.get(node.id)!;
     setHit(index % matches.length);
     setSelected(node.id);
     setView((v) => {
-      const scale = Math.max(v.scale, 1.6);
-      return { scale, x: minX + width / 2 - p.x * scale, y: minY + height / 2 - p.y * scale };
+      const scale = Math.max(v.scale, 0.9);
+      return { scale, x: boxSize.w / 2 - (b.x + b.w / 2) * scale, y: boxSize.h / 2 - b.y * scale };
     });
   };
-
-  const zoom = (factor: number) => setView((v) => ({ ...v, scale: Math.min(6, Math.max(0.4, v.scale * factor)) }));
 
   /** Узел пути проявляется, когда до него дорисовалась линия. */
   const arrive = (id: string) => ({ animationDelay: `${(trace?.steps.get(id) ?? 0) * STEP_SECONDS}s` });
@@ -265,83 +346,97 @@ export function GraphTab() {
   const links = selectedNode && graph
     ? graph.edges.filter((e) => e.source === selectedNode.id || e.target === selectedNode.id) : [];
 
-  // Узлы и связи не зависят от сдвига и масштаба: перетаскивание графа меняет только
+  // Узлы и связи не зависят от сдвига и масштаба: перетаскивание меняет только
   // transform группы, а не перерисовывает сотни узлов на каждое движение мыши.
-  const focus = hover?.id ?? selected;
-  const layer = useMemo(() => graph && (
-    <>
-      {graph.edges.map((e, i) => {
-        const a = graph.positions.get(e.source)!;
-        const b = graph.positions.get(e.target)!;
-        const role = trace?.edges.get(edgeKey(e.source, e.target));
-        const lit = neighbours && (e.source === focus || e.target === focus);
-        if (!role)
-          return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-            className={`edge ${lit ? "lit" : neighbours || trace ? "faded" : ""}`} />;
-        // Линия пути рисуется от конца, ближнего к цели, — так путь «растёт» от неё.
-        const sa = trace!.steps.get(e.source) ?? 0;
-        const sb = trace!.steps.get(e.target) ?? 0;
-        const [from, to] = sa <= sb ? [a, b] : [b, a];
-        return <line key={i} x1={from.x} y1={from.y} x2={to.x} y2={to.y} pathLength={1}
-          className={`edge trace ${role}`} style={{ animationDelay: `${Math.min(sa, sb) * STEP_SECONDS}s` }} />;
-      })}
-      {trace && graph.goalEdges.map((e) => {
-        const a = graph.positions.get(GOAL)!;
-        const b = graph.positions.get(e.target)!;
-        return <line key={"goal" + e.target} x1={a.x} y1={a.y} x2={b.x} y2={b.y} pathLength={1}
-          className={`edge trace ${e.role} ${e.missing ? "missing" : ""}`} />;
-      })}
-      {graph.nodes.map((n) => {
-        const p = graph.positions.get(n.id)!;
-        const kind = KIND[n.label];
-        const lit = neighbours?.has(n.id);
-        const role = trace?.nodes.get(n.id);
-        const label = graph.nodes.length <= LABELS_ALWAYS || lit || role || n.label === "Order" || n.label === "Department";
-        return (
-          <g key={n.id} transform={`translate(${p.x} ${p.y})`} data-node={n.id}
-            className={`node ${n.status === "archived" ? "archived" : ""} ${role ? `traced ${role}` : (neighbours && !lit) || (trace && !lit) ? "faded" : ""} ${selected === n.id ? "selected" : ""}`}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => setSelected(n.id)}
-            onMouseEnter={(e) => {
-              const rect = box.current!.getBoundingClientRect();
-              setHover({ id: n.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
-            }}
-            onMouseLeave={() => setHover(null)}>
-            <circle r={(kind.r + 6) * graph.k} className="hit" />
-            {role && role !== "path" && <circle r={(kind.r + 5) * graph.k} className="halo" style={arrive(n.id)} />}
-            <circle r={kind.r * graph.k} fill={kind.color} className="dot" style={role ? arrive(n.id) : undefined} />
-            {role && ROLE_MARK[role] && (
-              <g transform={`translate(${kind.r * graph.k} ${-kind.r * graph.k}) scale(${graph.k})`} className="mark" style={arrive(n.id)}>
-                <circle r={6.5} /><text textAnchor="middle" y={3.5}>{ROLE_MARK[role]}</text>
-              </g>
-            )}
-            {label && <text textAnchor="middle" y={(kind.r + 15) * graph.k} style={{ fontSize: 13 * graph.k }}>{short(nameOf(n), 26)}</text>}
-          </g>
-        );
-      })}
-      {trace && (() => {
-        const p = graph.positions.get(GOAL)!;
-        return (
-          <g transform={`translate(${p.x} ${p.y}) scale(${graph.k})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => setSelected(null)}>
-            <rect x={-30} y={-13} width={60} height={26} rx={13} />
-            <text textAnchor="middle" y={4}>Цель</text>
-          </g>
-        );
-      })()}
-    </>
+  const layer = useMemo(() => {
+    if (!graph) return null;
+    const { boxes, columns, bands } = graph.layout;
+    const dim = !!lit || !!trace;
+    return (
+      <>
+        {bands.filter((b) => b.col !== GOAL_COL).map((b) => {
+          const column = columns.find((c) => c.col === b.col)!;
+          const kind = KINDS.find((k) => k.col === b.col && k.band === b.band)!;
+          // Верхние заголовки — в одну линию над схемой, нижние полосы — над своим первым узлом.
+          return (
+            <text key={`${b.col}.${b.band}`} className="col-head" x={column.x + 2} y={b.band ? b.top - 14 : -HEAD + 10}>
+              {kind.name} <tspan className="count">{b.count}</tspan>
+            </text>
+          );
+        })}
+        {graph.edges.map((e, i) => {
+          const a = boxes.get(e.source)!;
+          const b = boxes.get(e.target)!;
+          const key = edgeKey(e.source, e.target);
+          const role = trace?.edges.get(key);
+          if (!role)
+            return <path key={i} d={curve(a, b)}
+              className={`edge ${e.type === "REFERENCES" ? "ref" : ""} ${lit?.keys.has(key) ? "lit" : dim ? "faded" : ""}`} />;
+          // Линия пути рисуется от конца, ближнего к цели, — так путь «растёт» от неё.
+          const sa = trace!.steps.get(e.source) ?? 0;
+          const sb = trace!.steps.get(e.target) ?? 0;
+          return <path key={i} d={sa <= sb ? curve(a, b) : curve(b, a)} pathLength={1}
+            className={`edge trace ${role}`} style={{ animationDelay: `${Math.min(sa, sb) * STEP_SECONDS}s` }} />;
+        })}
+        {trace && graph.goalEdges.map((e) => (
+          <path key={"goal" + e.target} d={curve(boxes.get(GOAL)!, boxes.get(e.target)!)} pathLength={1}
+            className={`edge trace ${e.role} ${e.missing ? "missing" : ""}`} />
+        ))}
+        {graph.nodes.map((n) => {
+          const b = boxes.get(n.id)!;
+          const role = trace?.nodes.get(n.id);
+          const on = lit?.ids.has(n.id);
+          const sub = subOf(n);
+          const pick = () => setSelected(n.id);
+          return (
+            <g key={n.id} transform={`translate(${b.x} ${b.y - b.h / 2})`} data-node={n.id}
+              className={`node ${n.status === "archived" ? "archived" : ""} ${role ? `traced ${role}` : dim && !on ? "faded" : ""} ${on && lit ? "lit" : ""} ${selected === n.id ? "selected" : ""}`}
+              role="button" tabIndex={0} aria-label={`${KIND_ONE[n.label]}: ${nameOf(n)}`}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={pick}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } }}
+              onMouseEnter={(e) => {
+                const rect = box.current!.getBoundingClientRect();
+                setHover({ id: n.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
+              }}
+              onMouseLeave={() => setHover(null)}>
+              {role && role !== "path" && <rect className="halo" x={-4} y={-4} width={b.w + 8} height={b.h + 8} rx={14} style={arrive(n.id)} />}
+              <rect className="face" width={b.w} height={b.h} rx={10} style={role ? arrive(n.id) : undefined} />
+              <circle className="dot" cx={17} cy={b.h / 2} r={5} fill={KIND[n.label].color} />
+              <text className="name" x={32} y={sub ? 19 : b.h / 2 + 4.5}>{clip(nameOf(n), b.w)}</text>
+              {sub && <text className="sub" x={32} y={35}>{clip(sub, b.w, 6.2)}</text>}
+              {role && ROLE_MARK[role] && (
+                <g transform={`translate(${b.w - 2} 2)`} className="mark" style={arrive(n.id)}>
+                  <circle r={9} /><text textAnchor="middle" y={4}>{ROLE_MARK[role]}</text>
+                </g>
+              )}
+            </g>
+          );
+        })}
+        {trace && (() => {
+          const b = boxes.get(GOAL)!;
+          return (
+            <g transform={`translate(${b.x} ${b.y - b.h / 2})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => setSelected(null)}>
+              <rect width={b.w} height={b.h} rx={b.h / 2} />
+              <text x={b.w / 2} y={b.h / 2 + 4.5} textAnchor="middle">Цель</text>
+            </g>
+          );
+        })()}
+      </>
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ), [graph, trace, neighbours, focus, selected]);
+  }, [graph, trace, lit, selected]);
 
   return (
     <section id="tab-graph">
-      <PageHead title="Граф" sub="Каталог целиком: что из чего следует и где действует. Нажмите на узел, чтобы увидеть его связи.">
+      <PageHead title="Граф" sub="Каталог целиком: что из чего следует и где действует. Нажмите на узел, чтобы увидеть его цепочку.">
         {traced && <button className="btn" onClick={() => setTrace(null)}>Сбросить трассировку</button>}
         <button className="btn" disabled={busy} onClick={() => void load()}>
           {busy ? <><Spinner /> Обновляем…</> : "Обновить"}
         </button>
       </PageHead>
-      <div className="toolbar">
+      <div className="toolbar graph-toolbar">
         <label className="graph-search">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5" /><path d="M13.5 13.5L17 17" /></svg>
           <input type="search" aria-label="Найти узел" placeholder="Найти узел" value={query}
@@ -349,17 +444,26 @@ export function GraphTab() {
             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); jump(matches.length && selected === matches[hit]?.id ? hit + 1 : hit); } }} />
           {query.trim() && <span className="dim">{matches.length ? `${hit + 1} из ${matches.length}` : "не найдено"}</span>}
         </label>
-        {/* Типы, которых в каталоге нет, не занимают место в панели. */}
-        {KINDS.filter((k) => (counts.get(k.kind) ?? 0) > 0).map((k) => (
-          <button key={k.kind} className={`chip chip-btn legend ${off.has(k.kind) ? "off" : ""}`}
-            aria-pressed={!off.has(k.kind)} onClick={() => toggle(k.kind)}>
-            <span className="swatch" style={{ background: k.color }} />{k.name}
-            <span className="dim">{counts.get(k.kind) ?? 0}</span>
-          </button>
-        ))}
-        <label className="check">
-          <input type="checkbox" checked={archived} onChange={(e) => setArchived(e.target.checked)} /> Архив
-        </label>
+        {/* Кнопки типов — они же легенда. Типы, которых в каталоге нет, места не занимают. */}
+        <div className="chips">
+          {KINDS.filter((k) => (counts.get(k.kind) ?? 0) > 0).map((k) => (
+            <button key={k.kind} className={`chip chip-btn legend ${off.has(k.kind) ? "off" : ""}`}
+              aria-pressed={!off.has(k.kind)} disabled={!!trace && onlyPath} onClick={() => toggle(k.kind)}>
+              <span className="swatch" style={{ background: k.color }} />{k.name}
+              <span className="dim">{counts.get(k.kind) ?? 0}</span>
+            </button>
+          ))}
+        </div>
+        <div className="graph-flags">
+          {trace && (
+            <label className="check">
+              <input type="checkbox" checked={onlyPath} onChange={(e) => setOnlyPath(e.target.checked)} /> Только путь проверки
+            </label>
+          )}
+          <label className="check">
+            <input type="checkbox" checked={archived} onChange={(e) => setArchived(e.target.checked)} /> Архив
+          </label>
+        </div>
       </div>
 
       {state.kind === "loading" && <Skeleton rows={5} />}
@@ -368,44 +472,41 @@ export function GraphTab() {
       {graph && graph.nodes.length > 0 && (
         <div className="graph-page">
           <div className="card graph-box" ref={box}
-            onWheel={(e) => zoom(e.deltaY < 0 ? 1.15 : 1 / 1.15)}
             onMouseDown={(e) => { drag.current = { x: e.clientX, y: e.clientY, moved: false }; }}
             onMouseMove={(e) => {
               const d = drag.current;
               if (!d) return;
-              const rect = box.current!.getBoundingClientRect();
-              // Сдвиг в единицах viewBox: экранные пиксели делятся на масштаб вписывания.
-              const fit = Math.min(rect.width / graph.viewBox.width, rect.height / graph.viewBox.height);
-              const dx = (e.clientX - d.x) / fit;
-              const dy = (e.clientY - d.y) / fit;
               if (Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) > 3) d.moved = true;
+              const dx = e.clientX - d.x;
+              const dy = e.clientY - d.y;
               d.x = e.clientX; d.y = e.clientY;
               setView((v) => ({ ...v, x: v.x + dx, y: v.y + dy }));
             }}
             onMouseUp={() => { if (drag.current && !drag.current.moved) setSelected(null); drag.current = null; }}
             onMouseLeave={() => { drag.current = null; setHover(null); }}>
-            <svg role="img" aria-label={`Граф каталога: узлов ${graph.nodes.length}, связей ${graph.edges.length}`}
-              viewBox={`${graph.viewBox.minX} ${graph.viewBox.minY} ${graph.viewBox.width} ${graph.viewBox.height}`}>
-              <g key={replay} transform={`translate(${view.x} ${view.y}) scale(${view.scale})`} className={trace ? "tracing" : ""}>
+            <svg role="img" aria-label={`Граф каталога: узлов ${graph.nodes.length}, связей ${graph.edges.length}`}>
+              <g key={replay} transform={`translate(${view.x} ${view.y}) scale(${view.scale})`}
+                className={`${trace ? "tracing" : ""} ${view.scale < 0.45 ? "far" : ""}`}>
                 {layer}
               </g>
             </svg>
             <div className="graph-zoom">
-              <button className="btn sm" aria-label="Приблизить" onClick={() => zoom(1.3)}>+</button>
-              <button className="btn sm" aria-label="Отдалить" onClick={() => zoom(1 / 1.3)}>−</button>
-              <button className="btn sm" onClick={() => setView({ x: 0, y: 0, scale: 1 })}>Весь граф</button>
+              <button className="btn sm" aria-label="Отдалить" onClick={() => zoom(1 / 1.25)}>−</button>
+              <span className="small dim">{Math.round(view.scale * 100)}%</span>
+              <button className="btn sm" aria-label="Приблизить" onClick={() => zoom(1.25)}>+</button>
+              <button className="btn sm" onClick={() => fitView(true)}>Весь граф</button>
             </div>
+            <div className="graph-hint small dim">Перетаскивание и колесо — сдвиг · Ctrl + колесо — масштаб</div>
             {hoverNode && hover && (
-              <div className="graph-tip" style={{ left: hover.x + 14, top: hover.y + 14 }}>
-                <div className="small dim">{KIND_ONE[hoverNode.label]}</div>
+              <div className="graph-tip" style={{ left: Math.min(hover.x + 14, boxSize.w - 300), top: hover.y + 14 }}>
+                <div className="small dim">{KIND_ONE[hoverNode.label]}{hoverNode.label === "Rule" ? ` · ${hoverNode.title}` : ""}</div>
                 <div className="mid">{nameOf(hoverNode)}</div>
-                {hoverNode.detail && <div className="small muted">{short(hoverNode.detail, 140)}</div>}
+                {hoverNode.detail && hoverNode.label !== "Rule" && <div className="small muted">{short(hoverNode.detail, 160)}</div>}
               </div>
             )}
           </div>
 
-          <aside className="graph-side">
-            <div className="card pad">
+          <aside className="graph-side card pad">
             {selectedNode ? (
               <>
                 <div className="row node-kind">
@@ -419,25 +520,26 @@ export function GraphTab() {
                 <h2 className="node-title">{nameOf(selectedNode)}</h2>
                 {selectedNode.label === "Rule" && <div className="dim">{selectedNode.title}</div>}
                 {selectedNode.detail && selectedNode.label !== "Rule" && <p className="muted node-detail">{selectedNode.detail}</p>}
-                <div className="node-kind" style={{ marginTop: 12 }}>Связи: {links.length}</div>
-                {links.map((e, i) => {
-                  const out = e.source === selectedNode.id;
-                  const other = graph.byId.get(out ? e.target : e.source)!;
-                  return (
-                    <button key={i} className="graph-link" onClick={() => setSelected(other.id)}
-                      title={EDGE_NAMES[e.type] ?? e.type}>
-                      {/* Тип соседа, а у области действия — сама связь: «действует только в АГД». */}
-                      <span className="dim">{e.type === "ONLY_IN" && out ? EDGE_NAMES.ONLY_IN : KIND_ONE[other.label]}</span>
-                      <span>{nameOf(other)}</span>
-                    </button>
-                  );
-                })}
                 {OPENABLE.includes(selectedNode.label) && (
                   <button className="btn sm primary" style={{ marginTop: 12 }}
                     onClick={() => void goToNode(selectedNode.id, selectedNode.label)}>
                     Открыть {KIND_ONE[selectedNode.label].toLowerCase()}
                   </button>
                 )}
+                <div className="node-kind" style={{ marginTop: 18 }}>Связи: {links.length}</div>
+                {links.map((e, i) => {
+                  const out = e.source === selectedNode.id;
+                  const other = graph.byId.get(out ? e.target : e.source)!;
+                  return (
+                    <button key={i} className="graph-link node-link" onClick={() => setSelected(other.id)}
+                      title={EDGE_NAMES[e.type] ?? e.type}>
+                      <span className="swatch" style={{ background: KIND[other.label].color }} />
+                      {/* Тип соседа, а у области действия — сама связь: «действует только в АГД». */}
+                      <span className="dim">{e.type === "ONLY_IN" && out ? EDGE_NAMES.ONLY_IN : KIND_ONE[other.label]}</span>
+                      <span>{nameOf(other)}</span>
+                    </button>
+                  );
+                })}
               </>
             ) : traced && trace ? (
               <TraceSummary result={traced}
@@ -449,21 +551,15 @@ export function GraphTab() {
             ) : (
               <>
                 <h3>Узлов: {graph.nodes.length} · связей: {graph.edges.length}</h3>
-                <p className="muted" style={{ marginTop: 8 }}>Выберите узел на графе или найдите его по названию.</p>
+                <p className="muted" style={{ marginTop: 8 }}>
+                  Схема читается слева направо: приказ содержит пункты, пункт задаёт правила, правило проверяет
+                  атрибуты цели и может действовать только в отдельных подразделениях.
+                </p>
+                <p className="muted" style={{ marginTop: 8 }}>
+                  Выберите узел, чтобы подсветить его цепочку и увидеть связи, или найдите его по названию.
+                </p>
               </>
             )}
-            </div>
-            <div className="card pad">
-              <h3>Легенда</h3>
-              <div className="graph-legend">
-                {KINDS.filter((k) => !off.has(k.kind)).map((k) => (
-                  <span key={k.kind}><span className="swatch" style={{ background: k.color }} />{KIND_ONE[k.kind]}</span>
-                ))}
-              </div>
-              <p className="small dim" style={{ marginTop: 10 }}>
-                Колесо мыши — масштаб, перетаскивание — сдвиг. Наведите на узел, чтобы подсветить его связи.
-              </p>
-            </div>
           </aside>
         </div>
       )}
@@ -493,7 +589,7 @@ function TraceSummary({ result, onPick }: {
       {result.detected_attributes.length > 0 && <h3 style={{ margin: "14px 0 0" }}>Найдено в цели</h3>}
       {result.detected_attributes.map((name) => (
         <button key={name} className="graph-link" onClick={() => onPick("CheckTarget", name)}>
-          <span><i className="trace-mark ok">✓</i> {name}</span>
+          <span><i className="trace-mark ok">✓</i> {attributeTitle(name)}</span>
         </button>
       ))}
       {bad > 0 && <h3 style={{ margin: "14px 0 0" }}>Нарушения: {bad}</h3>}
