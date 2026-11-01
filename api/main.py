@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 import anyio
 import anyio.from_thread
@@ -16,7 +16,7 @@ import anyio.lowlevel
 import anyio.to_thread
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
 DOCS = os.getenv("ENABLE_DOCS", "0").strip().lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(
-    title="Goal Checker Agent", version="1.0.0", lifespan=lifespan,
+    title="SmartGuard", version="1.0.0", lifespan=lifespan,
     docs_url="/docs" if DOCS else None, redoc_url=None,
     openapi_url="/openapi.json" if DOCS else None,
 )
@@ -392,14 +392,21 @@ app.include_router(settings_router)
 VIEWER = [Depends(auth.viewer)]
 
 
+def _department_given(value: str) -> str:
+    """Подразделение из одних пробелов после обрезки — то же, что не переданное."""
+    if not value:
+        raise ValueError("подразделение обязательно")
+    return value
+
+
 class GoalRequest(BaseModel):
     goal: schemas.GoalText = Field(
         ..., description="Формулировка цели для проверки, не длиннее настройки goalMaxChars")
-    department_id: schemas.OptionalDepartmentId = Field(
-        None,
-        description="Идентификатор подразделения (Department.departmentId), до 100 символов. "
-                    "Без него применяются все правила, а причина пишется в notes; "
-                    "пустая строка — то же, что без поля",
+    # Обязательно, как и в пакете: без подразделения не понять, какие правила применять.
+    department_id: Annotated[schemas.DepartmentId, AfterValidator(_department_given)] = Field(
+        ...,
+        description="Идентификатор подразделения (Department.departmentId), до 100 символов; "
+                    "число принимается как строка. Пустая строка или пробелы — ошибка 422",
     )
     is_student: Optional[bool] = Field(
         None,

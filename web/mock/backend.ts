@@ -1440,9 +1440,11 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     // Двойников по написанию мок не заводит: сводить нечего.
     if (method === "POST" && path === "/catalog/merge-duplicate-targets") return { merged: [], skipped: [] };
     if (method === "POST" && path === "/check-goal") {
-      const department = body?.department_id;
-      if (department != null && typeof department !== "string")
-        throw new HttpError(422, "department_id: Input should be a valid string");
+      // Как в API: подразделение обязательно, число принимается строкой, пустое — 422.
+      const raw = typeof body?.department_id === "number" ? String(body.department_id) : body?.department_id;
+      if (typeof raw !== "string" || !raw.trim())
+        throw new HttpError(422, "department_id: Field required");
+      const department = raw.trim();
       const goal = goalText(body?.goal, settings.goalMaxChars as number);
       const isStudent = studentFlag(body?.is_student);
       spendChecks(1);

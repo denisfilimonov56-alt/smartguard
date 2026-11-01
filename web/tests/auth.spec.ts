@@ -152,6 +152,7 @@ test("после «Не сейчас» отказ на действие поль
   await expect(page.locator(".session-bar")).toBeVisible();
 
   await page.getByLabel("Формулировка цели").fill("Улучшить работу с заявками");
+  await choose(page.locator("#departmentInput"), { value: "UCT" });
   await page.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
   await expect(lost).toBeVisible();
 });
@@ -338,6 +339,7 @@ test.describe("читатель", () => {
 
   test("может проверить цель", async ({ app }) => {
     await app.getByLabel("Формулировка цели").fill("В рамках проекта «Альфа» внедрить мониторинг до 15.09.2025");
+    await choose(app.locator("#departmentInput"), { value: "UCT" });
     await app.locator("#tab-check").getByRole("button", { name: "Проверить" }).click();
     await expect(app.locator("#checkResult")).toBeVisible();
   });

@@ -100,14 +100,19 @@ const STEPS: Step[] = [
     place: "bottom",
     // Своя формулировка пользователя остаётся вместе с ответом на неё; форма целиком
     // вернётся к прежней после обучения (Tour.tsx).
-    prepare: ({ catalog }) =>
-      catalog.setCheckForm((prev) => (prev.goal.trim()
-        ? { mode: "single" } : { mode: "single", result: null, goal: TOUR_GOAL })),
+    // Без подразделения «Проверить» неактивна — для примера ставим первое действующее.
+    prepare: ({ catalog }) => {
+      const fallback = catalog.departments.find((d) => d.departmentId && d.status === "active")?.departmentId ?? "";
+      catalog.setCheckForm((prev) => ({
+        mode: "single", departmentId: prev.departmentId || fallback,
+        ...(prev.goal.trim() ? {} : { result: null, goal: TOUR_GOAL }),
+      }));
+    },
     body: (
       <>
         <p>Введите формулировку цели, выберите подразделение и отметьте, если цель ставит студент:
           часть правил действует только в отдельных подразделениях или только для студентов.</p>
-        <p>Без подразделения применяются все правила. Отправить можно кнопкой или сочетанием <kbd>{ENTER}</kbd>.</p>
+        <p>Без подразделения проверка не запускается. Отправить можно кнопкой или сочетанием <kbd>{ENTER}</kbd>.</p>
       </>
     ),
   },
@@ -119,13 +124,19 @@ const STEPS: Step[] = [
     target: "#checkResult",
     place: "right",
     busy: "Проверяем пример на модели…",
-    // Пока кнопка «Проверить» занята, проверка идёт — ответ появится, сколько бы модель ни думала.
-    pending: () => !!document.querySelector("#tab-check .hero .btn.primary[disabled]"),
+    // Пока на кнопке «Проверить» крутится индикатор, проверка идёт — ответ появится, сколько бы модель
+    // ни думала. По одной неактивности не судим: без подразделения кнопка тоже неактивна.
+    pending: () => !!document.querySelector("#tab-check .hero .btn.primary .spinner"),
     prepare: async ({ catalog, active }) => {
-      const { goal, departmentId, isStudent } = catalog.checkForm;
+      const { goal, isStudent } = catalog.checkForm;
       const text = goal.trim() || TOUR_GOAL;
-      const result = await api.checkGoal(text, departmentId || null, isStudent);
-      if (active()) catalog.setCheckForm({ mode: "single", goal: text, result, checked: { goal: text, departmentId, isStudent } });
+      // Без подразделения проверку не отправить — пример идёт для первого действующего.
+      const departmentId = catalog.checkForm.departmentId
+        || catalog.departments.find((d) => d.departmentId && d.status === "active")?.departmentId || "";
+      if (!departmentId) return;
+      const result = await api.checkGoal(text, departmentId, isStudent);
+      if (active()) catalog.setCheckForm({ mode: "single", goal: text, departmentId, result,
+        checked: { goal: text, departmentId, isStudent } });
     },
     body: ({ catalog }) => (
       <>

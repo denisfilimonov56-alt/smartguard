@@ -223,9 +223,9 @@ export function MonitoringTab() {
               note={`${num(totals.manual_review)} — сбой модели или нечем проверить`} />
           </div>
           <div className="charts">
-            <BarChart title="Проверок за интервал" points={points.map((p) => ({ label: p.label, value: p.total }))}
+            <LineChart title="Проверок за интервал" points={points.map((p) => ({ label: p.label, value: p.total }))}
               format={(v) => num(Math.round(v))} />
-            <BarChart title="Среднее время проверки, с" points={points.map((p) => ({ label: p.label, value: p.seconds }))}
+            <LineChart title="Среднее время проверки, с" points={points.map((p) => ({ label: p.label, value: p.seconds }))}
               format={(v) => v.toLocaleString("ru-RU", { maximumFractionDigits: 1 })} />
           </div>
           <div className="card scroll-x"><table>
@@ -414,17 +414,21 @@ function NowCards({ now }: { now: MonitoringNow }) {
   );
 }
 
-/* Столбцы одной серии: без легенды (её называет заголовок), значения — в
-   подсказке при наведении и в таблице ниже. */
-function BarChart({ title, points, format }: {
+/* Линия одной серии с заливкой под ней — как мини-график в плитках: без легенды
+   (её называет заголовок), значения — в подсказке при наведении и в таблице ниже. */
+function LineChart({ title, points, format }: {
   title: string; points: { label: string; value: number }[]; format: (v: number) => string;
 }) {
   const [active, setActive] = useState<number | null>(null);
   const W = 560, H = 190, left = 44, right = 8, top = 10, bottom = 24;
   const max = Math.max(...points.map((p) => p.value), 0) || 1;
   const slot = (W - left - right) / Math.max(points.length, 1);
-  const bar = Math.max(1, Math.min(24, slot - 2));
+  // Точка — посередине своего интервала: подпись оси и зона наведения под ней.
+  const x = (i: number) => left + slot * (i + 0.5);
   const y = (v: number) => top + (H - top - bottom) * (1 - v / max);
+  const line = points.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(p.value).toFixed(1)}`).join(" ");
+  const area = points.length
+    ? `${line} L${x(points.length - 1).toFixed(1)} ${H - bottom} L${x(0).toFixed(1)} ${H - bottom} Z` : "";
   // Подписи оси — не чаще, чем помещаются.
   const every = Math.ceil(points.length / 6);
   const tip = active != null ? points[active] : null;
@@ -438,22 +442,23 @@ function BarChart({ title, points, format }: {
             <text x={left - 6} y={y(max * t) + 4} textAnchor="end">{format(max * t)}</text>
           </g>
         ))}
-        {points.map((p, i) => {
-          const x = left + slot * i + (slot - bar) / 2;
-          const h = Math.max(p.value > 0 ? 2 : 0, H - bottom - y(p.value));
-          const r = Math.min(4, bar / 2, h);
-          return (
-            <g key={i}>
-              <path className={`bar ${active === i ? "active" : ""}`}
-                d={`M${x},${H - bottom} v${-(h - r)} q0,${-r} ${r},${-r} h${bar - 2 * r} q${r},0 ${r},${r} v${h - r} z`} />
-              {i % every === 0 && <text x={x + bar / 2} y={H - 7} textAnchor="middle">{p.label}</text>}
-              <rect x={left + slot * i} y={top} width={slot} height={H - top - bottom} fill="transparent"
-                onMouseEnter={() => setActive(i)} />
-            </g>
-          );
-        })}
+        <path className="area" d={area} />
+        <path className="line" d={line} />
+        {active != null && tip && (
+          <g className="hover">
+            <line x1={x(active)} x2={x(active)} y1={top} y2={H - bottom} />
+            <circle cx={x(active)} cy={y(tip.value)} r={4} />
+          </g>
+        )}
+        {points.map((p, i) => (
+          <g key={i}>
+            {i % every === 0 && <text x={x(i)} y={H - 7} textAnchor="middle">{p.label}</text>}
+            <rect x={left + slot * i} y={top} width={slot} height={H - top - bottom} fill="transparent"
+              onMouseEnter={() => setActive(i)} />
+          </g>
+        ))}
       </svg>
-      <div className="chart-tip">{tip ? <><b>{format(tip.value)}</b> · {tip.label}</> : "Наведите на столбец"}</div>
+      <div className="chart-tip">{tip ? <><b>{format(tip.value)}</b> · {tip.label}</> : "Наведите на график"}</div>
     </div>
   );
 }

@@ -26,7 +26,7 @@ export function LoginView({ notice }: { notice?: string }) {
 
   return (
     <div className="login-screen">
-      <header className="login-head">Проверка целей<small>каталог требований</small></header>
+      <header className="login-head">SmartGuard<small>проверка целей по приказам</small></header>
       <main className="login-main">
         <LoginOrbits />
         <span className="login-tag">Вход</span>

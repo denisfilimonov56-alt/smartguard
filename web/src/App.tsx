@@ -134,7 +134,7 @@ export function App() {
   const current = allowed.find((s) => s.id === requested) ?? allowed[0];
   const section = current.id;
   // У каждого раздела своё название вкладки: несколько открытых вкладок различимы.
-  useEffect(() => { document.title = `${current.label} — Проверка целей`; }, [current.label]);
+  useEffect(() => { document.title = `${current.label} — SmartGuard`; }, [current.label]);
   useEffect(() => {
     if (section === requested) return;
     history.replaceState(null, "", sectionPath(section));
@@ -192,7 +192,7 @@ export function App() {
         onMouseLeave={() => setFolded(false)} onKeyDown={() => setFolded(false)}>
         <div className="brand">
           <img src={logo} alt="" />
-          <div>Проверка целей<small>каталог требований</small></div>
+          <div>SmartGuard<small>проверка целей по приказам</small></div>
           {wide && (
             <button type="button" className="pin-btn label" aria-pressed={dockPref} onClick={toggleDock}
               title={dockPref ? "Открепить панель: сворачивать до иконок" : "Закрепить панель раскрытой"}

@@ -238,7 +238,7 @@ export function CheckView() {
                 <div className="row wrap" style={{ marginTop: 14 }}>
                   <Select id="departmentInput" ariaLabel="Подразделение" className="pill" value={departmentId}
                     style={{ width: 320 }} onChange={setDepartmentId}
-                    options={[{ value: "", label: "Подразделение не указано" },
+                    options={[{ value: "", label: "Выберите подразделение" },
                       ...options.map((d) => ({ value: d.departmentId!, label: d.name || d.departmentId! }))]} />
                   <label className="check" title="Часть правил действует только для целей студентов">
                     <input type="checkbox" id="studentInput" checked={isStudent}
@@ -246,12 +246,13 @@ export function CheckView() {
                     Цель ставит студент
                   </label>
                   <div className="spacer" />
-                  <button className="btn primary" disabled={busy} onClick={() => void run()}>
+                  <button className="btn primary" disabled={busy || !departmentId} onClick={() => void run()}
+                    title={departmentId ? undefined : "Сначала выберите подразделение"}>
                     {busy ? <><Spinner /> Проверяем…</> : "Проверить"}
                   </button>
                 </div>
                 {!departmentId && (
-                  <div className="hint">Без подразделения применяются все правила, включая те, что действуют только в отдельных.</div>
+                  <div className="hint">Выберите подразделение — без него проверка не запускается.</div>
                 )}
                 {departmentId && fromRecent && <div className="hint">Подразделение — с прошлой проверки.</div>}
               </div>
