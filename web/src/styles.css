@@ -805,12 +805,13 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .meter span{display:block;height:100%;background:var(--brand);border-radius:4px}
 
 /* --------------------------------- граф ----------------------------------- */
-/* Схема колонками: карточки узлов на лёгкой сетке точек, связи — плавные кривые.
+/* Схема колонками: карточки узлов на гладкой панели (точки — только общий фон
+   CloudField, своей сетки у холста нет), связи — плавные кривые.
    Холст и карточка узла справа одной высоты, карточка прокручивается сама. */
 .graph-page{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:stretch;
   height:calc(100vh - 220px);min-height:460px}
 .graph-box{position:relative;overflow:hidden;cursor:grab;user-select:none;border:1px solid var(--line-soft);
-  background:var(--panel) radial-gradient(circle,var(--line) 1px,transparent 1.2px) 0 0/22px 22px}
+  background:var(--panel)}
 .graph-box:active{cursor:grabbing}
 .graph-box svg{display:block;width:100%;height:100%}
 .graph-box .col-head{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;fill:var(--ink-3)}
