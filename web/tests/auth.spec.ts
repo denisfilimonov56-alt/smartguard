@@ -48,7 +48,7 @@ test.describe("вход", () => {
     await page.getByLabel("Логин").fill("admin");
     await page.getByLabel("Пароль").fill(MOCK_PASSWORD);
     await page.getByRole("button", { name: "Войти" }).click();
-    await expect(page.getByText("API на связи")).toBeVisible();
+    await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
     await expect(page).toHaveURL(/\/rules$/);
     expect(page.url()).not.toContain("code=");
   });
@@ -65,7 +65,7 @@ test.describe("вход", () => {
     await expect(app.locator(".side .who")).toContainText("Елена Редактор");
     await expect(app.locator(".side .who")).toContainText("редактор");
     await expect(app.locator(".side .who")).not.toContainText("editor");
-    await expect(app.getByText("API на связи")).toBeVisible();
+    await expect(app.getByRole("button", { name: /API на связи/ })).toBeVisible();
 
     await app.getByRole("button", { name: "Меню пользователя" }).click();
     await app.getByRole("menuitem", { name: "Выйти" }).click();
@@ -79,7 +79,7 @@ test.describe("вход", () => {
 
   test("пароль не попадает в адресную строку и хранилища браузера", async ({ app }) => {
     await signIn(app, "admin");
-    await expect(app.getByText("API на связи")).toBeVisible();
+    await expect(app.getByRole("button", { name: /API на связи/ })).toBeVisible();
     expect(app.url()).not.toContain(MOCK_PASSWORD);
     const stored = await app.evaluate(() => JSON.stringify([{ ...localStorage }, { ...sessionStorage }]));
     expect(stored).not.toContain(MOCK_PASSWORD);
@@ -98,7 +98,7 @@ test.describe("вход", () => {
 test("закрытая в Keycloak сессия: окно входа поверх приложения, ввод переживает повторный вход", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   const goal = "Черновик цели, набранный до конца сессии";
   await page.getByLabel("Формулировка цели").fill(goal);
 
@@ -137,13 +137,13 @@ async function relogin(page: Page) {
   await page.getByLabel("Логин").fill("admin");
   await page.getByLabel("Пароль").fill(MOCK_PASSWORD);
   await page.getByRole("button", { name: "Войти" }).click();
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
 }
 
 test("после «Не сейчас» отказ на действие пользователя (запись) снова открывает окно", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   backend.revoke();
   await page.getByRole("button", { name: "Меню пользователя" }).click();
   await page.getByRole("menuitem", { name: "Обновить" }).click();
@@ -160,7 +160,7 @@ test("после «Не сейчас» отказ на действие поль
 test("черновики окна свойств и советчика переживают повторный вход", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
 
   // Окно свойств узла: правка значения, сессия кончилась на сохранении.
   await go(page, "Приказы");
@@ -198,7 +198,7 @@ test("черновики окна свойств и советчика пере�
 test("сбои API посреди работы: 503 не выкидывает из сессии, оборванный ответ — ошибка, а не пустые данные", async ({ page }) => {
   await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   const refresh = async () => {
     await page.getByRole("button", { name: "Меню пользователя" }).click();
     await page.getByRole("menuitem", { name: "Обновить" }).click();
@@ -217,7 +217,7 @@ test("сбои API посреди работы: 503 не выкидывает и
   // Повтор проходит, токены на месте.
   unavailable = false;
   await refresh();
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   expect(await page.evaluate(() => sessionStorage.getItem("gc.oidc"))).toContain("mock:admin");
 
   // Ответ 200, оборванный посередине.
@@ -236,7 +236,7 @@ test("черновик другого пользователя после вхо
   })));
   await page.goto("/");
   await signIn(page, "admin");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   await expect(page.getByLabel("Формулировка цели")).toHaveValue("");
 });
 
@@ -263,7 +263,7 @@ test("Keycloak недоступен при обновлении токена: т
   // Keycloak вернулся: «Повторить» входит с теми же токенами, без страницы входа.
   await page.unroute("**/api/idp/token");
   await page.getByRole("button", { name: "Повторить" }).click();
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   expect(backend.handle("GET", "/auth/me", undefined, { authorization: "Bearer mock:admin" }).status).toBe(200);
 });
 
@@ -284,7 +284,7 @@ test("Keycloak ответил 429 при обновлении токена: эт
 
   limited = false;
   await page.getByRole("button", { name: "Повторить" }).click();
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
 });
 
 test("истёкший токен обновляется незаметно", async ({ page }) => {
@@ -296,7 +296,7 @@ test("истёкший токен обновляется незаметно", as
     if (raw) sessionStorage.setItem("gc.oidc", JSON.stringify({ ...JSON.parse(raw), expiresAt: Date.now() - 1 }));
   });
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   expect(refreshes.length).toBeGreaterThanOrEqual(1);
   expect(refreshes[0]).toContain("grant_type=refresh_token");
   expect(backend.handle("GET", "/auth/me", undefined, { authorization: "Bearer mock:admin" }).status).toBe(200);
