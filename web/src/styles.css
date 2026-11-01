@@ -153,79 +153,62 @@ b,strong{font-weight:600}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 
 /* -------------------------------- вход ------------------------------------ */
-/* Экран входа по макету «Орбиты»: эмблема в центре графа-орбит (LoginOrbits),
-   под ним заголовок и одна кнопка. Точечный фон — общий canvas (CloudField),
-   голубое свечение за эмблемой лежит под ним (z-index:-2), чтобы точки
-   оставались поверх свечения. .login-page с карточкой остаётся для состояний
-   «API недоступен» и «доступ не назначен» (state/auth.tsx). */
-.login-page,.login-screen{position:relative;min-height:100%;box-sizing:border-box}
-.login-page::before,.login-screen::before{content:"";position:absolute;inset:0;z-index:-2;pointer-events:none;
+/* .login-page с карточкой — состояния «API недоступен» и «доступ не назначен» (state/auth.tsx). */
+.login-page{position:relative;min-height:100%;box-sizing:border-box;display:grid;place-items:center;padding:24px}
+.login-page::before{content:"";position:absolute;inset:0;z-index:-2;pointer-events:none;
   background:radial-gradient(40% 55% at 50% 44%,var(--soft) 0%,transparent 72%)}
-.login-page{display:grid;place-items:center;padding:24px}
 .login-card{width:min(440px,100%);padding:36px 44px;box-sizing:border-box}
-.login-screen{display:flex;flex-direction:column;padding:28px 40px;overflow:hidden}
-.login-head{font-weight:700;font-size:15px;line-height:20px;letter-spacing:-.01em}
-.login-head small{display:block;font-weight:400;font-size:11px;line-height:14px;letter-spacing:0;color:var(--ink-2)}
-.login-main{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px 0;text-align:center}
-.login-tag{margin-top:36px;font-size:12px;line-height:16px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--brand)}
-.login-main h1{margin:12px 0 0;max-width:640px;font-size:40px;line-height:46px;font-weight:700;letter-spacing:-.025em}
-.login-main .alert{margin-top:18px;max-width:440px}
-.login-btn{margin-top:28px;height:50px;padding:0 36px;gap:10px;font-size:15px;font-weight:600}
-.login-foot{display:flex;justify-content:flex-end;font-size:12.5px;line-height:18px;color:var(--ink-2)}
 
-/* Граф-орбиты: кольца, спицы к центру и цепочка по кругу. Кольца медленно
-   вращаются; при проверке цели по цепочке прорисовываются линии, у узлов
-   загораются ореолы и всплывают ярлыки найденного — всё CSS-анимациями
-   с задержкой по шагам (узлы неподвижны, см. LoginOrbits.tsx). */
-.login-orbits{position:relative;width:100%;max-width:760px}
-.login-orbits .orbit{display:block;width:100%;height:auto;overflow:visible;user-select:none}
-.orbit .ring{fill:none;stroke:var(--brand);stroke-opacity:.28;stroke-width:1.2;stroke-dasharray:3 6;stroke-linecap:round;
-  animation:orbit-spin linear infinite}
-@keyframes orbit-spin{to{stroke-dashoffset:-9}}
-.orbit .hub-glow{fill:var(--bg);fill-opacity:.7}
-.orbit .hub-disc{fill:var(--panel);stroke:var(--line);filter:drop-shadow(0 10px 14px rgba(6,42,106,.16))}
-.orbit .spoke,.orbit .link{stroke:var(--brand);stroke-opacity:.4;stroke-width:1.4}
-.orbit .node .dot{stroke:var(--panel);stroke-width:2}
-/* Цвета видов — как в легенде графа (features/graph/GraphTab.tsx), чтобы приказ, пункт и правило
-   выглядели одинаково на входе и в каталоге. */
-.orbit .node.order .dot,.orbit .node.goal .dot{fill:var(--brand)}
-.orbit .node.clause .dot{fill:#eb6834}
-.orbit .node.rule .dot{fill:#1baf7a}
-.orbit .node.attr .dot{fill:#eda100}
-.orbit .node.dept .dot{fill:#e87ba4}
-.orbit .node text{font-size:12px;font-weight:500;fill:var(--ink-2);paint-order:stroke;stroke:var(--bg);stroke-width:3px}
-.orbit .scene{animation:orbit-fade linear both}
-@keyframes orbit-fade{0%,91%{opacity:1}100%{opacity:0}}
-.orbit .edge.trace{fill:none;stroke-width:2.6;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;
-  animation:trace-draw .45s ease-out both}
-.orbit .edge.trace.path{stroke:var(--brand)}
-.orbit .edge.trace.ok{stroke:var(--ok)}
-.orbit .edge.trace.bad{stroke:var(--danger)}
-.orbit .halo{fill:none;stroke-width:3;transform-box:fill-box;transform-origin:center;
-  animation:trace-pop .4s ease-out both,trace-pulse 1.8s ease-in-out .4s infinite}
-.orbit .halo.path{stroke:var(--brand)}
-.orbit .halo.ok{stroke:var(--ok)}
-.orbit .halo.bad{stroke:var(--danger)}
-.orbit .halo.hub{stroke-width:2;stroke-opacity:.6}
-.orbit .chip{transform-box:fill-box;transform-origin:center;animation:trace-pop .4s cubic-bezier(.3,1.6,.5,1) both}
-.orbit .chip rect{fill:var(--panel);stroke:var(--brand);stroke-width:1.5}
-.orbit .chip.ok rect{stroke:var(--ok)}
-.orbit .chip.bad rect{stroke:var(--danger);stroke-dasharray:3 3}
-.orbit .chip text{font-size:11px;font-weight:500;fill:var(--ink)}
-.orbit .chip .mark circle{fill:var(--brand)}
-.orbit .chip.ok .mark circle{fill:var(--ok)}
-.orbit .chip.bad .mark circle{fill:var(--danger)}
-.orbit .chip .mark text{font-size:9px;font-weight:700;fill:#fff}
-.login-scene{max-width:640px;min-height:18px;margin:4px auto 0;font-size:13px;line-height:18px;font-weight:500;color:var(--ink-2);
-  text-align:center;animation:orbit-fade linear both}
-@media (max-width:640px){
-  .login-screen{padding:20px 16px}
-  .login-main h1{font-size:28px;line-height:34px}
+/* Экран входа: во весь экран canvas с эмблемой из частиц (LoginEmblem), слева текст и кнопка.
+   Только белый вариант: токены цвета здесь переопределены светлыми значениями, чтобы и в тёмной
+   теме экран, предупреждения и спиннер оставались светлыми. */
+.login-screen{
+  --brand:#0c6ff1; --brand-2:#0a5bd1; --ink:#0f1626; --ink-2:#4b4f58; --ink-3:#8b909a;
+  --line:#e2e5eb; --soft:#e8f1ff; --soft-2:#d5e5ff; --panel:#fff;
+  --warn:#a15c00; --warn-soft:#fff3dc; --danger:#c0342b; --danger-soft:#fdecea;
+  color-scheme:light;
+  position:relative;isolation:isolate;min-height:100%;box-sizing:border-box;overflow:hidden;
+  display:grid;grid-template-rows:auto 1fr auto;
+  padding:28px max(16px,3vw) 24px clamp(16px,7vw,120px);background:#fff;color:var(--ink)}
+/* белая вуаль слева: эмблема не спорит с текстом */
+.login-screen::after{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
+  background:linear-gradient(90deg,rgba(255,255,255,.94) 0%,rgba(255,255,255,.6) 34%,rgba(255,255,255,0) 58%)}
+.login-emblem{position:absolute;inset:0;z-index:-2;display:block;width:100%;height:100%}
+.login-emblem-fallback{position:absolute;z-index:-2;top:50%;right:14%;width:min(300px,30vw);transform:translateY(-50%)}
+.login-head{font-weight:700;font-size:17px;line-height:22px;letter-spacing:-.01em}
+.login-main{align-self:center;display:flex;flex-direction:column;align-items:flex-start;max-width:min(780px,100%)}
+.login-tag{display:flex;align-items:center;gap:10px;font-size:12px;line-height:16px;font-weight:600;letter-spacing:.16em;
+  text-transform:uppercase;color:#2f7ff2;animation:login-rise 1s .15s cubic-bezier(.2,.8,.2,1) both}
+.login-tag::before{content:"";width:28px;height:1.5px;background:currentColor;opacity:.7}
+.login-main h1{margin:18px 0 0;font-size:clamp(40px,6.2vw,84px);line-height:1.02;font-weight:700;letter-spacing:-.045em;
+  animation:login-rise 1s .25s cubic-bezier(.2,.8,.2,1) both}
+.login-main h1 .accent{background:linear-gradient(100deg,#0a2e7a 0%,#2f7ff2 45%,#0c6ff1 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.login-main .alert{margin-top:20px;max-width:440px}
+@keyframes login-rise{from{transform:translateY(.45em);filter:blur(10px);opacity:.15}to{transform:none;filter:none;opacity:1}}
+/* Кнопка: при наведении меняется цвет и вправо удлиняется стрелка (древко растёт, наконечник сдвигается). */
+.login-btn{margin-top:44px;display:inline-flex;align-items:center;gap:14px;height:60px;padding:0 34px 0 38px;border:0;
+  border-radius:999px;font:inherit;font-size:17px;font-weight:600;color:#fff;cursor:pointer;background:var(--brand);
+  box-shadow:0 10px 36px -10px rgba(12,111,241,.35);animation:login-rise 1s .5s cubic-bezier(.2,.8,.2,1) both}
+.login-btn:hover{background:#2b80f4}
+.login-btn:focus-visible{outline:2px solid #2f7ff2;outline-offset:4px}
+.login-btn[disabled]{cursor:progress;background:var(--brand)}
+.login-btn .spinner{border-color:rgba(255,255,255,.35);border-top-color:#fff}
+.login-btn svg{overflow:visible}
+.login-btn .shaft,.login-btn .head{transition:transform .28s cubic-bezier(.2,.8,.2,1)}
+.login-btn .shaft{transform-box:fill-box;transform-origin:left center}
+.login-btn:hover .shaft,.login-btn:focus-visible .shaft{transform:scaleX(1.6)}
+.login-btn:hover .head,.login-btn:focus-visible .head{transform:translateX(6px)}
+.login-foot{display:flex;justify-content:flex-end;font-size:12.5px;line-height:18px;color:var(--ink-3)}
+@media (max-width:760px){
+  .login-screen::after{background:linear-gradient(0deg,rgba(255,255,255,.95) 0%,rgba(255,255,255,.6) 45%,rgba(255,255,255,.1) 75%)}
+  .login-main{align-self:end;margin-bottom:28px}
+  .login-btn{margin-top:28px}
+  .login-emblem-fallback{top:18%;right:50%;transform:translate(50%,-50%);width:160px}
 }
 @media (prefers-reduced-motion:reduce){
-  .orbit .ring,.orbit .scene,.login-scene{animation:none}
-  .orbit .edge.trace{stroke-dashoffset:0;animation:none}
-  .orbit .halo,.orbit .chip{animation:none}
+  .login-tag,.login-main h1,.login-btn{animation:none}
+  .login-btn .shaft,.login-btn .head{transition:none}
 }
 
 /* --------------------------- кнопки и поля -------------------------------- */
