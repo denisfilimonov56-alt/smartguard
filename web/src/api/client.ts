@@ -390,7 +390,7 @@ export const api = {
   mergeDuplicateTargets: () => request<MergeReport>("POST", "/catalog/merge-duplicate-targets"),
 
   /** checkId — по нему интерфейс спрашивает ход этой проверки (checkProgress). */
-  checkGoal: (goal: string, departmentId: string | null, isStudent: boolean, signal?: AbortSignal, checkId?: string) =>
+  checkGoal: (goal: string, departmentId: string, isStudent: boolean, signal?: AbortSignal, checkId?: string) =>
     request<CheckResult>("POST", "/check-goal", { goal, department_id: departmentId, is_student: isStudent },
       { signal, timeoutMs: CHECK_TIMEOUT_MS, headers: checkId ? { "X-Check-Id": checkId } : undefined }),
   /** Рекомендованная формулировка цели по нарушениям из ответа проверки. */

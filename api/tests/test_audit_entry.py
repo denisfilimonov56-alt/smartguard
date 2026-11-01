@@ -111,7 +111,7 @@ def test_key_check_and_failure_are_audited(app, monkeypatch, caplog):
     """Проверка по ключу и отказ — в журнале с источником api и именем ключа (13.1)."""
     client = TestClient(app, headers=bearer(SERVICE_KEY))
     with caplog.at_level(logging.INFO, logger="audit"):
-        assert client.post("/check-goal", json={"goal": "цель"}).status_code == 200
+        assert client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 200
         assert client.post("/catalog/orders", json={}).status_code == 403
     events = [e for e in audit_events(caplog) if e["event"] == "request"]
     assert [(e["path"], e["status"], e["result"], e["blocked"]) for e in events] == [
@@ -464,11 +464,11 @@ def test_single_checks_over_the_limit_get_503_before_a_thread(app, monkeypatch):
     client = TestClient(app, headers=bearer(token()))
     assert main.check_admission.enter(False)
     try:
-        response = client.post("/check-goal", json={"goal": "цель"})
+        response = client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"})
         assert response.status_code == 503 and response.headers["Retry-After"] == "10"
     finally:
         main.check_admission.leave(False)
-    assert client.post("/check-goal", json={"goal": "цель"}).status_code == 200
+    assert client.post("/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 200
     assert main.check_admission.total == 0, "место освобождается после ответа"
 
 
@@ -478,9 +478,9 @@ def test_keys_do_not_take_the_interactive_reserve(app, monkeypatch):
     assert main.check_admission.enter(True)
     try:
         assert TestClient(app, headers=bearer(SERVICE_KEY)).post(
-            "/check-goal", json={"goal": "цель"}).status_code == 503
+            "/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 503
         assert TestClient(app, headers=bearer(token())).post(
-            "/check-goal", json={"goal": "цель"}).status_code == 200
+            "/check-goal", json={"goal": "цель", "department_id": "UCT"}).status_code == 200
     finally:
         main.check_admission.leave(True)
 

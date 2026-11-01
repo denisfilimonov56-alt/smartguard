@@ -5,11 +5,11 @@ import { clauseBlock, expect, go, menu, modal, openRule, panel, PROJECT, selectM
 
 test("список открывается под полем, выбирает мышью и закрывается кликом мимо", async ({ app }) => {
   const field = app.locator("#departmentInput");
-  await expect(field).toHaveText("Подразделение не указано");
+  await expect(field).toHaveText("Выберите подразделение");
   await field.click();
   const list = selectMenu(app);
-  await expect(list.getByRole("option")).toHaveText(["Подразделение не указано", "АГД", "Финансовое управление", "УЦТ"]);
-  await expect(list.getByRole("option", { name: "Подразделение не указано" })).toHaveAttribute("aria-selected", "true");
+  await expect(list.getByRole("option")).toHaveText(["Выберите подразделение", "АГД", "Финансовое управление", "УЦТ"]);
+  await expect(list.getByRole("option", { name: "Выберите подразделение" })).toHaveAttribute("aria-selected", "true");
 
   // Меню — той же ширины, что поле, и сразу под ним.
   const [fieldBox, listBox] = [await field.boundingBox(), await list.boundingBox()];

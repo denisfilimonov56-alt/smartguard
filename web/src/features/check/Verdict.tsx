@@ -1,9 +1,9 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import type { CheckResult, SmartScores } from "../../api/types";
 import { attributeTitle, Chip } from "../../ui/common";
 import { place, plural, ruleKey, unverifiedCount } from "./batch";
-import { SMART_LETTERS, SmartRings } from "./Smart";
+import { SmartRings } from "./Smart";
 
 /* Ответ проверки одной цели человеческим языком: что не так, какой пункт
    приказа и как исправить. Используется и для одной цели, и для каждой
@@ -105,29 +105,19 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu, 
         </div>
       )}
 
-      {/* SMART — справка автору, на вердикт не влияет: в конце, одной строкой оценок;
-          круги с пояснениями — по «Подробнее». */}
+      {/* SMART — справка автору, на вердикт не влияет: в конце, всегда целиком — круги с пояснениями. */}
       {result.smart && <SmartBlock smart={result.smart} />}
     </div>
   );
 }
 
-const SMART_LEVEL = (score: number) => (score >= 70 ? "ok" : score >= 40 ? "warn" : "err");
-
 function SmartBlock({ smart }: { smart: SmartScores }) {
-  const [open, setOpen] = useState(false);
   return (
     <div className="smart-block">
       <div className="smart-head">
         <b>SMART</b><span className="dim">справочно, на вердикт не влияет</span>
-        {!open && SMART_LETTERS.map(({ key, letter, name }) => (
-          <span key={key} className={`badge ${SMART_LEVEL(smart[key]?.score ?? 0)}`} title={`${name}: ${smart[key]?.comment ?? ""}`}>
-            {letter} {smart[key]?.score ?? 0}</span>
-        ))}
-        <button type="button" className="btn sm ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
-          {open ? "Свернуть" : "Подробнее"}</button>
       </div>
-      {open && <SmartRings smart={smart} />}
+      <SmartRings smart={smart} />
     </div>
   );
 }

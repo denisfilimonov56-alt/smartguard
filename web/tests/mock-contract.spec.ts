@@ -22,10 +22,18 @@ test("/auth/me отдаёт пределы API", () => {
   expect(reply.body).toMatchObject({ login: "viewer", limits: { maxGoalsPerRequest: 200, goalMaxChars: 4000 } });
 });
 
+test("одиночная проверка без подразделения — 422, как в API; число — строкой", () => {
+  const backend = createBackend();
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель" }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель", department_id: "  " }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель", department_id: null }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель", department_id: " UCT " }, as("viewer")).status).toBe(200);
+});
+
 test("цель: пустая и длиннее 4000 символов — 422, числовые id — строкой", () => {
   const backend = createBackend();
-  expect(backend.handle("POST", "/check-goal", { goal: "   " }, as("viewer")).status).toBe(422);
-  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(4001) }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "   ", department_id: "UCT" }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(4001), department_id: "UCT" }, as("viewer")).status).toBe(422);
   expect(backend.handle("POST", "/check-goals", [{ goal: "", department_id: "UCT" }], as("viewer")).status).toBe(422);
 
   const reply = backend.handle("POST", "/check-goals",
@@ -42,8 +50,8 @@ test("предел длины цели — настройка goalMaxChars: /aut
   expect(backend.handle("PUT", "/settings", { goalMaxChars: 99 }, as("admin")).status).toBe(422);
   expect(backend.handle("PUT", "/settings", { goalMaxChars: 100 }, as("admin")).status).toBe(200);
   expect(backend.handle("GET", "/auth/me", undefined, as("viewer")).body).toMatchObject({ limits: { goalMaxChars: 100 } });
-  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(100) }, as("viewer")).status).toBe(200);
-  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(101) }, as("viewer")).status).toBe(422);
+  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(100), department_id: "UCT" }, as("viewer")).status).toBe(200);
+  expect(backend.handle("POST", "/check-goal", { goal: "я".repeat(101), department_id: "UCT" }, as("viewer")).status).toBe(422);
   expect(backend.handle("POST", "/check-goals", [{ goal: "я".repeat(101), department_id: "UCT" }], as("viewer")).status)
     .toBe(422);
 });
@@ -187,11 +195,11 @@ test("лимит проверок в минуту: скользящее окно
   expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 2 }, as("admin")).status).toBe(200);
   const goals = (n: number) => Array.from({ length: n }, () => ({ goal: "Цель", department_id: "UCT" }));
   expect(backend.handle("POST", "/check-goals", goals(5), as("viewer")).status).toBe(200);
-  const refused = backend.handle("POST", "/check-goal", { goal: "Цель" }, as("viewer"));
+  const refused = backend.handle("POST", "/check-goal", { goal: "Цель", department_id: "UCT" }, as("viewer"));
   expect(refused.status).toBe(429);
   expect(Number(refused.headers?.["Retry-After"])).toBeGreaterThan(0);
   // У другого пользователя своё окно.
-  expect(backend.handle("POST", "/check-goal", { goal: "Цель" }, as("editor")).status).toBe(200);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель", department_id: "UCT" }, as("editor")).status).toBe(200);
   backend.advanceClock(61);
-  expect(backend.handle("POST", "/check-goal", { goal: "Цель" }, as("viewer")).status).toBe(200);
+  expect(backend.handle("POST", "/check-goal", { goal: "Цель", department_id: "UCT" }, as("viewer")).status).toBe(200);
 });
