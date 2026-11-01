@@ -81,7 +81,9 @@ b,strong{font-weight:600}
 .brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:15px;letter-spacing:-.01em;white-space:nowrap;
   padding:0 6px 22px}
 .brand img{height:36px;display:block;flex:none}
-.brand small{display:block;font-weight:400;font-size:11px;letter-spacing:0;color:var(--ink-3)}
+/* Рядом с булавкой подпись в строку не влезает, поэтому разбита на две строки в разметке (App.tsx).
+   Перенос по ширине не годится: в свёрнутой панели слова встают столбиком, шапка растёт и сдвигает иконки. */
+.brand small{display:block;margin-top:2px;font-weight:400;font-size:11px;line-height:1.35;letter-spacing:0;color:var(--ink-3)}
 .nav-item{display:flex;align-items:center;gap:14px;width:100%;padding:11px 15px;border:0;border-radius:14px;background:none;
   font-weight:500;color:var(--ink-2);cursor:pointer;text-align:left;text-decoration:none;box-sizing:border-box;white-space:nowrap}
 .nav-item:hover{background:var(--soft);color:var(--brand)}

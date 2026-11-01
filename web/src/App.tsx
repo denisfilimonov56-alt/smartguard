@@ -192,7 +192,7 @@ export function App() {
         onMouseLeave={() => setFolded(false)} onKeyDown={() => setFolded(false)}>
         <div className="brand">
           <img src={logo} alt="" />
-          <div>SmartGuard<small>проверка целей по приказам</small></div>
+          <div>SmartGuard<small>проверка целей<br />по приказам</small></div>
           {wide && (
             <button type="button" className="pin-btn label" aria-pressed={dockPref} onClick={toggleDock}
               title={dockPref ? "Открепить панель: сворачивать до иконок" : "Закрепить панель раскрытой"}
