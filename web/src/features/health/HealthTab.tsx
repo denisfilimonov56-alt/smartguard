@@ -198,7 +198,7 @@ function Report({ report, repairing, fixes, isAdmin, onGoTo }: {
             )}
           </div>
         );
-      }) : <Empty icon="check" title="Замечаний нет">Граф внутренне непротиворечив: проверки работают на полных данных.</Empty>}
+      }) : <Empty icon="check" title="Замечаний нет">Противоречий в графе нет: проверки работают на полных данных.</Empty>}
     </>
   );
 }

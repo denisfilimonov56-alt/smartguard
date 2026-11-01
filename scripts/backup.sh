@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Регулярная резервная копия без остановки сервиса (docs/deployment.md,
-# «Регулярная копия»). Снимает с работающего стека:
+# «Ночная копия»). Снимает с работающего стека:
 #
 #   data.cypher   каталог — export_graph.py --stdout, тот же MERGE-скрипт,
 #                 что грузит сидер (одна транзакция чтения: согласован);
@@ -132,7 +132,7 @@ finally:
     driver.close()
 
 print("// Пользователи, ключи доступа и настройки (scripts/backup.sh).")
-print("// Восстановление — docs/deployment.md, «Регулярная копия».")
+print("// Восстановление — docs/deployment.md, «Ночная копия».")
 for label, key in KEYS:
     rows = [p for p in data[label] if p.get(key) is not None]
     for p in rows:

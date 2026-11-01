@@ -328,7 +328,7 @@ test.describe("читатель", () => {
 
     await go(app, "Приказы");
     await expect(orderDoc(app)).toContainText("О порядке постановки целей");
-    for (const name of ["+ Добавить приказ", "+ Добавить пункт", "+ Правило", "Изменить", "Действия"])
+    for (const name of ["+ Приказ", "+ Добавить пункт", "+ Правило", "Изменить", "Действия"])
       await expect(app.locator("#tab-orders").getByRole("button", { name })).toHaveCount(0);
 
     await go(app, "Атрибуты");
