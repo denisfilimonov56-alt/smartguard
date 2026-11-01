@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
 DOCS = os.getenv("ENABLE_DOCS", "0").strip().lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(
-    title="Goal Checker Agent", version="1.0.0", lifespan=lifespan,
+    title="SmartGuard", version="1.0.0", lifespan=lifespan,
     docs_url="/docs" if DOCS else None, redoc_url=None,
     openapi_url="/openapi.json" if DOCS else None,
 )
