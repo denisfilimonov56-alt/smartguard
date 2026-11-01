@@ -29,7 +29,7 @@ interface FieldBase {
 
 export type Field =
   | (FieldBase & { type?: "text" | "date"; value?: string; placeholder?: string; maxLength?: number })
-  | (FieldBase & { type: "textarea"; value?: string; placeholder?: string; maxLength?: number })
+  | (FieldBase & { type: "textarea"; value?: string; placeholder?: string; maxLength?: number; rows?: number })
   | (FieldBase & { type: "select"; value?: string; options: Option[] })
   | (FieldBase & { type: "checkbox"; value?: boolean })
   | (FieldBase & { type: "multi"; value?: string[]; options: Option[]; emptyText?: string });
@@ -365,6 +365,7 @@ function FieldControl({ field: f, value, onChange, autoFocus }: {
   let control: ReactNode;
   if (f.type === "textarea") {
     control = <textarea id={id} value={value as string} placeholder={f.placeholder} autoFocus={autoFocus} maxLength={f.maxLength}
+      rows={f.rows}
       onChange={(e) => onChange(e.target.value)} />;
   } else if (f.type === "select") {
     control = (

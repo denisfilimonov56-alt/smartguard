@@ -1,4 +1,4 @@
-import { api, ApiError } from "../../api/client";
+import { api, ApiError, type BatchProgress } from "../../api/client";
 import type { BatchCheck, CheckResult, CheckStatus, Department, GoalItem, Violation } from "../../api/types";
 import { writeWorkbook, type Sheet } from "../../lib/xlsx";
 import type { BatchRow, BatchSnapshot } from "../../state/checkForm";
@@ -286,8 +286,30 @@ function waitRetry(seconds: number, signal: AbortSignal | undefined, onWait?: (s
     (пакетная проверка выключена, обслуживание) не повторяется. onWait получает оставшиеся
     секунды ожидания каждую секунду и причину, и null, когда ожидание кончилось.
     signal останавливает пакет: текущий запрос или ожидание повтора прерывается, следующие части не отправляются. */
+/** Как часто спрашивать ход части пакета, мс. */
+const LIVE_POLL_MS = 500;
+/** Номер части для X-Check-Id: randomUUID есть только в защищённом контексте (https, localhost). */
+const newPartId = () => globalThis.crypto?.randomUUID?.()
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+
+/** Ход части пакета: offset — номер первой цели части среди rows; final — последний снимок части. */
+export type OnLive = (offset: number, progress: BatchProgress, final: boolean) => void;
+
+/** Спрашивать ход части, пока она идёт; API без хода (404, ошибка) больше не спрашиваем. */
+async function followPart(partId: string, offset: number, onLive: OnLive, done: { value: boolean }) {
+  while (!done.value) {
+    await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
+    if (done.value) return;
+    try {
+      onLive(offset, await api.batchProgress(partId), false);
+    } catch {
+      return;
+    }
+  }
+}
+
 export async function runBatch(rows: BatchRow[], fallback: string, chunk: number, onPart: (partial: BatchCheck) => void,
-  signal?: AbortSignal, onWait?: (seconds: number | null, reason: WaitReason) => void): Promise<BatchCheck> {
+  signal?: AbortSignal, onWait?: (seconds: number | null, reason: WaitReason) => void, onLive?: OnLive): Promise<BatchCheck> {
   const items: GoalItem[] = rows.map((r) => ({
     goal: r.goal.trim(), department_id: r.departmentId.trim() || fallback, is_student: r.isStudent,
     id: r.id.trim() || null,
@@ -298,9 +320,16 @@ export async function runBatch(rows: BatchRow[], fallback: string, chunk: number
   for (let start = 0; start < items.length;) {
     if (signal?.aborted) throw new ApiError("Запрос отменён", -1);
     let part: BatchCheck;
+    const partId = newPartId();
+    const finished = { value: false };
+    if (onLive) void followPart(partId, start, onLive, finished);
     try {
-      part = await api.checkGoals(items.slice(start, start + size), signal);
+      part = await api.checkGoals(items.slice(start, start + size), signal, onLive ? partId : undefined);
+      finished.value = true;
+      // Последний снимок части — с временем всех её целей и токенами.
+      if (onLive) await api.batchProgress(partId).then((last) => onLive(start, last, true), () => undefined);
     } catch (err) {
+      finished.value = true;
       if (err instanceof ApiError && err.status === 413 && size > 1) { size = Math.max(1, Math.floor(size / 2)); continue; }
       // 429 без Retry-After — ограничение частоты запросов у прокси (nginx limit_req, тело — его HTML-страница):
       // своя пауза с нарастанием, 2–5 с.

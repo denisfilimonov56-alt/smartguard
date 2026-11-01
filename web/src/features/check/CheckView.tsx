@@ -10,6 +10,7 @@ import { Spinner } from "../../ui/common";
 import { Select } from "../../ui/Select";
 import { useAdviceDialog } from "./AdviceDialog";
 import { BatchCheck } from "./BatchCheck";
+import { CheckProgress } from "./CheckProgress";
 import { JsonBlock } from "./JsonBlock";
 import { Verdict } from "./Verdict";
 
@@ -151,6 +152,7 @@ export function CheckView() {
                 )}
               </div>
 
+              {(busy || result) && <CheckProgress progress={single.progress} busy={busy} />}
               {dispute && (
                 <div className="card pad" id="checkDispute" style={{ marginTop: 16 }}>
                   <div className="row" style={{ gap: 16 }}>

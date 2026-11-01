@@ -11,7 +11,10 @@ import { Spinner } from "../../ui/common";
 import { Overlay, useDialogs } from "../../ui/Dialogs";
 import { Select, type SelectOption } from "../../ui/Select";
 import { errorText, useToast } from "../../ui/Toasts";
+import type { BatchItemProgress } from "../../api/client";
 import { useAdviceDialog } from "./AdviceDialog";
+import { BatchProgress, RowLive } from "./BatchProgress";
+import { seconds } from "./CheckProgress";
 import {
   MAX_ROWS, SHEET_MAX_ROWS, STATUS_CLASS, STATUS_LABEL, detectColumns, emptyRow, hasErrors, plural, resultsWorkbook,
   ruleKey, rowsFromSheet, sameRow, sheetWidth, summaryOf, templateWorkbook, unverifiedCount, validateRows,
@@ -143,6 +146,8 @@ export function BatchCheck() {
         </div>
       </div>
 
+      <BatchProgress live={batchRun.live} rows={rows} running={busy} />
+
       <div className="card batch-card" id="batchRows" style={{ marginTop: 16 }}>
         <div className="row wrap batch-head">
           <span className="mid">{rows.length ? plural(rows.length, ["цель", "цели", "целей"]) : "Целей пока нет"}</span>
@@ -167,6 +172,7 @@ export function BatchCheck() {
             <tbody>
               {rows.map((row, i) => (
                 <BatchTableRow key={row.key} row={row} index={i} issues={issues.get(row.key)} outcome={outcomeOf(row)}
+                  live={batchRun.live?.items[row.key]}
                   options={options} fallbackName={fallbackName} onPatch={patch} onRemove={remove} />
               ))}
             </tbody>
@@ -189,6 +195,8 @@ interface RowProps {
   index: number;
   issues: Issue[] | undefined;
   outcome: Outcome;
+  /** Ход цели в идущем или последнем пакете. */
+  live: BatchItemProgress | undefined;
   options: SelectOption[];
   fallbackName: string | undefined;
   onPatch: (key: string, change: Partial<BatchRow>) => void;
@@ -198,7 +206,7 @@ interface RowProps {
 /** Строка таблицы: перерисовывается, только когда меняется она сама, — ввод в одной строке
     не перерисовывает остальные сотни. validateRows каждый раз даёт новые массивы, поэтому
     замечания сравниваются по содержимому. */
-const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome, options, fallbackName, onPatch, onRemove }: RowProps) {
+const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome, live, options, fallbackName, onPatch, onRemove }: RowProps) {
   const known = options.some((o) => o.value === row.departmentId);
   const rowOptions = useMemo(() => [
     { value: "", label: fallbackName ? `По умолчанию (${fallbackName})` : "Не указано" },
@@ -234,7 +242,14 @@ const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome,
           ? <span className="badge" title="Пакет не уложился в отведённое время: цель не проверена, отправьте её снова">не проверено, отправьте снова</span>
           : outcome === "failed"
           ? <span className="badge warn" title="Проверка сорвалась из-за временного сбоя: «Проверить оставшиеся» отправит цель снова">сбой, отправьте снова</span>
-          : outcome && <span className={`badge ${STATUS_CLASS[outcome]}`}>{STATUS_LABEL[outcome]}</span>}
+          : outcome ? <span className={`badge ${STATUS_CLASS[outcome]}`}>{STATUS_LABEL[outcome]}</span>
+          // Ответ части ещё не пришёл, а ход уже знает итог цели — показать его сразу.
+          : live?.status === "done" && live.verdict ? <span className={`badge ${STATUS_CLASS[live.verdict]}`}>{STATUS_LABEL[live.verdict]}</span>
+          : live && <RowLive item={live} />}
+        {outcome !== "stale" && live?.status === "done" && live.seconds != null && (
+          <span className="bp-row-time" title={live.cached ? "Ответ из кэша" : "Сколько проверялась цель"}>
+            {live.cached ? "кэш" : seconds(live.seconds)}</span>
+        )}
       </td>
       <td className="x">
         <button className="close-x" aria-label={`Удалить строку ${n}`} title="Удалить строку"
@@ -243,6 +258,7 @@ const BatchTableRow = memo(function BatchTableRow({ row, index, issues, outcome,
     </tr>
   );
 }, (a, b) => a.row === b.row && a.index === b.index && a.outcome === b.outcome && a.options === b.options
+  && a.live?.status === b.live?.status && a.live?.seconds === b.live?.seconds && a.live?.verdict === b.live?.verdict
   && a.fallbackName === b.fallbackName && a.onPatch === b.onPatch && a.onRemove === b.onRemove && sameIssues(a.issues, b.issues));
 
 type Catalog = ReturnType<typeof useCatalog>;

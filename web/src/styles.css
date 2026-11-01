@@ -595,6 +595,56 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .optlist label:hover{background:var(--soft)}
 .optlist input{margin-top:3px;flex:none}
 .optlist .d{color:var(--ink-3);font-size:12.5px}
+/* Ход проверки цели (features/check/CheckProgress.tsx) и выписки обязанностей (departments/DutiesProgress.tsx) */
+.cp{margin-top:16px}
+.cp-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.cp-head .mid{flex:1}
+.cp-tokens{color:var(--ink-3);font-size:12.5px;font-variant-numeric:tabular-nums}
+.cp-step{display:grid;grid-template-columns:20px minmax(0,1fr) 56px;gap:10px;align-items:start;padding:6px 0;font-size:13px}
+.cp-step > .ico{margin-top:1px}
+.cp-icon{width:20px;height:20px;border-radius:50%;border:1.5px solid var(--line);box-sizing:border-box}
+.cp-step.running .cp-icon{border-top-color:var(--brand);animation:spin .7s linear infinite}
+.cp-step.skipped .cp-icon{border-style:dashed}
+.cp-step.waiting,.cp-step.skipped{color:var(--ink-3)}
+.cp-detail{color:var(--ink-2);font-size:12.5px}
+.cp-step.waiting .cp-detail,.cp-step.skipped .cp-detail{color:var(--ink-3)}
+.cp-time{color:var(--ink-3);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
+.cp-note{color:var(--ink-3);font-size:12px;margin:4px 0 0 30px}
+.cp-lanes{border-left:1.5px solid var(--line);margin:2px 0 2px 9px;padding-left:12px}
+.cp-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.cp-chip{font-size:12px;border-radius:8px;padding:2px 8px;background:var(--soft);color:var(--brand-2);animation:fade .3s}
+.cp-chip.warn{background:var(--warn-soft);color:var(--warn)}
+.cp-icon.spinning{border-top-color:var(--brand);animation:spin .7s linear infinite;flex:none}
+/* Ход пакетной проверки (features/check/BatchProgress.tsx) */
+.bp-bar{display:flex;height:6px;border-radius:3px;background:var(--panel-2);overflow:hidden;margin:10px 0 6px}
+.bp-bar i{display:block;height:100%;transition:width .3s}
+.bp-bar .ok{background:var(--ok)} .bp-bar .warn{background:var(--warn)} .bp-bar .bad{background:var(--danger)}
+.bp-bar .run{background:var(--soft-2)}
+.bp-line{display:flex;justify-content:space-between;color:var(--ink-2);font-size:12.5px}
+.bp-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.bp-stats > div{background:var(--panel-2);border-radius:10px;padding:8px 10px}
+.bp-stats span{display:block;color:var(--ink-3);font-size:12px}
+.bp-stats b{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
+.bp-avg{margin-top:8px}
+.bp-lane{display:grid;grid-template-columns:20px minmax(0,1fr) auto 48px;gap:10px;align-items:center;padding:6px 0;
+  border-top:1px solid var(--line-soft);font-size:13px}
+.bp-goal{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bp-dots{display:flex;gap:4px}
+.bp-dot{width:8px;height:8px;border-radius:50%;border:1px solid var(--line);background:var(--panel-2)}
+.bp-dot.done{background:var(--ok);border-color:var(--ok)}
+.bp-dot.running{background:var(--brand);border-color:var(--brand);animation:pulse 1s ease-in-out infinite}
+.bp-queued{color:var(--ink-3)}
+.bp-row-run{display:inline-flex;align-items:center;gap:6px;color:var(--brand-2);font-size:12.5px;white-space:nowrap}
+.bp-row-run .cp-icon{width:14px;height:14px}
+.bp-row-time{margin-left:6px;color:var(--ink-3);font-size:12px;font-variant-numeric:tabular-nums}
+.cp-summary{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:14px}
+.cp-summary .cp-detail{flex:1}
+.duties-stage{display:flex;align-items:center;gap:10px;font-size:14px}
+.duties-live{margin:12px 0;padding-left:22px;font-size:14px;line-height:1.7}
+.duties-live li{animation:fade .3s}
+.duties-live .typing{color:var(--ink-2)}
+.duties-live .caret{display:inline-block;width:2px;height:14px;margin-left:2px;vertical-align:-2px;background:var(--brand);
+  animation:pulse 1s steps(1) infinite}
 .prop-row{display:grid;grid-template-columns:minmax(120px,1fr) 118px minmax(160px,2fr) auto;gap:8px;align-items:start;margin-bottom:8px}
 .prop-row.removed input,.prop-row.removed .select{opacity:.45;text-decoration:line-through}
 .popup{position:fixed;z-index:70;min-width:150px;background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r-md);

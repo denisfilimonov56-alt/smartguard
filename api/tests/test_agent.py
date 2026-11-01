@@ -1134,6 +1134,45 @@ def test_extract_duties_cleans_and_deduplicates(monkeypatch):
     assert client.calls[0]["max_tokens"] == agent.DUTIES_MAX_TOKENS
 
 
+def test_duties_so_far_reads_unfinished_answer():
+    assert agent.duties_so_far('{"duties": [" Готовит  отчёт", "Ведёт \\"реестр\\"", "Прин') == (
+        ["Готовит отчёт", 'Ведёт "реестр"'], "Прин")
+    assert agent.duties_so_far('{"duties": ["Готовит \\') == ([], "Готовит")
+    assert agent.duties_so_far('{"dut') == ([], "")
+
+
+def _chunk(text):
+    delta = type("Delta", (), {"content": text})
+    return type("Chunk", (), {"choices": [type("Choice", (), {"delta": delta})]})
+
+
+def test_extract_duties_reports_progress_from_stream(monkeypatch):
+    pieces = ['{"duties": ["Готовит ', 'отчёт", "Ведёт', ' реестр"]}']
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return iter(_chunk(p) for p in pieces)
+
+    client = type("Client", (), {"chat": type("Chat", (), {
+        "completions": type("C", (), {"create": staticmethod(create)})})})
+    monkeypatch.setattr(agent, "get_client", lambda: client)
+    reports = []
+    with agent.reporting_duties(lambda **state: reports.append(state)):
+        assert agent.extract_duties("текст инструкции") == ["Готовит отчёт", "Ведёт реестр"]
+    assert calls[0]["stream"] is True
+    assert reports[0] == {"stage": "reading", "part": 1, "parts": 1, "duties": [], "partial": ""}
+    assert [(r["duties"], r["partial"]) for r in reports[1:]] == [
+        ([], "Готовит"), (["Готовит отчёт"], "Ведёт"), (["Готовит отчёт", "Ведёт реестр"], "")]
+
+
+def test_extract_duties_without_reporter_is_not_streamed(monkeypatch):
+    client = _RecordingClient('{"duties": ["Обязанность"]}')
+    monkeypatch.setattr(agent, "get_client", lambda: client)
+    agent.extract_duties("текст инструкции")
+    assert "stream" not in client.calls[0]
+
+
 def test_extract_duties_reads_long_text_in_parts(monkeypatch):
     client = _RecordingClient('{"duties": ["Обязанность"]}')
     monkeypatch.setattr(agent, "get_client", lambda: client)

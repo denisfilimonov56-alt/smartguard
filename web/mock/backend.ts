@@ -50,6 +50,140 @@ export interface Reply {
   /** Ответ фейкового Keycloak: страница входа (text/html) или перенаправление (Location). */
   contentType?: string;
   headers?: Record<string, string>;
+  /** liveModel: через сколько мс отдать ответ (vite.config.ts ждёт) — «модель думает». */
+  delayMs?: number;
+}
+
+/* ---- liveModel: модель «думает» по-настоящему долго (только npm run dev:mock) ----
+   Ход проверки — как его будет отдавать API по GET /check-progress/{id}: шаги
+   с состоянием и временем, найденные атрибуты, совпавшие обязанности. План
+   строится из готового ответа фейка, а показывается по прошедшему времени. */
+
+type StageKey = "cache" | "queue" | "attributes" | "jobs" | "smart" | "rules";
+interface StagePlan { key: StageKey; start: number; end: number; skipped?: string; running: string; done: string;
+  /** Обращение к модели: токены запроса и ответа (ответ «генерируется» от start до end). */
+  llm?: { prompt: number; completion: number } }
+interface CheckPlan { stages: StagePlan[]; total: number; attributes: { name: string; quote: string | null; at: number }[];
+  duties: { duty: string; at: number }[] }
+
+function liveCheckPlan(result: { detected_attributes: string[]; attribute_quotes: Record<string, string>;
+  violations: { matched_duties?: { duty: string }[] }[]; smart: unknown }, jobs: { skip?: string; docs: number },
+  targets: number, rules: number): CheckPlan {
+  const begin = 500; // кэш и очередь
+  const names = result.detected_attributes.filter((n, i, all) => all.indexOf(n) === i);
+  const attrEnd = begin + 2200 + 250 * names.length;
+  const jobEnd = jobs.skip ? begin : begin + 3000;
+  const rulesStart = Math.max(attrEnd, jobEnd);
+  const duties = [...new Set(result.violations.flatMap((v) => (v.matched_duties ?? []).map((d) => d.duty)))];
+  return {
+    total: rulesStart + 150,
+    stages: [
+      { key: "cache", start: 0, end: 200, running: "ищем такую же цель среди недавних", done: "нет — проверяем заново" },
+      { key: "queue", start: 200, end: begin, running: "ждём свободное место", done: "место получено" },
+      { key: "attributes", start: begin, end: attrEnd, running: `модель ищет атрибутов: ${targets}`,
+        done: `найдено ${names.length} из ${targets}`, llm: { prompt: 640 + 85 * targets, completion: 18 + 26 * names.length } },
+      { key: "jobs", start: begin, end: jobEnd, skipped: jobs.skip,
+        running: `сравниваем с инструкциями: ${jobs.docs}`, done: duties.length ? "есть совпадение с обязанностью" : "совпадений нет",
+        llm: { prompt: 520 + 340 * jobs.docs, completion: 22 + 30 * duties.length } },
+      { key: "smart", start: begin, end: result.smart ? begin + 900 : begin,
+        skipped: result.smart ? undefined : "выключена в настройках", running: "оцениваем по критериям", done: "готово",
+        llm: { prompt: 410, completion: 96 } },
+      { key: "rules", start: rulesStart, end: rulesStart + 150, running: `правил: ${rules}`,
+        done: `нарушений: ${result.violations.length}` },
+    ],
+    attributes: names.map((name, i) => ({ name, quote: result.attribute_quotes[name] ?? null,
+      at: begin + 1600 + i * ((attrEnd - begin - 1700) / Math.max(names.length, 1)) })),
+    duties: duties.map((duty) => ({ duty, at: jobEnd })),
+  };
+}
+
+function liveCheckView(plan: CheckPlan, elapsed: number) {
+  // Токены ответа растут равномерно, пока идёт обращение; запрос считается целиком с его начала.
+  const llm = plan.stages.filter((s) => s.llm && !s.skipped && elapsed >= s.start);
+  const written = (s: StagePlan) => Math.round(s.llm!.completion * Math.min(1, (elapsed - s.start) / Math.max(s.end - s.start, 1)));
+  const completion = llm.reduce((sum, s) => sum + written(s), 0);
+  const llmStart = Math.min(...plan.stages.filter((s) => s.llm && !s.skipped).map((s) => s.start));
+  const llmEnd = Math.max(...plan.stages.filter((s) => s.llm && !s.skipped).map((s) => s.end));
+  const llmSeconds = (Math.min(elapsed, llmEnd) - llmStart) / 1000;
+  return {
+    elapsedSeconds: Math.round(Math.min(elapsed, plan.total) / 100) / 10,
+    tokens: { prompt: llm.reduce((sum, s) => sum + s.llm!.prompt, 0), completion },
+    tokensPerSecond: llmSeconds > 0.2 ? Math.round(completion / llmSeconds) : null,
+    stages: plan.stages.map((s) => ({
+      key: s.key,
+      status: s.skipped ? "skipped" : elapsed >= s.end ? "done" : elapsed >= s.start ? "running" : "waiting",
+      seconds: !s.skipped && elapsed >= s.end ? Math.round((s.end - s.start) / 100) / 10 : null,
+      detail: s.skipped ?? (elapsed >= s.end ? s.done : s.running),
+      tokens: s.llm && !s.skipped && elapsed >= s.start ? written(s) : null,
+    })),
+    attributes: plan.attributes.filter((a) => elapsed >= a.at).map(({ name, quote }) => ({ name, quote })),
+    matchedDuties: plan.duties.filter((d) => elapsed >= d.at).map((d) => d.duty),
+  };
+}
+
+/* ---- liveModel: ход пакета (GET /batch-progress/{id}) ----
+   Цели пакета раскладываются по местам у модели (как пакетный слот очереди
+   API): цель занимает место на время своего плана, следующая берёт первое
+   освободившееся. */
+
+/** Мест у модели под пакет — как на сервере с картой 24 ГБ: 8 одновременных, 2 в резерве ручных. */
+const LIVE_BULK_SLOTS = 6;
+
+/** Ответ из кэша (и цель, до которой не дошли): мгновенно, к модели не идёт. */
+const CACHED_PLAN: CheckPlan = {
+  total: 150, attributes: [], duties: [],
+  stages: [
+    { key: "cache", start: 0, end: 150, running: "ищем готовый ответ", done: "ответ из кэша" },
+    ...(["queue", "attributes", "jobs", "smart", "rules"] as StageKey[]).map((key) => (
+      { key, start: 0, end: 0, skipped: "ответ из кэша", running: "", done: "" })),
+  ],
+};
+
+interface LiveBatch { started: number; total: number;
+  items: { plan: CheckPlan; start: number; cached: boolean; verdict: string | null }[] }
+
+function liveBatchSchedule(items: { plan: CheckPlan; cached: boolean; verdict: string | null }[], slots: number): LiveBatch {
+  const free = Array.from({ length: slots }, () => 0);
+  const placed = items.map((item) => {
+    const slot = free.indexOf(Math.min(...free));
+    const start = free[slot];
+    free[slot] = start + item.plan.total;
+    return { ...item, start };
+  });
+  return { started: Date.now(), total: Math.max(0, ...free), items: placed };
+}
+
+function liveBatchView(batch: LiveBatch, elapsed: number) {
+  const stageSeconds: Record<string, { total: number; count: number }> = {};
+  let prompt = 0;
+  let completion = 0;
+  const items = batch.items.map((item, index) => {
+    const own = elapsed - item.start;
+    const status = own < 0 ? "queued" : own < item.plan.total ? "running" : "done";
+    if (status === "queued") return { index, status, stage: null, seconds: null, cached: item.cached, verdict: null };
+    const view = liveCheckView(item.plan, Math.min(own, item.plan.total));
+    prompt += view.tokens.prompt;
+    completion += view.tokens.completion;
+    if (status === "done")
+      for (const s of view.stages) if (s.seconds != null && !item.cached) {
+        const sum = stageSeconds[s.key] ??= { total: 0, count: 0 };
+        sum.total += s.seconds;
+        sum.count++;
+      }
+    return {
+      index, status, cached: item.cached, verdict: status === "done" ? item.verdict : null,
+      stage: status === "running" ? view.stages.find((s) => s.status === "running")?.key ?? null : null,
+      seconds: Math.round(Math.min(own, item.plan.total) / 100) / 10,
+    };
+  });
+  const seconds = Math.min(elapsed, batch.total) / 1000;
+  return {
+    elapsedSeconds: Math.round(seconds * 10) / 10,
+    total: items.length, done: items.filter((i) => i.status === "done").length,
+    tokens: { prompt, completion },
+    tokensPerSecond: seconds > 0.5 ? Math.round(completion / seconds) : null,
+    stageSeconds, items,
+  };
 }
 
 const LOGIN_REQUIRED = "Требуется вход";
@@ -192,8 +326,14 @@ function seed() {
 /** user — кто делает запросы без заголовка Authorization (вызовы из самих тестов);
     firstLogin — обучение по интерфейсу ещё не пройдено. */
 /** bulkBusy — столько первых запросов /check-goals получат 503 с Retry-After: 1, как API сверх BULK_MAX_REQUESTS. */
-export function createBackend(options: { user?: string; firstLogin?: boolean; bulkBusy?: number } = {}) {
+/** liveModel — проверка и выписка идут секунды и отдают ход, как настоящая модель (npm run dev:mock; тесты — без него). */
+export function createBackend(options: { user?: string; firstLogin?: boolean; bulkBusy?: number; liveModel?: boolean } = {}) {
   let bulkBusy = options.bulkBusy ?? 0;
+  // liveModel: идущие проверки по X-Check-Id и задержка ответа текущего запроса.
+  const liveChecks = new Map<string, { started: number; plan: CheckPlan }>();
+  const liveBatches = new Map<string, LiveBatch>();
+  let checkId: string | undefined;
+  let delayMs = 0;
   // Следующий /check-goals проверит только столько целей, остальные вернёт непроверенными
   // (unchecked), как API, чей пакет остановлен по сроку BULK_DEADLINE_SECONDS; null — проверит все.
   let bulkStopAfter: number | null = null;
@@ -859,7 +999,30 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
      интерфейс проходит тот же путь с опросом, что и с настоящим API. */
   function startDuties(n: Node) {
     Object.assign(n.props, { dutiesStatus: "pending", dutiesError: null });
+    if (options.liveModel) dutiesStarted.set(n.id, Date.now());
     return new Accepted(jobNode(n));
+  }
+  /* liveModel: модель «пишет» обязанности по символу — 1,5 с на чтение, затем
+     40 символов в секунду; GET отдаёт ход (dutiesProgress), как routes.py. */
+  const dutiesStarted = new Map<string, number>();
+  const DUTIES_READ_MS = 1500;
+  const DUTIES_CHARS_PER_MS = 0.04;
+  function dutiesProgress(n: Node) {
+    const started = dutiesStarted.get(n.id);
+    if (started === undefined) return null;
+    const elapsed = Date.now() - started;
+    const all = splitDuties(String(n.props.text ?? ""));
+    const written = Math.floor(Math.max(0, elapsed - DUTIES_READ_MS) * DUTIES_CHARS_PER_MS);
+    if (written > all.join("").length) return null; // дописано — пора отдавать список
+    const duties: string[] = [];
+    let left = written;
+    for (const duty of all) {
+      if (left < duty.length) return { stage: elapsed < DUTIES_READ_MS ? "reading" : "writing", part: 1, parts: 1,
+        duties, partial: duty.slice(0, left).trim(), elapsedSeconds: Math.round(elapsed / 100) / 10 };
+      duties.push(duty);
+      left -= duty.length;
+    }
+    return null;
   }
   /** Выписка «зависла»: pending остался от прерванного процесса (тест — backend.stallDuties). */
   const stalled = new Set<string>();
@@ -1086,6 +1249,18 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     };
   }
 
+  /** liveModel: план хода одной проверки по её ответу — какие шаги, сколько длятся, что найдено. */
+  function livePlan(result: ReturnType<typeof checkGoal>): CheckPlan {
+    const active = (label: string) => [...nodes.values()].filter((n) => n.label === label && statusOf(n) === "active");
+    const jobTargets = active("CheckTarget").filter((t) => t.props.source === "job_descriptions");
+    const docs = result.department
+      ? children(departmentById(result.department.id)!.id).filter((j) => statusOf(j) === "active").length : 0;
+    const jobs = !jobTargets.length ? { skip: "в каталоге нет правил по инструкциям", docs }
+      : !result.department ? { skip: "подразделение не указано", docs }
+      : !docs ? { skip: "у подразделения нет инструкций", docs } : { docs };
+    return liveCheckPlan(result, jobs, active("CheckTarget").length - jobTargets.length, active("Rule").length);
+  }
+
   /** Оценка по SMART «на глаз» — как agent.assess_smart, но по признакам в тексте, чтобы ответ был предсказуем. */
   function smartScores(goal: string) {
     const text = goal.toLowerCase();
@@ -1226,9 +1401,42 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       const goal = goalText(body?.goal, settings.goalMaxChars as number);
       const isStudent = studentFlag(body?.is_student);
       spendChecks(1);
-      return checkGoal(goal, department ?? null, isStudent);
+      const result = checkGoal(goal, department ?? null, isStudent);
+      // Ход проверки — только интерфейсу (X-Check-Id шлёт он): ответ /check-goal для внешних систем тот же.
+      if (options.liveModel && checkId) {
+        const plan = livePlan(result);
+        liveChecks.set(checkId, { started: Date.now(), plan });
+        delayMs = plan.total;
+      }
+      return result;
     }
-    if (method === "POST" && path === "/check-goals") return checkGoals(body);
+    if (method === "POST" && path === "/check-goals") {
+      // Какие цели уже есть в кэше ответов — до проверки: checkGoal их туда кладёт.
+      const cachedBefore = Array.isArray(body) ? body.map((item: any) => {
+        const dept = typeof item?.department_id === "string" ? departmentById(item.department_id.trim()) : undefined;
+        return !!settings.checkCache && caches.results.has(
+          `${String(item?.goal ?? "").trim()}|${dept ? String(dept.props.departmentId) : ""}|${item?.is_student ?? null}`);
+      }) : [];
+      const reply = checkGoals(body);
+      if (options.liveModel && checkId) {
+        const batch = liveBatchSchedule(reply.results.map((r, i) => ({
+          plan: cachedBefore[i] || "unchecked" in r || "retryable" in r ? CACHED_PLAN : livePlan(r as ReturnType<typeof checkGoal>),
+          cached: !!cachedBefore[i], verdict: "unchecked" in r ? null : r.status })), LIVE_BULK_SLOTS);
+        liveBatches.set(checkId, batch);
+        delayMs = batch.total;
+      }
+      return reply;
+    }
+    if ((p = m(/^\/batch-progress\/([^/]+)$/)) && method === "GET") {
+      const live = liveBatches.get(decodeURIComponent(p[1]));
+      if (!live) throw new HttpError(404, "Пакет не найден");
+      return liveBatchView(live, Date.now() - live.started);
+    }
+    if ((p = m(/^\/check-progress\/([^/]+)$/)) && method === "GET") {
+      const live = liveChecks.get(decodeURIComponent(p[1]));
+      if (!live) throw new HttpError(404, "Проверка не найдена");
+      return liveCheckView(live.plan, Date.now() - live.started);
+    }
 
     if ((p = m(/^\/catalog\/nodes\/([^/]+)$/))) {
       const id = decodeURIComponent(p[1]);
@@ -1291,6 +1499,9 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     if ((p = m(/^\/catalog\/job-descriptions\/([^/]+)(\/extract-duties|\/duties)?$/))) {
       const n = ofLabel(decodeURIComponent(p[1]), "JobDescription");
       if (method === "GET" && !p[2]) {
+        const progress = n.props.dutiesStatus === "pending" ? dutiesProgress(n) : null;
+        if (progress) return { ...jobNode(n), dutiesProgress: progress };
+        dutiesStarted.delete(n.id);
         finishDuties(n);
         return jobNode(n);
       }
@@ -1400,13 +1611,15 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         const token = auth.replace(/^Bearer\s+/i, "");
         current = !revoked && token.startsWith(TOKEN_PREFIX) ? token.slice(TOKEN_PREFIX.length) : null;
       }
+      checkId = header("x-check-id");
+      delayMs = 0;
       try {
         const result = route(method.toUpperCase(), parsed.pathname, parsed.searchParams, body);
         if (parsed.pathname === "/auth/logout") return { status: 204, body: null };
         if (result instanceof Accepted) return { status: 202, body: result.body };
         return { status: method.toUpperCase() === "POST"
           && /^\/(catalog\/(orders|clauses|rules|examples|check-targets|departments|job-descriptions)|auth\/users|settings\/api-keys)$/
-            .test(parsed.pathname) ? 201 : 200, body: result };
+            .test(parsed.pathname) ? 201 : 200, body: result, ...(delayMs ? { delayMs } : {}) };
       } catch (err) {
         if (err instanceof HttpError) return { status: err.status, body: { detail: err.message }, headers: err.headers };
         return { status: 500, body: { detail: String(err) } };

@@ -1149,6 +1149,40 @@ def test_pending_is_not_closed_while_another_request_starts_extraction(api, monk
     assert api.get(f"/catalog/job-descriptions/{JOB_NODE_ID}").json()["dutiesStatus"] == "pending"
 
 
+def test_pending_poll_shows_extraction_progress(api, monkeypatch):
+    import time
+
+    import routes
+    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID: 1})
+    monkeypatch.setattr(routes, "_duties_progress", {JOB_NODE_ID: {
+        "stage": "writing", "part": 1, "parts": 2, "duties": ["Готовит отчёт"], "partial": "Ведёт",
+        "job": object(), "started": time.monotonic() - 3}})
+    monkeypatch.setattr(catalog, "get_job_description", lambda node_id: dict(PENDING_JOB))
+    progress = api.get(f"/catalog/job-descriptions/{JOB_NODE_ID}").json()["dutiesProgress"]
+    assert progress.pop("elapsedSeconds") >= 3
+    assert progress == {"stage": "writing", "part": 1, "parts": 2, "duties": ["Готовит отчёт"],
+                        "partial": "Ведёт"}
+
+
+def test_job_reports_progress_and_clears_it(monkeypatch):
+    import agent
+    import routes
+    seen = []
+    monkeypatch.setattr(routes, "_duties_running", {JOB_NODE_ID: 1})
+    monkeypatch.setattr(routes, "_duties_progress", {})
+
+    def extract(text):
+        agent._duties_report.fn(stage="writing", part=1, parts=1, duties=["А"], partial="Б")
+        seen.append(routes._progress_view(JOB_NODE_ID))
+        return ["А", "Б"]
+
+    monkeypatch.setattr(agent, "extract_duties", extract)
+    monkeypatch.setattr(catalog, "finish_duties", lambda *a, **k: True)
+    routes._extract_duties_job(JOB_NODE_ID, "текст")
+    assert seen[0]["duties"] == ["А"] and seen[0]["partial"] == "Б"
+    assert routes._duties_progress == {} and agent._duties_report.fn is None
+
+
 def test_restart_closes_orphaned_pending_first(api, duties, monkeypatch):
     """Повторная выписка при «зависшем» pending: сначала error, затем запуск (не 409)."""
     order = []

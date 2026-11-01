@@ -70,8 +70,9 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -405,13 +406,43 @@ def _pause(seconds: float) -> None:
         raise metrics.Cancelled()
 
 
+@dataclass
+class _Message:
+    content: str
+
+
+@dataclass
+class _Choice:
+    message: _Message
+
+
+@dataclass
+class _Streamed:
+    """Ответ, собранный из потока, в форме обычного ответа (choices[0].message.content)."""
+    choices: list[_Choice]
+
+
+def _read_stream(stream: Iterable[Any], on_text: Callable[[str], None]) -> _Streamed:
+    """Собирает потоковый ответ; после каждого куска отдаёт весь текст на сейчас."""
+    text = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            text += delta
+            on_text(text)
+    return _Streamed([_Choice(_Message(text))])
+
+
 def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
               max_tokens: int, timeout: float | None,
-              breaker: Optional[_Breaker] = None, probe: bool = False, count_timeouts: bool = True) -> Any:
+              breaker: Optional[_Breaker] = None, probe: bool = False, count_timeouts: bool = True,
+              on_text: Optional[Callable[[str], None]] = None) -> Any:
     """Вызов модели с повторами только для ошибок соединения и 5xx.
 
     breaker — чей предохранитель узнаёт об ответе и таймауте; count_timeouts=False —
     таймаут ему не засчитывается (ответ — засчитывается: модель жива).
+    on_text — ответ читается потоком, и функция получает текст по мере генерации.
+    Таймаут тогда — на паузу между кусками, а не на весь ответ.
     """
     global _json_mode
     attempt = 0
@@ -429,8 +460,12 @@ def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
                 temperature=0.0,
                 max_tokens=max_tokens,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},  # Qwen3
+                **({"stream": True} if on_text is not None else {}),
                 **params,
             )
+            if on_text is not None:
+                # Сбой посреди потока — внутри этого же try: те же повторы и причины.
+                response = _read_stream(response, on_text)
         except BadRequestError as exc:
             if breaker is not None:
                 breaker.answered()
@@ -442,7 +477,8 @@ def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
                 continue
             log.error("Модель отклонила запрос: %s", exc)
             raise ExtractionError(REASON_TOO_LONG if reason == "context" else REASON_REJECTED) from exc
-        except APITimeoutError as exc:
+        except (APITimeoutError, httpx.TimeoutException) as exc:
+            # httpx.TimeoutException — пауза посреди потокового ответа: клиент OpenAI её не оборачивает.
             if breaker is not None and (count_timeouts or probe):
                 breaker.timed_out(probe)
             log.error("Модель не ответила за отведённое время: %s", exc)
@@ -499,7 +535,7 @@ _background = threading.local()
 def ask_model(prompt: str, schema: dict[str, Any] | None = None,
               max_tokens: int = LLM_MAX_TOKENS, system: str | None = None,
               timeout: float | None = None, bulk: bool | None = None,
-              breaker: bool = True) -> str:
+              breaker: bool = True, on_text: Optional[Callable[[str], None]] = None) -> str:
     """Один запрос к модели через общую очередь. Бросает ExtractionError при сбое.
 
     schema — JSON-схема ответа: модель не может ответить мимо неё, поэтому
@@ -513,6 +549,7 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
     действует на запрос в любом случае; при timeout (выписка) — не действует.
     Сообщение ExtractionError — обобщённая причина без текста исключения.
     QueueTimeout (ручной запрос не дождался очереди) проходит как есть.
+    on_text — читать ответ потоком и отдавать функции текст по мере генерации.
     """
     messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": prompt})
@@ -535,7 +572,8 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
                     continue  # пакет: освободить слот и ждать закрытия
                 started = time.monotonic()
                 try:
-                    response = _complete(messages, schema, max_tokens, timeout, guard, probe, breaker)
+                    response = _complete(messages, schema, max_tokens, timeout, guard, probe, breaker,
+                                         on_text=on_text)
                 finally:
                     metrics.note_llm(waited, time.monotonic() - started)
         finally:
@@ -957,10 +995,19 @@ def extract_duties(text: str) -> list[str]:
     # Части — по границам абзацев и с перекрытием (split_long_text): обязанность
     # на стыке целиком попадает хотя бы в одну часть, а не теряется разрезом (N21).
     parts = split_long_text(text, DUTIES_CHUNK_CHARS) if len(text) > DUTIES_CHUNK_CHARS else [text]
-    for part in parts:
+    report = getattr(_duties_report, "fn", None)
+    for number, part in enumerate(parts, 1):
+        on_text = None
+        if report is not None:
+            report(stage="reading", part=number, parts=len(parts), duties=list(duties), partial="")
+
+            def on_text(raw: str, number: int = number) -> None:
+                done, partial = duties_so_far(raw)
+                report(stage="writing", part=number, parts=len(parts),
+                       duties=duties + [d for d in done if _duty_key(d) not in seen], partial=partial)
         answer = ask_model(DUTIES_PROMPT.format(text=part),
                            DUTIES_SCHEMA, DUTIES_MAX_TOKENS, timeout=DUTIES_TIMEOUT, bulk=True,
-                           breaker=False)
+                           breaker=False, on_text=on_text)
         raw = parse_attributes_json(answer).get("duties")
         if not isinstance(raw, list):
             raise ExtractionError("поле duties отсутствует или не является списком")
@@ -978,6 +1025,47 @@ def extract_duties(text: str) -> list[str]:
 def _duty_key(duty: str) -> str:
     """Ключ сравнения обязанностей: без регистра, лишних пробелов и знаков в конце."""
     return " ".join(duty.lower().split()).rstrip(" .;,")
+
+
+# Ход выписки для интерфейса: пока функция задана в потоке, extract_duties
+# сообщает ей стадию и обязанности, уже выписанные моделью (routes.py).
+_duties_report = threading.local()
+
+
+@contextmanager
+def reporting_duties(report: Callable[..., None]) -> Iterator[None]:
+    """Пока открыт, extract_duties в этом потоке сообщает ход выписки функции report."""
+    _duties_report.fn = report
+    try:
+        yield
+    finally:
+        _duties_report.fn = None
+
+
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)(")?')
+_DUTIES_ARRAY = re.compile(r'"duties"\s*:\s*\[')
+
+
+def duties_so_far(raw: str) -> tuple[list[str], str]:
+    """Недописанный ответ {"duties": [...]: дописанные строки и строка, которая пишется сейчас."""
+    found = _DUTIES_ARRAY.search(raw)
+    if not found:
+        return [], ""
+    done: list[str] = []
+    partial = ""
+    for literal in _JSON_STRING.finditer(raw, found.end()):
+        body = literal.group(1)
+        try:
+            value = json.loads(f'"{body}"')
+        except ValueError:  # оборвано посреди \-последовательности
+            value = body.rstrip("\\")
+        value = " ".join(str(value).split())
+        if literal.group(2):
+            if value:
+                done.append(value)
+        else:
+            partial = value
+    return done, partial
 
 
 def comparable(descriptions: list[dict[str, Any]]) -> list[dict[str, str]]:

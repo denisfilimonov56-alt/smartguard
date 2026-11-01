@@ -24,7 +24,8 @@ const readBody = (req: IncomingMessage) =>
 
 function mockApi(): Plugin {
   // Обучение по интерфейсу показывается при первом входе каждой учётки — до перезапуска.
-  const backend = createBackend({ firstLogin: true });
+  // liveModel: проверка и выписка идут секунды и показывают ход, как с настоящей моделью.
+  const backend = createBackend({ firstLogin: true, liveModel: true });
   return {
     name: "mock-api",
     configureServer(server) {
@@ -32,6 +33,7 @@ function mockApi(): Plugin {
         const body = await readBody(req);
         const headers = Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v ?? "")]));
         const reply = backend.handle(req.method ?? "GET", req.url ?? "/", body, headers);
+        if (reply.delayMs) await new Promise((resolve) => setTimeout(resolve, reply.delayMs));
         res.statusCode = reply.status;
         for (const [name, value] of Object.entries(reply.headers ?? {})) res.setHeader(name, value);
         if (reply.status === 204 || reply.status === 302) { res.end(); return; }

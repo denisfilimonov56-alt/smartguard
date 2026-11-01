@@ -10,6 +10,7 @@ import { Chip } from "../ui/common";
 import { useDialogs, type Option } from "../ui/Dialogs";
 import type { MenuItem } from "../ui/Menu";
 import { errorText, useToast } from "../ui/Toasts";
+import { createDutiesWatch, DutiesProgressDialog, dutiesProgressShown } from "./departments/DutiesProgress";
 import { usePropertiesEditor } from "./PropertiesDialog";
 
 /* Все операции над узлами каталога. Каждая либо открывает форму, либо
@@ -35,6 +36,8 @@ const str = (v: unknown) => (v as string) ?? "";
 /* Обязанности выписываются в фоне (API отвечает 202 и dutiesStatus = pending):
    интерфейс опрашивает инструкцию, пока выписка не закончится. */
 const DUTIES_POLL_MS = 2000;
+/** Пока открыто окно хода выписки — чаще: обязанности появляются по мере генерации. */
+const DUTIES_LIVE_POLL_MS = 700;
 /** Подряд неудачных опросов, после которых интерфейс перестаёт ждать. */
 const DUTIES_POLL_FAILURES = 5;
 /** Инструкции, которые уже опрашиваются: повторное «Выписать заново» второй опрос не заводит. */
@@ -49,7 +52,7 @@ export const parseDuties = (text: string) => text.split("\n").map((s) => s.trim(
 export function useActions() {
   const catalog = useCatalog();
   const { orders, targets, clauses, mutate, openWizard, selectOrder } = catalog;
-  const { openForm, confirm } = useDialogs();
+  const { openForm, confirm, openCustom, close: closeDialog } = useDialogs();
   const { isAdmin } = useAuth();
   const toast = useToast();
   const editProperties = usePropertiesEditor();
@@ -420,18 +423,21 @@ export function useActions() {
   /** Список обязанностей: редактор сверяет то, что выписала модель. */
   const openDuties = (nodeId: string, title: string, duties: string[]) => openForm({
     title: "Обязанности — " + title, wide: true, submitLabel: "Подтвердить список",
+    // Список читают целиком: поле по высоте списка, но не выше окна.
     fields: [{ name: "duties", label: "Обязанности", type: "textarea", value: duties.join("\n"), required: true,
-      hint: DUTIES_HINT }],
+      rows: Math.min(Math.max(duties.length + 1, 8), 22), hint: DUTIES_HINT }],
     // expected — список, как его показали редактору: если его за это время выписали заново
     // или поправил другой пользователь, API отклонит правку (409) и не затрёт чужой список.
     onSubmit: (v) => unlessStale(() => mutate(() => api.setJobDuties(nodeId, parseDuties(str(v.duties)), duties),
       "Список обязанностей сохранён")),
   });
 
-  /** После загрузки или правки текста: показать выписанный список либо сказать, что его нет. */
-  const afterExtraction = (node: JobDescriptionNode) => {
+  /** После загрузки или правки текста: показать выписанный список либо сказать, что его нет.
+      replacing — открыто наше окно хода выписки: список встаёт на его место. */
+  const afterExtraction = (node: JobDescriptionNode, replacing = false) => {
     // Старый API выписывал синхронно и статуса не отдавал: ошибка — по dutiesError.
     if (node.dutiesStatus === "error" || (!node.dutiesStatus && node.dutiesError)) {
+      if (replacing) closeDialog();
       toast("Обязанности не выписаны: " + (node.dutiesError || "модель не ответила")
         + ". Пока цель сравнивается с полным текстом; повторите через меню инструкции.", "err");
       return;
@@ -441,7 +447,7 @@ export function useActions() {
     // Форма загрузки закрывается после onSubmit — список открывается следом.
     setTimeout(() => {
       // Выписка закончилась, пока открыто другое окно: не подменять его.
-      if (dialogOpen()) {
+      if (!replacing && dialogOpen()) {
         toast(`Обязанности «${str(node.title)}» выписаны: ${node.duties?.length ?? 0}. `
           + "Сверьте список через меню инструкции → «Обязанности».", "ok");
         return;
@@ -450,30 +456,45 @@ export function useActions() {
     }, 0);
   };
 
-  /** Дождаться фоновой выписки (опрос раз в 2 с), затем показать результат. */
+  /** Дождаться фоновой выписки, показывая её ход в окне, затем показать результат. */
   const followDuties = async (node: JobDescriptionNode) => {
     if (node.dutiesStatus !== "pending") { afterExtraction(node); return; }
     if (pollingDuties.has(node.nodeId)) return;
     pollingDuties.add(node.nodeId);
-    toast("Обязанности выписываются… Список откроется, когда модель закончит.");
+    // Форма загрузки закрывается после onSubmit — окно хода открывается следом.
+    // Открыто чужое окно — не подменяем его, ход не показываем.
+    await sleep(0);
+    const watch = createDutiesWatch(node);
+    if (!dialogOpen()) {
+      openCustom((close) => <DutiesProgressDialog watch={watch} title={str(node.title)} close={close} />);
+    } else {
+      toast("Обязанности выписываются… Список откроется, когда модель закончит.");
+    }
     let failures = 0;
     try {
       for (;;) {
-        await sleep(DUTIES_POLL_MS);
+        await sleep(dutiesProgressShown() ? DUTIES_LIVE_POLL_MS : DUTIES_POLL_MS);
         let next: JobDescriptionNode;
         try {
           next = await api.jobDescription(node.nodeId);
           failures = 0;
         } catch (err) {
-          if (err instanceof ApiError && err.status === 404) return; // инструкцию удалили
+          if (err instanceof ApiError && err.status === 404) { // инструкцию удалили
+            if (dutiesProgressShown()) closeDialog();
+            return;
+          }
           if (++failures < DUTIES_POLL_FAILURES) continue;
+          if (dutiesProgressShown()) closeDialog();
           toast("Не удалось узнать, выписаны ли обязанности: " + errorText(err)
             + ". Список появится в меню инструкции, когда модель закончит.", "err");
           return;
         }
-        if (next.dutiesStatus === "pending") continue;
+        if (next.dutiesStatus === "pending") {
+          watch.set({ ...next, title: next.title ?? node.title });
+          continue;
+        }
         await catalog.reload();
-        afterExtraction({ ...next, title: next.title ?? node.title });
+        afterExtraction({ ...next, title: next.title ?? node.title }, dutiesProgressShown());
         return;
       }
     } finally {

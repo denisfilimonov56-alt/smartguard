@@ -1,7 +1,7 @@
 import type {
   ApiKey, ApiKeyCreated, CacheCleared, CacheId, CacheStats, Settings,
   CheckMode, CheckRecord, GraphEdge, GraphNode, MonitoringNow, MonitoringStats, StatsStep,
-  Account, Advice, BatchCheck, CheckResult, GoalItem, CheckTarget, Department, Descendants, Diagnostics, ExamplesCheck, FlatClause,
+  Account, Advice, BatchCheck, CheckResult, CheckStatus, GoalItem, CheckTarget, Department, Descendants, Diagnostics, ExamplesCheck, FlatClause,
   MergeReport, NodeProps, Order, RepairReport, Role, RuleType, Status, TargetSource, User, UserStatus,
 } from "./types";
 import * as oidc from "../lib/oidc";
@@ -48,6 +48,8 @@ export interface RequestOptions {
   /** Сколько ждать ответа, мс; по умолчанию READ_TIMEOUT_MS или WRITE_TIMEOUT_MS.
       Пока тело ответа приходит, предел отсчитывается от последнего пришедшего куска. */
   timeoutMs?: number;
+  /** Дополнительные заголовки запроса. */
+  headers?: Record<string, string>;
 }
 
 /* Без предела зависший API или прокси держит интерфейс в «Загрузка…» бесконечно. */
@@ -142,6 +144,7 @@ async function request<T>(method: Method, path: string, body?: unknown, options:
         "X-Requested-With": "XMLHttpRequest",
         ...(token ? { Authorization: "Bearer " + token } : {}),
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...options.headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -203,6 +206,70 @@ export interface JobDescriptionNode extends Created {
   dutiesError?: string | null;
   /** Выписка обязанностей идёт в фоне: pending — ещё идёт, ready — готово, error — см. dutiesError. */
   dutiesStatus?: "pending" | "ready" | "error" | null;
+  /** Ход идущей выписки; null — задача ещё в очереди. Только пока pending. */
+  dutiesProgress?: DutiesProgress | null;
+}
+
+/** Шаг проверки цели: cache — готовый ответ, queue — очередь к модели, attributes / jobs / smart —
+    обращения к модели (идут одновременно), rules — поиск сработавших правил в графе. */
+export interface CheckStage {
+  key: "cache" | "queue" | "attributes" | "jobs" | "smart" | "rules";
+  status: "waiting" | "running" | "done" | "skipped";
+  /** Сколько занял шаг, с; null — ещё идёт или пропущен. */
+  seconds: number | null;
+  detail: string;
+  /** Обращение к модели: сколько токенов ответа она уже выдала; у прочих шагов — null. */
+  tokens: number | null;
+}
+
+export interface CheckProgress {
+  elapsedSeconds: number;
+  stages: CheckStage[];
+  /** Токены всех обращений к модели: запроса (prompt) и ответа (completion). */
+  tokens: { prompt: number; completion: number };
+  /** Скорость генерации: токенов ответа в секунду с начала обращений к модели; null — ещё не начали. */
+  tokensPerSecond: number | null;
+  /** Атрибуты, которые модель уже нашла, с цитатой из цели. */
+  attributes: { name: string; quote: string | null }[];
+  /** Обязанности из инструкций, с которыми совпала цель. */
+  matchedDuties: string[];
+}
+
+/** Цель пакета в ходе проверки; index — номер в запросе. */
+export interface BatchItemProgress {
+  index: number;
+  status: "queued" | "running" | "done";
+  /** Шаг, на котором цель сейчас (только running). */
+  stage: CheckStage["key"] | null;
+  /** Сколько цель проверяется (running) или проверялась (done), с. */
+  seconds: number | null;
+  /** Ответ взят из кэша — к модели не ходили. */
+  cached: boolean;
+  verdict: CheckStatus | null;
+}
+
+/** Ход одного пакетного запроса (одной части пакета). */
+export interface BatchProgress {
+  elapsedSeconds: number;
+  total: number;
+  done: number;
+  tokens: { prompt: number; completion: number };
+  tokensPerSecond: number | null;
+  /** Время шагов по готовым целям (без ответов из кэша): сумма и сколько целей — для среднего. */
+  stageSeconds: Partial<Record<CheckStage["key"], { total: number; count: number }>>;
+  items: BatchItemProgress[];
+}
+
+export interface DutiesProgress {
+  /** reading — модель читает часть текста (ответа ещё нет); writing — выписывает. */
+  stage: "reading" | "writing";
+  part: number;
+  parts: number;
+  /** Обязанности, которые модель уже дописала. */
+  duties: string[];
+  /** Обязанность, которую модель пишет прямо сейчас. */
+  partial: string;
+  elapsedSeconds: number;
 }
 
 const enc = encodeURIComponent;
@@ -322,10 +389,18 @@ export const api = {
   /** Свести двойников атрибутов (одинаковые после нормализации написания). */
   mergeDuplicateTargets: () => request<MergeReport>("POST", "/catalog/merge-duplicate-targets"),
 
-  checkGoal: (goal: string, departmentId: string | null, isStudent: boolean, signal?: AbortSignal) =>
+  /** checkId — по нему интерфейс спрашивает ход этой проверки (checkProgress). */
+  checkGoal: (goal: string, departmentId: string | null, isStudent: boolean, signal?: AbortSignal, checkId?: string) =>
     request<CheckResult>("POST", "/check-goal", { goal, department_id: departmentId, is_student: isStudent },
-      { signal, timeoutMs: CHECK_TIMEOUT_MS }),
-  /** Пакетная проверка: подразделение у каждой цели обязательно. */
-  checkGoals: (items: GoalItem[], signal?: AbortSignal) =>
-    request<BatchCheck>("POST", "/check-goals", items, { signal, timeoutMs: CHECK_TIMEOUT_MS }),
+      { signal, timeoutMs: CHECK_TIMEOUT_MS, headers: checkId ? { "X-Check-Id": checkId } : undefined }),
+  /** Ход идущей проверки — только для интерфейса; 404 — API хода не отдаёт или проверка не найдена. */
+  checkProgress: (checkId: string) =>
+    request<CheckProgress>("GET", `/check-progress/${enc(checkId)}`, undefined, { timeoutMs: 3000 }),
+  /** Пакетная проверка: подразделение у каждой цели обязательно. checkId — по нему интерфейс спрашивает ход (batchProgress). */
+  checkGoals: (items: GoalItem[], signal?: AbortSignal, checkId?: string) =>
+    request<BatchCheck>("POST", "/check-goals", items,
+      { signal, timeoutMs: CHECK_TIMEOUT_MS, headers: checkId ? { "X-Check-Id": checkId } : undefined }),
+  /** Ход идущего пакета — только для интерфейса; 404 — API хода не отдаёт или пакет не найден. */
+  batchProgress: (checkId: string) =>
+    request<BatchProgress>("GET", `/batch-progress/${enc(checkId)}`, undefined, { timeoutMs: 3000 }),
 };

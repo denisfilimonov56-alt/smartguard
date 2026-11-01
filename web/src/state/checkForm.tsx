@@ -2,7 +2,7 @@ import {
   createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode,
 } from "react";
 
-import { api, isAborted } from "../api/client";
+import { api, isAborted, type BatchItemProgress, type BatchProgress, type CheckProgress } from "../api/client";
 import type { BatchCheck, CheckResult } from "../api/types";
 import { CHUNK, checkedResults, mergeBatch, runBatch, type WaitReason } from "../features/check/batch";
 import { errorText, useToast } from "../ui/Toasts";
@@ -85,6 +85,32 @@ export interface BatchRun {
   /** Запустить пакет; пока идёт другой — ничего не делает. onlyPending — проверить только строки
       без ответа или изменённые после проверки, а прежние ответы остальных строк оставить. */
   start: (rows: BatchRow[], fallback: string, onlyPending?: boolean) => Promise<void>;
+  /** Ход идущего или последнего пакета; null — API хода не отдаёт или пакета ещё не было. */
+  live: BatchLive | null;
+}
+
+/** Ход пакета, собранный из всех его частей (каждая часть — свой запрос со своим ходом). */
+export interface BatchLive {
+  startedAt: number;
+  finished: boolean;
+  elapsedSeconds: number;
+  /** Сколько целей отправлено (без строк, ответ которых остался с прошлого раза). */
+  total: number;
+  /** Ход цели по ключу строки таблицы. */
+  items: Record<string, BatchItemProgress>;
+  tokens: { prompt: number; completion: number };
+  tokensPerSecond: number | null;
+  stageSeconds: BatchProgress["stageSeconds"];
+}
+
+/** Время шагов двух частей вместе. */
+function addStages(a: BatchProgress["stageSeconds"], b: BatchProgress["stageSeconds"]): BatchProgress["stageSeconds"] {
+  const sum: BatchProgress["stageSeconds"] = { ...a };
+  for (const [key, value] of Object.entries(b) as [keyof typeof b, { total: number; count: number }][]) {
+    const prev = sum[key];
+    sum[key] = prev ? { total: prev.total + value.total, count: prev.count + value.count } : value;
+  }
+  return sum;
 }
 
 /** Идущая проверка одной цели. */
@@ -92,7 +118,15 @@ export interface SingleRun {
   busy: boolean;
   /** Проверить; пока идёт прежняя проверка — false без запроса. true — ответ получен и показан. */
   run: (goal: string, departmentId: string, isStudent: boolean) => Promise<boolean>;
+  /** Ход идущей или последней проверки (шаги и время); null — API хода не отдаёт. */
+  progress: CheckProgress | null;
 }
+
+/** Как часто спрашивать ход проверки, мс. */
+const PROGRESS_POLL_MS = 400;
+/** Номер проверки для X-Check-Id: randomUUID есть только в защищённом контексте (https, localhost). */
+const newCheckId = () => globalThis.crypto?.randomUUID?.()
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
 type Patch = Partial<CheckForm> | ((prev: CheckForm) => Partial<CheckForm>);
 
@@ -156,6 +190,7 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const stop = useCallback(() => controller.current?.abort(), []);
+  const [live, setLive] = useState<BatchLive | null>(null);
 
   const start = useCallback(async (rows: BatchRow[], fallback: string, onlyPending = false) => {
     if (controller.current || !rows.length) return;
@@ -169,11 +204,29 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
     setProgress({ done: keptCount, total: rows.length, waiting: null, waitReason: null });
     if (!keptCount) setCheckForm({ batch: null });
     let partial: BatchCheck | null = null;
+    // Ход частей складывается в один: готовые части — в base, идущая — поверх неё.
+    const keys = todo.map((r) => r.key);
+    const startedAt = Date.now();
+    let base: Pick<BatchLive, "items" | "tokens" | "stageSeconds"> =
+      { items: {}, tokens: { prompt: 0, completion: 0 }, stageSeconds: {} };
+    setLive(null);
+    const onLive = (offset: number, part: BatchProgress, final: boolean) => {
+      const items = { ...base.items };
+      for (const item of part.items) if (keys[offset + item.index]) items[keys[offset + item.index]] = item;
+      const tokens = { prompt: base.tokens.prompt + part.tokens.prompt,
+        completion: base.tokens.completion + part.tokens.completion };
+      const stageSeconds = addStages(base.stageSeconds, part.stageSeconds);
+      if (final) base = { items, tokens, stageSeconds };
+      const elapsed = (Date.now() - startedAt) / 1000;
+      if (mounted.current) setLive({ startedAt, finished: false, elapsedSeconds: elapsed, total: todo.length, items, tokens,
+        stageSeconds, tokensPerSecond: elapsed > 0.5 ? Math.round(tokens.completion / elapsed) : null });
+    };
     try {
       const result = await runBatch(todo, fallback, chunk, (part) => {
         partial = part;
         setProgress({ done: keptCount + part.results.length, total: rows.length, waiting: null, waitReason: null });
-      }, ctrl.signal, (waiting, reason) => setProgress((p) => (p ? { ...p, waiting, waitReason: waiting === null ? null : reason } : p)));
+      }, ctrl.signal, (waiting, reason) => setProgress((p) => (p ? { ...p, waiting, waitReason: waiting === null ? null : reason } : p)),
+      onLive);
       setCheckForm({ batch: mergeBatch(rows, fallback, kept, result.results) });
       // Пакет на сервере остановили по сроку: часть целей не проверена, их надо отправить снова.
       const unchecked = result.results.filter((r) => r.unchecked).length;
@@ -193,17 +246,20 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
     } finally {
       controller.current = null;
       setProgress(null);
+      // Пакет закончился (или его остановили): ход остаётся с итоговым временем.
+      if (mounted.current) setLive((l) => l && { ...l, finished: true, elapsedSeconds: (Date.now() - startedAt) / 1000 });
     }
   }, [chunk, setCheckForm, toast]);
 
   const batchRun = useMemo<BatchRun>(() => ({
     running: progress !== null, done: progress?.done ?? 0, total: progress?.total ?? 0,
-    waiting: progress?.waiting ?? null, waitReason: progress?.waitReason ?? null, stop, start,
-  }), [progress, stop, start]);
+    waiting: progress?.waiting ?? null, waitReason: progress?.waitReason ?? null, stop, start, live,
+  }), [progress, stop, start, live]);
 
   // Одна цель: пока идёт проверка, повторный запуск (кнопка, Ctrl+Enter, советчик) не шлёт второй запрос.
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  const [checkProgress, setCheckProgress] = useState<CheckProgress | null>(null);
   const run = useCallback(async (goal: string, departmentId: string, isStudent: boolean) => {
     const text = goal.trim();
     if (!text) { toast("Введите формулировку цели", "err"); return false; }
@@ -212,8 +268,32 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
     busyRef.current = true;
     setBusy(true);
     setCheckForm({ result: null, checked: null });
+    setCheckProgress(null);
+    // Ход проверки опрашивается, пока ждём ответ; последний снимок остаётся с временем шагов.
+    // API, который хода не отдаёт (404 и прочие ошибки), опрашивать дальше незачем.
+    const checkId = newCheckId();
+    let polling = true;
+    const poll = async () => {
+      while (polling) {
+        await new Promise((resolve) => setTimeout(resolve, PROGRESS_POLL_MS));
+        if (!polling) return;
+        try {
+          const next = await api.checkProgress(checkId);
+          if (mounted.current) setCheckProgress(next);
+        } catch {
+          return;
+        }
+      }
+    };
+    void poll();
     try {
-      const result = await api.checkGoal(text, departmentId || null, isStudent);
+      const result = await api.checkGoal(text, departmentId || null, isStudent, undefined, checkId);
+      polling = false;
+      // Финальный снимок: все шаги завершены, видно время каждого.
+      try {
+        const last = await api.checkProgress(checkId);
+        if (mounted.current) setCheckProgress(last);
+      } catch { /* хода нет — показываем только ответ */ }
       // Ответ хранится вместе с тем, о чём спрашивали: если за время проверки поменяли
       // подразделение или признак студента, он не покажется под новыми значениями.
       setCheckForm({ result, checked: { goal: text, departmentId, isStudent } });
@@ -222,12 +302,13 @@ export function CheckFormProvider({ children }: { children: ReactNode }) {
       if (mounted.current) toast(errorText(err), "err");
       return false;
     } finally {
+      polling = false;
       busyRef.current = false;
       setBusy(false);
     }
   }, [goalMaxChars, setCheckForm, toast]);
 
-  const single = useMemo<SingleRun>(() => ({ busy, run }), [busy, run]);
+  const single = useMemo<SingleRun>(() => ({ busy, run, progress: checkProgress }), [busy, run, checkProgress]);
 
   const value = useMemo<CheckFormState>(() => ({ checkForm, setCheckForm, batchRun, single }),
     [checkForm, setCheckForm, batchRun, single]);

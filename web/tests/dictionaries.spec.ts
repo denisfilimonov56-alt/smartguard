@@ -45,8 +45,8 @@ test("должностные инструкции: загрузка, правк�
   await modal(app).getByLabel("Текст инструкции").fill(`${DUTY};\nвести реестр обращений`);
   await modal(app).getByRole("button", { name: "Загрузить" }).click();
   await expect(toast(app, "Инструкция загружена")).toBeVisible();
-  // Выписка идёт в фоне (202): интерфейс опрашивает инструкцию, пока она не готова.
-  await expect(toast(app, "Обязанности выписываются")).toBeVisible();
+  // Выписка идёт в фоне (202): сразу открывается окно её хода, интерфейс опрашивает инструкцию.
+  await expect(app.locator("#dutiesProgress")).toBeVisible();
 
   // Когда модель закончила, редактор сверяет список обязанностей, выписанный ею.
   await expect(modal(app).getByLabel("Обязанности", { exact: true })).toHaveValue(`${DUTY}\nвести реестр обращений`);

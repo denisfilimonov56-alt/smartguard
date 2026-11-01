@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 from contextvars import ContextVar
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -290,6 +290,10 @@ _duties_starting = 0
 _duties_closing: set[str] = set()
 _duties_lock = threading.Lock()
 _duties_changed = threading.Condition(_duties_lock)
+# Ход идущей выписки для опроса интерфейса: стадия, часть текста, уже выписанные
+# обязанности и та, что пишется сейчас. Только в памяти: после перезапуска API
+# оборванная выписка всё равно переводится в error.
+_duties_progress: dict[str, dict[str, Any]] = {}
 
 
 def _finish_duties(node_id: str, text: str, duties: Optional[list[str]] = None,
@@ -317,9 +321,17 @@ def _finish_duties(node_id: str, text: str, duties: Optional[list[str]] = None,
 def _extract_duties_job(node_id: str, text: str) -> None:
     """Фоновая выписка. Сбой модели инструкцию не теряет: она остаётся без
     списка, проверка идёт по полному тексту, а причина — в dutiesError."""
+    started = time.monotonic()
+    job = object()  # чья запись хода: правка текста ставит вторую выписку того же узла
+
+    def report(**state: Any) -> None:
+        with _duties_lock:
+            _duties_progress[node_id] = {**state, "job": job, "started": started}
+
     try:
         try:
-            duties = agent.extract_duties(text)
+            with agent.reporting_duties(report):
+                duties = agent.extract_duties(text)
         except agent.ExtractionError as exc:
             log.warning("Обязанности из инструкции %s не извлечены: %s", node_id, exc)
             _finish_duties(node_id, text, error=str(exc))
@@ -330,7 +342,20 @@ def _extract_duties_job(node_id: str, text: str) -> None:
             return
         _finish_duties(node_id, text, duties=duties)
     finally:
+        with _duties_lock:
+            if _duties_progress.get(node_id, {}).get("job") is job:
+                del _duties_progress[node_id]
         _duties_done(node_id)
+
+
+def _progress_view(node_id: str) -> Optional[dict[str, Any]]:
+    """Ход выписки для ответа GET; None — задача ещё в очереди или её нет."""
+    with _duties_lock:
+        state = _duties_progress.get(node_id)
+    if state is None:
+        return None
+    view = {k: v for k, v in state.items() if k not in ("job", "started")}
+    return {**view, "elapsedSeconds": round(time.monotonic() - state["started"], 1)}
 
 
 class _Starting:
@@ -454,6 +479,8 @@ def get_job_description(node_id: str):
     node = _handle(catalog.get_job_description, node_id)
     if node.get("dutiesStatus") == catalog.DUTIES_PENDING and _close_orphaned_duties(node_id):
         node = _handle(catalog.get_job_description, node_id)
+    if node.get("dutiesStatus") == catalog.DUTIES_PENDING:
+        node = {**node, "dutiesProgress": _progress_view(node_id)}
     return node
 
 
