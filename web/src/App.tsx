@@ -178,9 +178,16 @@ export function App() {
   // Подложка активного пункта меню: встаёт под выбранную кнопку и переезжает к новой.
   const nav = useRef<HTMLElement>(null);
   const [indicator, setIndicator] = useState<{ top: number; height: number } | null>(null);
+  // Пересчитывается и при смене высоты меню: на низком экране пункты уплотняются (styles.css).
   useLayoutEffect(() => {
-    const active = nav.current?.querySelector<HTMLElement>('[aria-selected="true"]');
-    setIndicator(active ? { top: active.offsetTop, height: active.offsetHeight } : null);
+    const measure = () => {
+      const active = nav.current?.querySelector<HTMLElement>('[aria-selected="true"]');
+      setIndicator(active ? { top: active.offsetTop, height: active.offsetHeight } : null);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (nav.current) observer.observe(nav.current);
+    return () => observer.disconnect();
   }, [section, isAdmin]);
 
   return (
@@ -226,8 +233,9 @@ export function App() {
         </nav>
         <div className="spacer" />
         <div className="side-foot">
-          {/* Вся строка пользователя — кнопка меню: в свёрнутой панели от неё виден только аватар. */}
-          <button className="who" aria-label="Меню пользователя" title="Меню пользователя"
+          {/* Вся строка пользователя — кнопка меню: в свёрнутой панели от неё виден только аватар.
+              Состояние API — точка на аватаре; словами оно пишется вместо роли, только когда не «на связи». */}
+          <button className="who" aria-label={`Меню пользователя. ${pill.text}`} title={`${user.displayName || user.login} · ${pill.text}`}
             onClick={(e) => {
               setPinned(true);
               openMenu(e.currentTarget, [
@@ -242,8 +250,9 @@ export function App() {
             <span className={`avatar ${pill.cls}`} aria-hidden="true">{initials(user.displayName || user.login)}<i className="status" /></span>
             <span className="who-text label">
               <span className="mid">{user.displayName || user.login}</span>
-              <span className="small dim">{ROLE_LABEL[user.role]}</span>
-              <span className={`small api ${pill.cls}`}><span className="dot" />{pill.text}</span>
+              {pill.cls === "ok"
+                ? <span className="small dim">{ROLE_LABEL[user.role]}</span>
+                : <span className={`small api ${pill.cls}`}>{pill.text}</span>}
             </span>
             <span className="user-menu label" aria-hidden="true">⋯</span>
           </button>

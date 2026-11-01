@@ -74,7 +74,7 @@ test.describe("первый вход", () => {
 
     // После перезагрузки обучение не повторяется: отметка на сервере.
     await app.reload();
-    await expect(app.getByText("API на связи")).toBeVisible();
+    await expect(app.getByRole("button", { name: /API на связи/ })).toBeVisible();
     await expect(tour(app)).toHaveCount(0);
   });
 });

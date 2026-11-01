@@ -60,7 +60,7 @@ export const test = base.extend<{ app: Page; role: MockRole; firstLogin: boolean
   app: async ({ page, role, firstLogin }, use) => {
     await mockApi(page, role, firstLogin);
     await page.goto("/");
-    if (role) await expect(page.getByText("API на связи")).toBeVisible();
+    if (role) await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
     else await expect(page.getByRole("button", { name: "Войти" })).toBeVisible();
     await use(page);
   },
