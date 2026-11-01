@@ -1,6 +1,6 @@
 {
   "realm": "goal-checker",
-  "displayName": "Проверка целей",
+  "displayName": "SmartGuard",
   "enabled": true,
   "sslRequired": "none",
   "registrationAllowed": false,
@@ -20,7 +20,7 @@
   "clients": [
     {
       "clientId": "goal-checker-web",
-      "name": "Проверка целей — интерфейс",
+      "name": "SmartGuard — интерфейс",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": true,
