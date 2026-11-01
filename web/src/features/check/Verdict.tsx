@@ -1,13 +1,15 @@
-import type { CheckResult } from "../../api/types";
-import { Chip } from "../../ui/common";
+import { useState, type ReactNode } from "react";
+
+import type { CheckResult, SmartScores } from "../../api/types";
+import { attributeTitle, Chip } from "../../ui/common";
 import { place, plural, ruleKey, unverifiedCount } from "./batch";
-import { SmartRings } from "./Smart";
+import { SMART_LETTERS, SmartRings } from "./Smart";
 
 /* Ответ проверки одной цели человеческим языком: что не так, какой пункт
    приказа и как исправить. Используется и для одной цели, и для каждой
    цели пакета. */
 
-export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
+export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu, children }: {
   result: CheckResult;
   /** Сколько правил проверялось для подразделения цели. */
   total: number;
@@ -17,10 +19,15 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
   onDispute?: (attribute: string) => void;
   /** Открыть атрибут в словаре. */
   onAttribute?: (attribute: string) => void;
+  /** Кнопка «⋯» в шапке ответа (ответ API и т. п.). */
+  menu?: ReactNode;
+  /** Блок сразу под шапкой: рекомендованная формулировка. */
+  children?: ReactNode;
 }) {
+  // Атрибут — человеческим названием; служебное имя — в подсказке.
   const attribute = (name: string) => (onAttribute
-    ? <button type="button" className="chip chip-btn" title="Открыть атрибут" onClick={() => onAttribute(name)}>{name}</button>
-    : <Chip>{name}</Chip>);
+    ? <button type="button" className="chip chip-btn" title={`Открыть атрибут «${name}»`} onClick={() => onAttribute(name)}>{attributeTitle(name)}</button>
+    : <Chip title={name}>{attributeTitle(name)}</Chip>);
   const manual = result.status === "NEEDS_MANUAL_REVIEW";
   // Нарушенных правил, а не пар «правило × атрибут»: правило с двумя атрибутами — одно.
   const bad = new Set(result.violations.map(ruleKey)).size;
@@ -30,29 +37,22 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
     ? `не выполнено правил: ${bad} из ${total}${unverified ? ` · не проверено: ${unverified}` : ""}`
     : unverified ? `проверено правил: ${Math.max(0, total - unverified)} из ${total} · не проверено: ${unverified}`
     : `проверено правил: ${total}`;
+  // Подразделение и признак студента видны в форме проверки и в «Что проверяется» — в шапке ответа их нет.
   return (
     <div className="card verdict" id="checkResult">
-      <div className="row wrap" style={{ paddingBottom: 12 }}>
+      <div className="row wrap verdict-head">
         {manual
           ? <span className="badge warn lg">Требуется ручная проверка</span>
           : bad ? <span className="badge err lg">Нужно доработать</span> : <span className="badge ok lg">Нарушений нет</span>}
-        {(!manual || unverified > 0) && <span className="muted" data-rules-line>{rulesLine}</span>}
+        {(!manual || unverified > 0) && <span className="mid" data-rules-line>{rulesLine}</span>}
         <div className="spacer" />
         {!manual && onTrace && <button className="btn sm" onClick={onTrace}>Показать на графе</button>}
-        <span className="dim">подразделение: {result.department
-          ? <Chip>{result.department.name || result.department.id}</Chip> : "не определено"}</span>
-        {result.is_student && <span className="dim"><Chip>студент</Chip></span>}
+        {menu}
       </div>
 
       {result.notes.map((n, i) => <div key={i} className="alert" style={{ marginBottom: 8 }}>{n}</div>)}
 
-      {result.smart && (
-        <div className="vitem smart-block">
-          <span className="ico smart-ico">S</span>
-          <div className="t" style={{ fontSize: 14 }}>По SMART <span className="dim" style={{ fontWeight: 400 }}>справочно, на вердикт не влияет</span></div>
-          <div className="d"><SmartRings smart={result.smart} /></div>
-        </div>
-      )}
+      {children}
 
       {unverified > 0 && (
         <div className="vitem unverified">
@@ -68,13 +68,15 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
         return (
           <div key={i} className="vitem violation">
             <span className="ico bad">✕</span>
-            <div className="t">{v.rule_text}</div>
-            <div className="d">{place(v)} · атрибут {attribute(v.attribute)}
+            <div className="t">
+              <span className="grow">{v.rule_text}</span>
               {onDispute && (
                 <button className="btn sm ghost" title="Предложить правку графа, чтобы ответ по атрибуту стал другим"
                   onClick={() => onDispute(v.attribute)}>Не согласен</button>
               )}
             </div>
+            {/* Где правило и по какому атрибуту: текст пункта — в подсказке, чтобы строка не разрасталась. */}
+            <div className="d" title={v.clause_text ?? undefined}>{place(v)} · атрибут {attribute(v.attribute)}</div>
             {(v.check_instruction || examples.length > 0 || duties.length > 0) && (
               <div className="fix">
                 {duties.map((m, j) => (
@@ -102,6 +104,30 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute }: {
           ))}
         </div>
       )}
+
+      {/* SMART — справка автору, на вердикт не влияет: в конце, одной строкой оценок;
+          круги с пояснениями — по «Подробнее». */}
+      {result.smart && <SmartBlock smart={result.smart} />}
+    </div>
+  );
+}
+
+const SMART_LEVEL = (score: number) => (score >= 70 ? "ok" : score >= 40 ? "warn" : "err");
+
+function SmartBlock({ smart }: { smart: SmartScores }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="smart-block">
+      <div className="smart-head">
+        <b>SMART</b><span className="dim">справочно, на вердикт не влияет</span>
+        {!open && SMART_LETTERS.map(({ key, letter, name }) => (
+          <span key={key} className={`badge ${SMART_LEVEL(smart[key]?.score ?? 0)}`} title={`${name}: ${smart[key]?.comment ?? ""}`}>
+            {letter} {smart[key]?.score ?? 0}</span>
+        ))}
+        <button type="button" className="btn sm ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Свернуть" : "Подробнее"}</button>
+      </div>
+      {open && <SmartRings smart={smart} />}
     </div>
   );
 }

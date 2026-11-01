@@ -1,17 +1,23 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { Violation } from "../../api/types";
+import { api } from "../../api/client";
+import type { CheckResult, Violation } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { resultMatches, useCheckForm } from "../../state/checkForm";
+import { pushRecent, readRecent, type RecentCheck } from "../../state/recent";
 import { ruleApplies } from "../../state/scope";
 import { activeRuleRefs, allRuleRefs } from "../../state/tree";
+import { copyText } from "../../ui/clipboard";
 import { Spinner } from "../../ui/common";
+import { useDialogs } from "../../ui/Dialogs";
+import { useMenu } from "../../ui/Menu";
 import { Select } from "../../ui/Select";
+import { errorText, useToast } from "../../ui/Toasts";
 import { useAdviceDialog } from "./AdviceDialog";
 import { BatchCheck } from "./BatchCheck";
 import { CheckProgress } from "./CheckProgress";
-import { JsonBlock } from "./JsonBlock";
+import { JsonDialog } from "./JsonBlock";
 import { Verdict } from "./Verdict";
 
 /* Главный экран: проверка формулировки цели. Ответ — человеческим языком:
@@ -58,6 +64,57 @@ function failedRules(violations: Violation[]) {
     nodes.has(rule.nodeId) || (!!rule.ruleId && ids.has(rule.ruleId)) || (!!rule.description && texts.has(rule.description));
 }
 
+const STATUS_BADGE: Record<RecentCheck["status"], [string, string]> = {
+  ALLOWED: ["ok", "Нарушений нет"],
+  VIOLATIONS_FOUND: ["err", "Нужно доработать"],
+  NEEDS_MANUAL_REVIEW: ["warn", "Ручная проверка"],
+};
+
+/** «сейчас», «12 мин назад», «вчера» или дата — для списка недавних проверок. */
+function ago(iso: string) {
+  const min = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  if (min < 1) return "сейчас";
+  if (min < 60) return `${min} мин назад`;
+  if (min < 24 * 60) return `${Math.round(min / 60)} ч назад`;
+  if (min < 48 * 60) return "вчера";
+  return new Date(iso).toLocaleDateString("ru-RU");
+}
+
+/** Сколько недавних проверок видно сразу; остальные — по «Вся история». */
+const RECENT_SHOWN = 3;
+
+type Suggestion = { state: "none" } | { state: "busy" } | { state: "error"; error: string; retry: () => void }
+  | { state: "ready"; text: string };
+
+/** Рекомендованная формулировка к ответу с нарушениями. Новый ответ — новый запрос; старый отменяется. */
+function useSuggestion(result: CheckResult | null): Suggestion & { retry: () => void } {
+  const [value, setValue] = useState<{ for: CheckResult | null; s: Suggestion }>({ for: null, s: { state: "none" } });
+  const [attempt, setAttempt] = useState(0);
+  const retry = () => setAttempt((n) => n + 1);
+  useEffect(() => {
+    if (!result || result.status !== "VIOLATIONS_FOUND" || !result.violations.length) {
+      setValue({ for: result, s: { state: "none" } });
+      return;
+    }
+    const seen = new Set<string>();
+    const violations = result.violations.filter((v) => {
+      const key = v.rule_text ?? "";
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map((v) => ({ rule_text: v.rule_text, check_instruction: v.check_instruction }));
+    const control = new AbortController();
+    setValue({ for: result, s: { state: "busy" } });
+    api.suggestGoal(result.goal, violations, control.signal)
+      .then((r) => setValue({ for: result, s: { state: "ready", text: r.goal } }))
+      .catch((err) => {
+        if (!control.signal.aborted) setValue({ for: result, s: { state: "error", error: errorText(err), retry } });
+      });
+    return () => control.abort();
+  }, [result, attempt]);
+  return { ...(value.for === result ? value.s : { state: "none" }), retry } as Suggestion & { retry: () => void };
+}
+
 export function CheckView() {
   const { orders, departments, targets, health, setSection, setTrace, goToNode } = useCatalog();
   const { checkForm, setCheckForm, single } = useCheckForm();
@@ -67,7 +124,7 @@ export function CheckView() {
   // старый вердикт и подсветка цитат к новым значениям не относятся; вернули как было — ответ снова виден.
   const result = checkForm.result && resultMatches(checkForm) ? checkForm.result : null;
   const setGoal = (next: string) => setCheckForm({ goal: next });
-  const setDepartmentId = (next: string) => setCheckForm({ departmentId: next });
+  const setDepartmentId = (next: string) => { setCheckForm({ departmentId: next }); setFromRecent(false); };
   const setIsStudent = (next: boolean) => setCheckForm({ isStudent: next });
   const busy = single.busy;
   // После ответа поле ввода сменяется формулировкой с подсветкой найденного; «Изменить» возвращает поле.
@@ -79,10 +136,37 @@ export function CheckView() {
     if (target) void goToNode(target.nodeId, "CheckTarget");
     else setSection("targets");
   };
-  const { canEdit } = useAuth();
+  const { canEdit, isAdmin, user } = useAuth();
   const openAdvice = useAdviceDialog();
   const options = departments.filter((d) => d.departmentId && d.status === "active");
   const department = options.find((d) => d.departmentId === departmentId);
+
+  // Недавние проверки этого пользователя (state/recent.ts): ответ записывается, как только пришёл.
+  const [recent, setRecent] = useState(() => readRecent(user.login));
+  const recorded = useRef(checkForm.result);
+  useEffect(() => {
+    const r = checkForm.result, sent = checkForm.checked;
+    if (!r || !sent || r === recorded.current) return;
+    recorded.current = r;
+    setRecent(pushRecent(user.login, { goal: sent.goal, departmentId: sent.departmentId, isStudent: sent.isStudent,
+      status: r.status, at: new Date().toISOString() }));
+  }, [checkForm.result, checkForm.checked, user.login]);
+  // Пустая форма берёт подразделение прошлой проверки, если оно ещё действует;
+  // только при открытии страницы и появлении справочника, а не при каждом выборе в списке.
+  const hasOptions = options.length > 0;
+  useEffect(() => {
+    const last = recent[0]?.departmentId;
+    if (goal || departmentId || !last) return;
+    if (options.some((d) => d.departmentId === last)) { setCheckForm({ departmentId: last }); setFromRecent(true); }
+  }, [hasOptions]);
+  const [fromRecent, setFromRecent] = useState(false);
+  // Недавних показывается три; «Вся история» раскрывает остальные сохранённые.
+  const [allRecent, setAllRecent] = useState(false);
+  const repeat = (r: RecentCheck) => {
+    setCheckForm({ goal: r.goal, departmentId: r.departmentId, isStudent: r.isStudent });
+    setEditing(false);
+    void single.run(r.goal, r.departmentId, r.isStudent);
+  };
 
   // Что реально проверяется для подразделения и студента — та же логика, что в графе.
   const active = useMemo(() => activeRuleRefs(orders), [orders]);
@@ -103,6 +187,24 @@ export function CheckView() {
     ? (attribute?: string) => openAdvice({ result, departmentId: departmentId || null, attribute,
       onApplied: () => void run() })
     : undefined;
+
+  // Рекомендованная формулировка: отдельный запрос к модели после ответа с нарушениями (POST /suggest-goal).
+  const suggestion = useSuggestion(result);
+  const toast = useToast();
+  const openMenu = useMenu();
+  const { openCustom } = useDialogs();
+  const applySuggestion = (text: string) => { setCheckForm({ goal: text }); setEditing(true); };
+  const jsonMenu = result && isAdmin ? (
+    <button className="btn sm menu-btn" id="checkMenu" aria-haspopup="menu" aria-label="Ещё" title="Ещё"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => openMenu(e.currentTarget, [
+        { label: "Показать ответ API (JSON)", run: () => openCustom((close) => <JsonDialog id="checkJson" value={result} close={close} />) },
+        { label: "Скопировать ответ API (JSON)", run: async () => {
+          if (await copyText(JSON.stringify(result, null, 2))) toast("JSON скопирован", "ok");
+          else toast("Не удалось скопировать — откройте ответ API и скопируйте вручную", "err");
+        } },
+      ])}>⋯</button>
+  ) : undefined;
 
   // Повторный запуск, пока идёт проверка (Ctrl+Enter, советчик), запроса не шлёт: см. state/checkForm.tsx.
   async function run() {
@@ -143,6 +245,7 @@ export function CheckView() {
                       onChange={(e) => setIsStudent(e.target.checked)} />
                     Цель ставит студент
                   </label>
+                  <div className="spacer" />
                   <button className="btn primary" disabled={busy} onClick={() => void run()}>
                     {busy ? <><Spinner /> Проверяем…</> : "Проверить"}
                   </button>
@@ -150,23 +253,57 @@ export function CheckView() {
                 {!departmentId && (
                   <div className="hint">Без подразделения применяются все правила, включая те, что действуют только в отдельных.</div>
                 )}
+                {departmentId && fromRecent && <div className="hint">Подразделение — с прошлой проверки.</div>}
               </div>
 
               {(busy || result) && <CheckProgress progress={single.progress} busy={busy} />}
-              {dispute && (
-                <div className="card pad" id="checkDispute" style={{ marginTop: 16 }}>
-                  <div className="row" style={{ gap: 16 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="mid">Ответ по атрибуту должен быть другим?</div>
-                      <div className="dim">Опишите, что не так, — модель предложит, как поправить описание атрибута и примеры.</div>
+              {/* Сначала вердикт и нарушения; «Не согласен» — у каждого нарушения (Verdict). */}
+              {result && (
+                <Verdict result={result} onDispute={dispute} onAttribute={openAttribute} menu={jsonMenu}
+                  onTrace={() => { setTrace(result); setSection("graph"); }} total={applicable.length}>
+                  {suggestion.state !== "none" && (
+                    <div className="suggest" id="checkSuggestion">
+                      <div className="suggest-label">Предлагаемая формулировка</div>
+                      {suggestion.state === "busy" && <div className="muted"><Spinner /> Модель переписывает цель с учётом нарушенных правил…</div>}
+                      {suggestion.state === "error" && (
+                        <div className="row"><span className="muted">{suggestion.error}</span>
+                          <button className="btn sm ghost" onClick={suggestion.retry}>Повторить</button></div>
+                      )}
+                      {suggestion.state === "ready" && <>
+                        <div className="suggest-text">{suggestion.text}</div>
+                        <div className="row">
+                          <button className="btn sm primary" onClick={() => applySuggestion(suggestion.text)}>Подставить в поле</button>
+                          <button className="btn sm" onClick={async () => {
+                            if (await copyText(suggestion.text)) toast("Формулировка скопирована", "ok");
+                            else toast("Не удалось скопировать — выделите текст и скопируйте вручную", "err");
+                          }}>Скопировать</button>
+                          <span className="dim">Слова в квадратных скобках замените своими данными.</span>
+                        </div>
+                      </>}
                     </div>
-                    <button className="btn sm" style={{ flex: "none" }} onClick={() => dispute()}>Предложить правку графа</button>
+                  )}
+                </Verdict>
+              )}
+              {recent.length > 0 && (
+                <div className="card pad recent" id="checkRecent">
+                  <div className="row recent-head">
+                    <h3>Недавние проверки</h3>
+                    <div className="spacer" />
+                    {recent.length > RECENT_SHOWN && (
+                      <button type="button" className="btn sm ghost" onClick={() => setAllRecent(!allRecent)}>
+                        {allRecent ? "Свернуть" : `Вся история (${recent.length}) →`}</button>
+                    )}
                   </div>
+                  {(allRecent ? recent : recent.slice(0, RECENT_SHOWN)).map((r) => (
+                    <div key={r.at} className="recent-row">
+                      <span className="recent-goal" title={r.goal}>{r.goal}</span>
+                      <span className={`badge ${STATUS_BADGE[r.status][0]}`}>{STATUS_BADGE[r.status][1]}</span>
+                      <span className="dim">{ago(r.at)}</span>
+                      <button type="button" className="btn sm ghost" disabled={busy} onClick={() => repeat(r)}>Повторить</button>
+                    </div>
+                  ))}
                 </div>
               )}
-              {result && <Verdict result={result} onDispute={dispute} onAttribute={openAttribute}
-                onTrace={() => { setTrace(result); setSection("graph"); }} total={applicable.length} />}
-              {result && <JsonBlock id="checkJson" value={result} />}
             </>
           )}
         </div>
@@ -174,9 +311,10 @@ export function CheckView() {
         {mode !== "batch" && <aside style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <div className="card pad">
             <h3>Что проверяется{department ? ` для «${department.name || department.departmentId}»` : ""}</h3>
-            <div className="small muted" style={{ margin: "4px 0 8px" }}>
-              правил: {applicable.length}{skippedByDepartment ? ` · не для этого подразделения: ${skippedByDepartment}` : ""}
-              {skippedForStudents ? ` · только для студентов: ${skippedForStudents}` : ""}
+            <div className="chips counts">
+              <span className="badge requirement">применимо {applicable.length} из {active.length}</span>
+              {skippedByDepartment > 0 && <span className="badge">не для этого подразделения: {skippedByDepartment}</span>}
+              {skippedForStudents > 0 && <span className="badge">только для студентов: {skippedForStudents}</span>}
             </div>
             {applicable.map(({ rule }) => {
               const state = !marks ? "skip" : failed(rule) ? "bad"

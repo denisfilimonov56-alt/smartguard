@@ -327,6 +327,8 @@ function seed() {
     firstLogin — обучение по интерфейсу ещё не пройдено. */
 /** bulkBusy — столько первых запросов /check-goals получат 503 с Retry-After: 1, как API сверх BULK_MAX_REQUESTS. */
 /** liveModel — проверка и выписка идут секунды и отдают ход, как настоящая модель (npm run dev:mock; тесты — без него). */
+const KIND_RU: Record<string, string> = { Order: "Приказ", Clause: "Пункт", Rule: "Правило", CheckTarget: "Атрибут", ViolationExample: "Пример", Department: "Подразделение", JobDescription: "Должностная инструкция" };
+
 export function createBackend(options: { user?: string; firstLogin?: boolean; bulkBusy?: number; liveModel?: boolean } = {}) {
   let bulkBusy = options.bulkBusy ?? 0;
   // liveModel: идущие проверки по X-Check-Id и задержка ответа текущего запроса.
@@ -720,13 +722,13 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     const issues: unknown[] = [];
     const issue = (code: string, severity: string, title: string, detail: string,
       items: unknown[] = [], fix: unknown = null) => issues.push({ code, severity, title, detail, items, fix });
-    const kindOf = (n: Node) => ({ label: `${n.label} ${n.props.number ?? n.props.code ?? n.props.ruleId ?? n.id}`,
+    const kindOf = (n: Node) => ({ label: `${KIND_RU[n.label] ?? n.label}: ${n.props.number ?? n.props.code ?? n.props.ruleId ?? n.id}`,
       nodeId: n.id, kind: n.label });
 
     const noDescription = active("CheckTarget").filter((t) => !String(t.props.description ?? "").trim());
     if (noDescription.length)
       issue("targets_without_description", "error", "Атрибуты без описания",
-        "Модель получает в промпте только имя и системно не распознаёт атрибут.",
+        "Без описания модель не узнает атрибут в формулировке цели, и правило на нём будет срабатывать всегда.",
         noDescription.map((t) => ({ label: String(t.props.name), nodeId: t.id, kind: "CheckTarget" })));
 
     const noTargets = active("Rule").filter((r) => !appliesTo.some(([rid]) => rid === r.id));
@@ -737,8 +739,8 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     const noKey = all.filter((n) => n.label !== "CheckTarget" && n.label !== "Department"
       && !n.props[BUSINESS_KEYS[n.label]!]);
     if (noKey.length)
-      issue("missing_identifiers", "error", "Узлы без идентификатора",
-        "Без бизнес-ключа узел не попадёт в выгрузку seed.cypher.", noKey.map(kindOf),
+      issue("missing_identifiers", "error", "Не заданы идентификаторы",
+        "Без идентификатора приказ, пункт, правило или пример не попадут в резервную копию каталога.", noKey.map(kindOf),
         { action: "repair_identifiers", label: "Проставить идентификаторы" });
 
     const orphans = active("CheckTarget").filter((t) => !appliesTo.some(([, tid]) => tid === t.id));
@@ -1367,7 +1369,7 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     const user = need(method === "DELETE" || path === "/catalog/repair-identifiers"
       || path === "/catalog/merge-duplicate-targets" || path.startsWith("/monitoring/")
       || path.startsWith("/settings") ? "admin"
-      : method === "GET" || path === "/check-goal" || path === "/check-goals" ? "viewer" : "editor");
+      : method === "GET" || path === "/check-goal" || path === "/check-goals" || path === "/suggest-goal" ? "viewer" : "editor");
     // Обслуживание, как auth.require: работает только администратор; вход и /auth/me остаются.
     if (settings.maintenance && user.role !== "admin") throw new HttpError(503, MAINTENANCE);
     if (path.startsWith("/settings")) return settingsRoute(method, path, body);
@@ -1409,6 +1411,18 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         delayMs = plan.total;
       }
       return result;
+    }
+    if (method === "POST" && path === "/suggest-goal") {
+      // Как agent.suggest_goal, но без модели: недостающее дописывается заглушками в квадратных скобках.
+      const goal = goalText(body?.goal, settings.goalMaxChars as number);
+      const problems: { rule_text?: string }[] = Array.isArray(body?.violations) ? body.violations : [];
+      if (!problems.length) throw new HttpError(422, "violations: List should have at least 1 item");
+      let text = goal.trim().replace(/[.\s]+$/, "");
+      const rules = problems.map((p) => String(p.rule_text ?? "").toLowerCase());
+      if (rules.some((r) => r.includes("проект"))) text = `В рамках проекта [название проекта] ${text[0].toLowerCase()}${text.slice(1)}`;
+      if (rules.some((r) => r.includes("срок"))) text += " до [дата]";
+      if (rules.some((r) => r.includes("наставник"))) text += " под руководством наставника [ФИО]";
+      return { goal: text };
     }
     if (method === "POST" && path === "/check-goals") {
       // Какие цели уже есть в кэше ответов — до проверки: checkGoal их туда кладёт.

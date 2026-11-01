@@ -22,6 +22,7 @@ import {
   ruleKey, rowsFromSheet, sameRow, sheetWidth, summaryOf, templateWorkbook, validateRows,
   failedTemporarily, type Columns, type Issue,
 } from "./batch";
+import { JsonDialog } from "./JsonBlock";
 import { Verdict } from "./Verdict";
 
 /* Проверка нескольких целей сразу: список целей «цель — подразделение —
@@ -78,6 +79,7 @@ export function BatchCheck() {
   }, [rows, setRows]);
   // Только что добавленная цель: в её поле сразу ставится курсор.
   const [added, setAdded] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
   const add = () => {
     const row = emptyRow();
     setRows((prev) => [...prev, row]);
@@ -98,7 +100,26 @@ export function BatchCheck() {
   async function pick(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file) return;
+    if (file) await openFile(file);
+  }
+
+  /** Строки, вставленные из Excel или таблицы (столбцы через табуляцию): заголовок узнаётся,
+      как в файле; без заголовка — цель, подразделение, студент по порядку. */
+  function paste(text: string) {
+    const lines = text.split(/\r?\n/).map((line) => line.split("\t")).filter((cells) => cells.some((c) => c.trim()));
+    if (!lines.length) return;
+    const found = detectColumns(lines);
+    const width = sheetWidth(lines);
+    const { columns, header } = found.columns.goal !== null ? found : {
+      columns: { goal: 0, department: width > 1 ? 1 : null, id: null, student: width > 2 ? 2 : null }, header: false };
+    const imported = rowsFromSheet({ name: "", rows: lines }, columns, header, departments);
+    if (!imported.length) return;
+    setRows((prev) => [...prev.filter((r) => r.goal.trim() || r.departmentId || r.id), ...imported]);
+    setSelected(imported[0].key);
+    toast(`Вставлено: ${plural(imported.length, ["строка", "строки", "строк"])}`, "ok");
+  }
+
+  async function openFile(file: File) {
     if (file.size > MAX_FILE_BYTES) { toast("Файл больше 10 МБ: оставьте в нём только лист с целями", "err"); return; }
     let sheets: WorkbookSheet[];
     try {
@@ -139,26 +160,24 @@ export function BatchCheck() {
       <div className="hero">
         <h1>Проверьте несколько целей</h1>
         <div className="hint" style={{ marginTop: 6 }}>
-          Заполните таблицу или загрузите файл Excel со столбцами «Цель», «Подразделение» и, если есть,
-          «Идентификатор» и «Студент». Подразделение у каждой цели обязательно: без него проверка не отправляется.
+          Таблица или файл Excel со столбцами «Цель», «Подразделение» и, если есть, «Идентификатор» и «Студент».
+          Подразделение у каждой цели обязательно: без него проверка не отправляется.
         </div>
+        {/* Как в форме одной цели: параметры слева, запуск справа. Файл и шаблон — в шапке списка или в зоне загрузки. */}
         <div className="row wrap" style={{ marginTop: 14 }}>
           <input ref={fileInput} type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             className="hidden" aria-label="Файл Excel" onChange={(e) => void pick(e)} />
-          <button className="btn" disabled={busy} onClick={() => fileInput.current?.click()}>Загрузить из Excel</button>
-          <button className="btn ghost" onClick={() => downloadFile(templateWorkbook(departments), "цели-шаблон.xlsx")}>
-            Скачать шаблон
-          </button>
-          <div className="spacer" />
-          <Select id="batchDepartment" ariaLabel="Подразделение для строк без него" className="pill" value={fallback}
-            style={{ width: 300 }} onChange={(next) => setCheckForm({ departmentId: next })}
-            options={[{ value: "", label: "Подразделение по умолчанию: нет" },
+          <Select id="batchDepartment" ariaLabel="Подразделение для строк без него" className="pill glass" value={fallback}
+            style={{ width: 340 }} onChange={(next) => setCheckForm({ departmentId: next })}
+            options={[{ value: "", label: "По умолчанию: не выбрано" },
               ...options.map((o) => ({ value: o.value, label: `По умолчанию: ${o.label}` }))]} />
+          <div className="spacer" />
           {!busy && pending > 0 && pending < rows.length && (
             <button className="btn" id="batchContinue" title="Строки с ответом не отправляются снова и не тратят лимит проверок"
               onClick={() => run(true)}>Проверить оставшиеся ({pending})</button>
           )}
-          <button className="btn primary" id="batchRun" disabled={busy} onClick={() => run()}>
+          {!busy && !rows.length && <span className="hint" style={{ margin: 0 }}>Добавьте цели, чтобы проверить</span>}
+          <button className="btn primary" id="batchRun" disabled={busy || !rows.length} onClick={() => run()}>
             {busy ? <><Spinner /> Проверено {batchRun.done} из {batchRun.total}
               {batchRun.waiting === null ? "…" : batchRun.waitReason === "rate"
                 ? ` · лимит проверок в минуту, повтор через ${batchRun.waiting} с`
@@ -178,6 +197,12 @@ export function BatchCheck() {
           {broken > 0 && <span className="badge err">с ошибками: {broken}</span>}
           {tooMany && <span className="badge err">не более {MAX_ROWS} целей за раз</span>}
           <div className="spacer" />
+          {rows.length > 0 && <>
+            <button className="btn sm" disabled={busy} onClick={() => fileInput.current?.click()}>Загрузить из Excel</button>
+            <button className="btn sm ghost" onClick={() => downloadFile(templateWorkbook(departments), "цели-шаблон.xlsx")}>
+              Скачать шаблон
+            </button>
+          </>}
           {broken > 0 && (
             <button className="btn sm ghost" onClick={() => setRows((prev) => prev.filter((r) => !hasErrors(issues.get(r.key))))}>
               Убрать строки с ошибками
@@ -204,9 +229,24 @@ export function BatchCheck() {
               verdict={verdictProps} autoFocus={current.key === added} />
           </div>
         ) : (
-          <div className="batch-empty">
-            <div className="muted">Добавьте цель вручную или загрузите файл Excel.</div>
-            <button className="btn sm" onClick={add}>+ Добавить цель</button>
+          // Пусто: зона, куда перетаскивают файл Excel или вставляют строки из таблицы (Ctrl+V).
+          <div className={`batch-empty drop ${dragging ? "over" : ""}`} id="batchDrop" tabIndex={0}
+            aria-label="Зона загрузки: перетащите книгу или вставьте строки"
+            onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
+            onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f) void openFile(f); }}
+            onPaste={(e) => { e.preventDefault(); paste(e.clipboardData.getData("text/plain")); }}>
+            <span className="drop-ico" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10 13V3M6 7l4-4 4 4M3 13v3a1 1 0 001 1h12a1 1 0 001-1v-3" /></svg>
+            </span>
+            <b>Перетащите файл Excel сюда</b>
+            <span className="muted">или щёлкните здесь и вставьте строки из таблицы через Ctrl+V</span>
+            <div className="row">
+              <button className="btn primary" disabled={busy} onClick={() => fileInput.current?.click()}>Выбрать файл</button>
+              <button className="btn" onClick={() => downloadFile(templateWorkbook(departments), "цели-шаблон.xlsx")}>Скачать шаблон</button>
+              <button className="btn ghost" onClick={add}>+ Добавить цель</button>
+            </div>
+            <span className="dim">.xlsx, до {MAX_ROWS} целей за раз</span>
           </div>
         )}
       </div>
@@ -216,7 +256,7 @@ export function BatchCheck() {
   function menuItems(): MenuItem[] {
     const items: MenuItem[] = [];
     if (batch) {
-      items.push({ label: "Показать ответ API (JSON)", run: () => openCustom((close) => <JsonDialog value={batch.result} close={close} />) });
+      items.push({ label: "Показать ответ API (JSON)", run: () => openCustom((close) => <JsonDialog id="batchJson" value={batch.result} close={close} />) });
       items.push({ label: "Скопировать ответ API (JSON)", run: async () => {
         if (await copyText(JSON.stringify(batch.result, null, 2))) toast("JSON скопирован", "ok");
         else toast("Не удалось скопировать — откройте ответ API и скопируйте вручную", "err");
@@ -228,20 +268,6 @@ export function BatchCheck() {
     }
     return items;
   }
-}
-
-/** Ответ API целиком — по пункту меню «⋯»: он нужен разработчикам, а не тем, кто проверяет цели. */
-function JsonDialog({ value, close }: { value: unknown; close: () => void }) {
-  const text = useMemo(() => JSON.stringify(value, null, 2), [value]);
-  return (
-    <Overlay onClose={close}>
-      <div className="modal wide" role="dialog" aria-modal="true" aria-label="Ответ API (JSON)" id="batchJson">
-        <h3>Ответ API (JSON)</h3>
-        <div className="content"><pre className="mono json">{text}</pre></div>
-        <div className="foot"><button type="button" className="btn" onClick={close}>Закрыть</button></div>
-      </div>
-    </Overlay>
-  );
 }
 
 /** Сводка ответа в шапке: только ненулевые счётчики. Непроверенные цели (unchecked) — отдельно, не в «ручной проверке». */

@@ -1,12 +1,15 @@
 import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
 
 export type ToastKind = "" | "ok" | "err";
-type ToastFn = (message: string, kind?: ToastKind) => void;
+/** Кнопка в уведомлении, например «Отменить»: уведомление с ней висит дольше. */
+export interface ToastAction { label: string; run: () => void }
+type ToastFn = (message: string, kind?: ToastKind, action?: ToastAction) => void;
 
 interface Toast {
   id: number;
   message: string;
   kind: ToastKind;
+  action?: ToastAction;
   leaving: boolean;
 }
 
@@ -26,10 +29,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), 300);
   }, []);
 
-  const toast = useCallback<ToastFn>((message, kind = "") => {
+  const toast = useCallback<ToastFn>((message, kind = "", action) => {
     const id = ++nextId;
-    setToasts((list) => [...list.filter((t) => !t.leaving).slice(-(MAX_TOASTS - 1)), { id, message, kind, leaving: false }]);
-    setTimeout(() => dismiss(id), 4200);
+    setToasts((list) => [...list.filter((t) => !t.leaving).slice(-(MAX_TOASTS - 1)), { id, message, kind, action, leaving: false }]);
+    setTimeout(() => dismiss(id), action ? 8000 : 4200);
   }, [dismiss]);
 
   return (
@@ -41,6 +44,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             style={t.leaving ? { opacity: 0, transform: "translateY(6px)", transition: ".3s", pointerEvents: "none" } : undefined}>
             <span className="toast-ico" aria-hidden="true">{t.kind === "ok" ? "✓" : t.kind === "err" ? "✕" : "i"}</span>
             <span>{t.message}</span>
+            {t.action && (
+              <button type="button" className="toast-action"
+                onClick={(e) => { e.stopPropagation(); dismiss(t.id); t.action!.run(); }}>{t.action.label}</button>
+            )}
           </div>
         ))}
       </div>

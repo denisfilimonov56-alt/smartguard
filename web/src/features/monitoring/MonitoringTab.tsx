@@ -162,6 +162,8 @@ export function MonitoringTab() {
 
   const records = history?.records ?? [];
   const totals = stats?.totals?.total ? stats.totals : null;
+  /** Значения показателя по интервалам периода — для мини-графиков в плитках. */
+  const trend = (pick: (b: CheckAggregate) => number) => (stats?.buckets ?? []).map(pick);
   const points = useMemo(() => (stats?.buckets ?? []).map((b) => ({
     label: bucketLabel(b.bucket, stats!.step), total: b.total, seconds: (b.avg_computed_ms ?? 0) / 1000, row: b,
   })), [stats]);
@@ -170,7 +172,8 @@ export function MonitoringTab() {
     <section id="tab-monitoring">
       <PageHead title="Мониторинг" sub="Очередь и нагрузка сейчас, показатели за период и история проверок." />
 
-      <h2 className="block-title">Сейчас <span className="dim">обновляется каждые {REFRESH_MS / 1000} с</span></h2>
+      <h2 className="block-title now-title">Сейчас <span className="dim">обновляется каждые {REFRESH_MS / 1000} с</span>
+        {now && <NowSummary now={now} />}</h2>
       {nowError && <div className="card pad"><span className="badge warn">{nowError}</span></div>}
       {!now && !nowError && <div className="tiles"><Skeleton rows={2} /><Skeleton rows={2} /><Skeleton rows={2} /></div>}
       {now && <NowCards now={now} />}
@@ -206,17 +209,17 @@ export function MonitoringTab() {
       {totals && (
         <>
           <div className="tiles">
-            <Tile label="Проверок" value={num(totals.total)}
+            <Tile label="Проверок" value={num(totals.total)} trend={trend((b) => b.total)}
               note={`из кэша: ${num(totals.cached)} (${share(totals.cached, totals.total)})`} />
-            <Tile label="Среднее время проверки" value={dur(totals.avg_computed_ms)}
+            <Tile label="Среднее время проверки" value={dur(totals.avg_computed_ms)} trend={trend((b) => b.avg_computed_ms ?? 0)}
               note={`без ответов из кэша · 95% таких проверок быстрее ${dur(totals.p95_ms)}`} />
-            <Tile label="Ожидание в очереди" value={dur(totals.avg_queue_ms)}
+            <Tile label="Ожидание в очереди" value={dur(totals.avg_queue_ms)} trend={trend((b) => b.avg_queue_ms ?? 0)}
               note={`в среднем на проверку · модель: ${dur(totals.avg_llm_ms)}`} />
-            <Tile label="Самая долгая" value={dur(totals.max_ms)}
+            <Tile label="Самая долгая" value={dur(totals.max_ms)} trend={trend((b) => b.max_ms ?? 0)}
               note={`запросов к модели: ${num(totals.llm_calls)}`} />
-            <Tile label="С нарушениями" value={share(totals.violations, totals.total)}
+            <Tile label="С нарушениями" value={share(totals.violations, totals.total)} trend={trend((b) => (b.total ? b.violations / b.total : 0))}
               note={`${num(totals.violations)} из ${num(totals.total)}`} />
-            <Tile label="На ручную проверку" value={share(totals.manual_review, totals.total)}
+            <Tile label="На ручную проверку" value={share(totals.manual_review, totals.total)} trend={trend((b) => (b.total ? b.manual_review / b.total : 0))}
               note={`${num(totals.manual_review)} — сбой модели или нечем проверить`} />
           </div>
           <div className="charts">
@@ -309,40 +312,78 @@ function Pager({ id, total, page, size, busy, onChange }: {
   );
 }
 
-function Tile({ label, value, note, tone }: { label: string; value: string; note?: string; tone?: "warn" }) {
+function Tile({ label, value, note, tone, trend }: {
+  label: string; value: string; note?: string; tone?: "warn";
+  /** Значения по интервалам периода — мини-график справа от числа. */
+  trend?: number[];
+}) {
   return (
     <div className={`card tile ${tone ?? ""}`}>
-      <div className="small muted">{label}</div>
-      <b>{value}</b>
+      <div className="small muted">{label}{tone === "warn" && <span className="badge warn tile-flag">выше обычного</span>}</div>
+      <div className="tile-row">
+        <b>{value}</b>
+        {trend && trend.length > 1 && <Sparkline values={trend} />}
+      </div>
       {note && <div className="small dim">{note}</div>}
     </div>
   );
 }
 
+/** Мини-график тренда без осей: форма важнее точных значений, они — в таблице ниже. */
+function Sparkline({ values }: { values: number[] }) {
+  const W = 120, H = 40;
+  const max = Math.max(...values), min = Math.min(...values);
+  const pts = values.map((v, i) => [i * W / (values.length - 1), H - 4 - ((v - min) / (max - min || 1)) * (H - 8)]);
+  const d = pts.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
+  return (
+    <svg className="spark" viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
+      <path className="area" d={`${d} L${W} ${H} L0 ${H} Z`} />
+      <path className="line" d={d} />
+    </svg>
+  );
+}
+
+/** Итог «Сейчас» справа от заголовка: всё ли в порядке и сколько показателей требуют внимания. */
+function NowSummary({ now }: { now: MonitoringNow }) {
+  const warnings = [now.llm.waiting > now.llm.capacity, now.recent.manual_review > 0, !now.vllm].filter(Boolean).length;
+  return warnings
+    ? <span className="badge warn">{warnings === 1 ? "Всё в норме, кроме 1 показателя" : `Требуют внимания: ${warnings}`}</span>
+    : <span className="badge ok">Всё в норме</span>;
+}
+
 function NowCards({ now }: { now: MonitoringNow }) {
   const { llm, checks, recent, cache, vllm, history } = now;
   const lookups = cache.hits + cache.misses;
+  const queueWarn = llm.waiting > llm.capacity;
+  const manualWarn = recent.manual_review > 0;
+  const minor: [string, string, string, boolean?][] = [
+    ["Запросов у модели", `${llm.running} из ${llm.capacity}`, `${llm.reserve} слотов оставлено ручным проверкам`],
+    ["Целей в работе", num(checks.running), `не начаты в пакетах: ${num(checks.queued)}`],
+    ["vLLM", vllm ? `${num(vllm.running ?? 0)} в работе` : "нет ответа", vllm ? `в очереди: ${num(vllm.waiting ?? 0)}`
+      + (vllm.kv_cache_usage != null ? ` · KV-кэш ${Math.round(vllm.kv_cache_usage * 100)}%` : "") : "показатели модели недоступны", !vllm],
+    ["Кэш ответов", num(cache.entries), lookups ? `попаданий: ${share(cache.hits, lookups)}` : "обращений пока не было"],
+  ];
   return (
     <>
-      <div className="tiles">
-        <Tile label="Очередь к модели" value={num(llm.waiting)} tone={llm.waiting > llm.capacity ? "warn" : undefined}
+      <div className="tiles tiles-main">
+        <Tile label="Очередь к модели" value={num(llm.waiting)} tone={queueWarn ? "warn" : undefined}
           note="запросов ждут свободного слота" />
-        <Tile label="Запросов у модели" value={`${llm.running} из ${llm.capacity}`}
-          note={`${llm.reserve} слотов оставлено ручным проверкам`} />
-        <Tile label="Целей в работе" value={num(checks.running)}
-          note={`ещё не начаты в принятых пакетах: ${num(checks.queued)}`} />
         <Tile label="Проверок в минуту" value={num(recent.per_minute)}
           note={`за последние ${recent.window_seconds / 60} мин: ${num(recent.checks)}`} />
         <Tile label="Среднее время проверки" value={dur(recent.avg_ms)}
           note={`за последние ${recent.window_seconds / 60} мин, без кэша`} />
         <Tile label="Ушло на ручную проверку" value={num(recent.manual_review)}
-          tone={recent.manual_review ? "warn" : undefined} note={`за последние ${recent.window_seconds / 60} мин`} />
-        <Tile label="vLLM" value={vllm ? `${num(vllm.running ?? 0)} в работе` : "нет ответа"} tone={vllm ? undefined : "warn"}
-          note={vllm ? `в его очереди: ${num(vllm.waiting ?? 0)}`
-            + (vllm.kv_cache_usage != null ? ` · KV-кэш ${Math.round(vllm.kv_cache_usage * 100)}%` : "")
-            : "показатели модели недоступны"} />
-        <Tile label="Кэш ответов" value={num(cache.entries)}
-          note={lookups ? `попаданий: ${share(cache.hits, lookups)}` : "обращений пока не было"} />
+          tone={manualWarn ? "warn" : undefined} note={`за последние ${recent.window_seconds / 60} мин`} />
+      </div>
+      {/* Второстепенное — одной полосой, чтобы не спорило за внимание с главным. */}
+      <div className="card now-minor">
+        {minor.map(([label, value, note, warn]) => (
+          <div key={label} className={warn ? "warn" : ""}>
+            <span className="small dim">{label}</span>
+            <b>{value}</b>
+            <span className="small dim">{note}</span>
+          </div>
+        ))}
       </div>
       {(!now.neo4j || history.dropped > 0 || !history.enabled) && (
         <div className="alert" style={{ marginTop: 12 }}>

@@ -1,14 +1,17 @@
 import { useState } from "react";
 
+import { api, isStale, STALE_TEXT } from "../../api/client";
 import type { Department, Rule } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { cellState, type CellState } from "../../state/scope";
+import {
+  allDepartmentIds, cellState, FUTURE_DEPARTMENTS_HINT, scopeOf, withApplies, withOff, type CellState,
+} from "../../state/scope";
 import { allRuleRefs, normalizeQuery, ruleMatches, type RuleRef } from "../../state/tree";
 import { ArchivedBadge, Empty, PageHead } from "../../ui/common";
 import { Select } from "../../ui/Select";
+import { errorText, useToast } from "../../ui/Toasts";
 import { useActions } from "../actions";
-import { useCellEditor } from "./CellEditor";
 import { RuleWizard } from "./RuleWizard";
 
 /* Главный рабочий экран владельца приказа: строка — правило, столбец —
@@ -18,7 +21,7 @@ import { RuleWizard } from "./RuleWizard";
 const STATE_LABEL: Record<CellState, string> = { applies: "действует", off: "не действует" };
 
 const Cell = ({ state }: { state: CellState }) =>
-  state === "applies" ? <span className="cell yes">✓</span> : <span className="cell no">—</span>;
+  state === "applies" ? <span className="cell yes">✓</span> : <span className="cell no">✕</span>;
 
 export function RulesView() {
   const { wizard } = useCatalog();
@@ -33,7 +36,8 @@ function Matrix() {
   const { orders, departments, showArchived, reload, openRule, openWizard, panelRule, savingRule } = useCatalog();
   const actions = useActions();
   const { canEdit } = useAuth();
-  const editCell = useCellEditor();
+  const toast = useToast();
+  const [toggling, setToggling] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [orderFilter, setOrderFilter] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
@@ -44,10 +48,38 @@ function Matrix() {
     .filter((o) => !orderFilter || o.nodeId === orderFilter)
     .map((order) => ({ order, refs: allRuleRefs([order]).filter((ref) => ruleMatches(ref, query)) }))
     .filter((g) => g.refs.length);
-  function open(rule: Rule, department: Department, anchor: HTMLElement) {
+  /** Щелчок по ячейке сразу переключает правило для подразделения; «Отменить» в уведомлении возвращает как было. */
+  async function toggle(rule: Rule, department: Department) {
     const key = rule.nodeId + department.nodeId;
+    const departmentId = department.departmentId!;
+    const name = department.name || departmentId;
+    const scope = scopeOf(rule);
+    const turnOn = cellState(rule, departmentId) === "off";
     setFocus(key);
-    editCell({ rule, department, anchor: anchor.getBoundingClientRect() });
+    setToggling(key);
+    try {
+      // У правила «для всех» список берётся полный, с архивными подразделениями.
+      const next = turnOn ? withApplies(scope, departmentId)
+        : withOff(scope, departmentId, scope.length ? [] : await allDepartmentIds());
+      if (!next) {
+        toast("Правило должно действовать хотя бы в одном подразделении. Если оно больше не нужно — отправьте его в архив.", "err");
+        return;
+      }
+      // expected — область, от которой посчитан новый список: чужое изменение не перезаписывается (409).
+      await api.setRuleScope(rule.nodeId, next, scope);
+      await reload();
+      const what = `«${rule.description || "Правило"}» ${turnOn ? "теперь действует" : "больше не действует"} для «${name}»`;
+      toast(!turnOn && !scope.length ? `${what}. ${FUTURE_DEPARTMENTS_HINT}` : what, "ok", {
+        label: "Отменить",
+        run: () => void api.setRuleScope(rule.nodeId, scope, next).then(() => reload(),
+          (err) => toast(isStale(err) ? STALE_TEXT : errorText(err), "err")),
+      });
+    } catch (err) {
+      toast(isStale(err) ? STALE_TEXT : errorText(err), "err");
+      if (isStale(err)) await reload();
+    } finally {
+      setToggling(null);
+    }
   }
 
   const row = ({ clause, rule }: RuleRef) => (
@@ -67,9 +99,10 @@ function Matrix() {
         return (
           <td key={d.nodeId}>
             <button className={`cell-btn ${focus === key ? "focus" : ""}`} data-state={state}
-              disabled={!canEdit || savingRule === rule.nodeId} title={savingRule === rule.nodeId ? "Сохраняется…" : undefined}
+              disabled={!canEdit || savingRule === rule.nodeId || toggling === key}
+              title={savingRule === rule.nodeId || toggling === key ? "Сохраняется…" : canEdit ? "Щелчок переключает" : undefined}
               aria-label={`${rule.description} — ${d.name || d.departmentId}: ${STATE_LABEL[state]}`}
-              onClick={(e) => open(rule, d, e.currentTarget)} onBlur={() => setFocus(null)}>
+              onClick={() => void toggle(rule, d)} onBlur={() => setFocus(null)}>
               <Cell state={state} />
             </button>
           </td>
@@ -81,7 +114,7 @@ function Matrix() {
   return (
     <>
       <PageHead title="Где какое правило действует"
-        sub={<>Строка — правило из приказа, столбец — подразделение.{canEdit && " Нажмите на ячейку, чтобы изменить."}</>}>
+        sub={<>Строка — правило из приказа, столбец — подразделение.{canEdit && " Щелчок по отметке переключает её."}</>}>
         {canEdit && <button className="btn" onClick={actions.addDepartment}>+ Подразделение</button>}
         {canEdit && <button className="btn primary" onClick={() => openWizard()}>+ Правило</button>}
       </PageHead>
@@ -96,11 +129,9 @@ function Matrix() {
         </label>
         <input type="search" className="pill grow" placeholder="Поиск по правилам…" value={search}
           onChange={(e) => setSearch(e.target.value)} />
-      </div>
-      <div className="toolbar">
         <div className="legend">
           <span><span className="cell yes mini">✓</span>действует</span>
-          <span><span className="cell no mini">—</span>не действует</span>
+          <span><span className="cell no mini">✕</span>не действует</span>
         </div>
       </div>
 

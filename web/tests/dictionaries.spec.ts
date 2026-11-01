@@ -12,7 +12,7 @@ const targetRow = (page: Page, name: string) => page.locator("#tab-targets tr").
 
 test("подразделения: создание, двойник идентификатора, правка", async ({ app }) => {
   await go(app, "Подразделения");
-  await expect(departmentRow(app, "UCT")).toContainText("R-1.1");
+  await expect(departmentRow(app, "UCT")).toContainText("Цель обязана содержать упоминание проекта");
 
   await app.locator("#tab-departments").getByRole("button", { name: "+ Подразделение" }).click();
   await modal(app).getByLabel("Идентификатор").fill("UCT");
@@ -196,15 +196,15 @@ test("значок замечаний показывает число ошибо
 
 test("из замечаний — к атрибуту, правилу и приказу", async ({ app }) => {
   await go(app, /Замечания/);
-  await expect(app.getByText("Граф не готов к проверкам")).toBeVisible();
+  await expect(app.getByText("Проверка может ошибаться")).toBeVisible();
 
   await app.locator(".issue").filter({ hasText: "Атрибуты без описания" }).getByRole("button", { name: "Показать" }).click();
   await expect(app.getByRole("tab", { name: "Атрибуты" })).toHaveAttribute("aria-selected", "true");
   await expect(targetRow(app, "обучение")).toHaveClass(/flash/);
 
   await go(app, /Замечания/);
-  const noKeys = app.locator(".issue").filter({ hasText: "Узлы без идентификатора" });
-  await noKeys.locator(".item").filter({ hasText: "Rule" }).getByRole("button", { name: "Показать" }).click();
+  const noKeys = app.locator(".issue").filter({ hasText: "Не заданы идентификаторы" });
+  await noKeys.locator(".item").filter({ hasText: "Правило" }).getByRole("button", { name: "Показать" }).click();
   await expect(app.getByRole("tab", { name: "Приказы" })).toHaveAttribute("aria-selected", "true");
   await expect(orderItem(app, "ПР-02")).toHaveAttribute("aria-selected", "true");
   await expect(ruleCard(app, TRAINING)).toHaveClass(/flash/);
@@ -216,7 +216,7 @@ test("автопочинка идентификаторов", async ({ app }) =>
   await app.getByRole("button", { name: "Проставить идентификаторы" }).click();
   await app.getByRole("dialog").getByRole("button", { name: "Проставить" }).click();
   await expect(toast(app, "Проставлено: приказов 1, пунктов 1, правил 1")).toBeVisible();
-  await expect(app.locator(".issue").filter({ hasText: "Узлы без идентификатора" })).toHaveCount(0);
+  await expect(app.locator(".issue").filter({ hasText: "Не заданы идентификаторы" })).toHaveCount(0);
   await go(app, "Приказы");
   await orderItem(app, "ПР-02").click();
   await expect(app.locator("#tab-orders").getByText("нет orderId")).toHaveCount(0);

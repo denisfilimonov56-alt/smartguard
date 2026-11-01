@@ -91,6 +91,19 @@ b,strong{font-weight:600}
   line-height:16px;font-weight:600;text-align:center}
 .side:not(.folded):is(:hover,:has(:focus-visible),.pinned) .nav-item .n{position:static;margin-left:auto;height:auto;padding:1px 8px;font-size:12px;
   line-height:inherit}
+/* Закреплённая панель (App.tsx, кнопка-булавка) стоит рядом с разделом, а не поверх него. */
+.shell.docked{grid-template-columns:256px minmax(0,1fr)}
+.side.docked{box-shadow:none !important}
+.pin-btn{margin-left:auto;flex:none;width:32px;height:32px;display:grid;place-items:center;border:0;border-radius:10px;
+  background:none;color:var(--ink-3);cursor:pointer}
+.pin-btn:hover{background:var(--soft);color:var(--brand)}
+.pin-btn[aria-pressed="true"]{background:var(--soft);color:var(--brand)}
+.pin-btn svg{width:18px;height:18px}
+.brand > div{flex:1;min-width:0}
+/* Подписи групп разделов; в свёрнутой панели прозрачны, как подписи пунктов. */
+.nav-group{padding:14px 15px 4px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink-3);white-space:nowrap}
+.nav-ind + .nav-group,nav > .nav-group:first-child{padding-top:2px}
 .search-btn{margin-bottom:10px;background:var(--panel-2);color:var(--ink-3);font-weight:500}
 .search-btn:hover{background:var(--soft);color:var(--brand)}
 .search-btn kbd{margin-left:auto;font:500 11px/1 Inter,system-ui,sans-serif;padding:3px 6px;border:1px solid var(--line);
@@ -242,6 +255,10 @@ input:focus,textarea:focus,.select:focus-visible,.select.open{outline:0;border-c
   stroke-linejoin:round;transition:transform .15s}
 .select.open svg{transform:rotate(180deg);stroke:var(--brand)}
 .select.pill{padding-left:18px;padding-right:16px}
+/* Выбор на синем фоне формы: тёмное стекло, как в макете пакетной проверки. */
+.hero .select.glass{background:rgba(6,42,106,.45);border-color:transparent;color:#fff}
+.hero .select.glass:hover{border-color:rgba(255,255,255,.5)}
+.hero .select.glass svg{stroke:#fff}
 
 /* Дата и время (ui/DateTime.tsx): поле как у списка, окно с календарём и временем. */
 .select.dt svg,.select.dt.open svg{width:14px;height:14px;transform:none;stroke-width:1.3}
@@ -389,13 +406,14 @@ table{width:100%;border-collapse:collapse}
 .matrix tbody tr:last-child td{border-bottom:0}
 /* Ячейка матрицы: метка маленькая, область нажатия — прежняя (кнопка с внутренними отступами). */
 .cell-btn{border:0;background:none;padding:10px;border-radius:12px;cursor:pointer}
-.cell-btn:hover,.cell-btn.focus{background:var(--soft);box-shadow:inset 0 0 0 2px var(--brand)}
+.cell-btn:hover,.cell-btn.focus,.cell-btn:focus-visible{outline:none;background:var(--soft);box-shadow:inset 0 0 0 2px var(--brand)}
 .cell-btn:disabled{cursor:default;background:none;box-shadow:none}
 .cell{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:22px;min-width:22px;border-radius:50px;
   font-size:11px;font-weight:700;padding:0 8px;white-space:nowrap;vertical-align:middle}
 .cell.yes{background:var(--brand);color:#fff;width:22px;padding:0}
 /* «Не действует» — пустое кольцо вместо прочерка; текст «—» остаётся для читалок. */
-.cell.no{width:22px;padding:0;border:1.5px solid var(--line);color:transparent;font-size:0}
+/* «Не действует» — серый кружок с крестиком: пустой кружок почти не виден, особенно в тёмной теме. */
+.cell.no{width:22px;padding:0;border:1.5px solid var(--ink-3);background:var(--mute-bg);color:var(--ink-2);font-size:10px;font-weight:700}
 .cell-btn:hover .cell.no{border-color:var(--brand-3)}
 .cell.mini{height:16px;min-width:16px;font-size:9px}
 .cell.mini.yes{width:16px}
@@ -427,6 +445,7 @@ table{width:100%;border-collapse:collapse}
 .sheet-scrim{position:fixed;inset:0;z-index:39;background:rgba(6,42,106,.35);backdrop-filter:blur(1px);animation:fade .2s ease-out;
   pointer-events:none}
 .sheet-scrim::after{content:"";position:absolute;inset:0 0 0 76px;pointer-events:auto}
+.shell.docked .sheet-scrim::after{left:256px}
 @keyframes fade{from{opacity:0}}
 .rule-panel{position:fixed;top:0;right:0;bottom:0;z-index:40;width:460px;max-width:calc(100vw - 100px);background:var(--panel);
   border-left:1px solid var(--line-soft);box-shadow:-16px 0 48px rgba(6,42,106,.18);padding:22px 24px;overflow:auto;
@@ -523,7 +542,30 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .smart .why{margin-top:2px;font-size:11px;line-height:14px;color:var(--ink-3)}
 .smart.compact .ring{width:72px}
 .ico.smart-ico{background:var(--soft);color:var(--brand)}
+/* SMART в конце ответа: строка оценок-меток; «Подробнее» раскрывает круги с пояснениями. */
+.smart-block{padding:14px 0 2px;border-top:1px solid var(--line-soft)}
+.smart-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.smart-head .dim{margin-right:4px}
+.smart-head .btn{margin-left:auto}
+/* Число в круге растёт от нуля: ширина под три цифры, иначе подпись и соседние круги дёргаются. */
+.smart .score{display:inline-block;min-width:3ch;text-align:left;font-variant-numeric:tabular-nums}
+/* Недавние проверки под ответом: формулировка в одну строку, статус, когда, «Повторить». */
+.recent{margin-top:16px}
+.recent h3{margin-bottom:6px}
+.recent-row{display:flex;align-items:center;gap:12px;padding:6px 0;border-top:1px solid var(--line-soft)}
+.recent-row:first-of-type{border-top:0}
+.recent-goal{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .verdict{padding:20px 24px;margin-top:16px}
+.verdict-head{padding-bottom:12px}
+/* Рекомендованная формулировка — сразу под шапкой ответа. */
+.suggest{margin:4px 0 12px;padding:16px 18px;border-radius:var(--r-md);background:var(--soft);border:1px solid var(--soft-2);
+  display:flex;flex-direction:column;gap:10px}
+.suggest-label{font-size:12px;font-weight:600;color:var(--brand)}
+.suggest-text{font-size:16px;font-weight:500;line-height:24px}
+.suggest .row{flex-wrap:wrap}
+.violation .t .grow{min-width:0}
+.counts{margin:6px 0 10px}
+.recent-head{margin-bottom:4px}
 .vitem{display:grid;grid-template-columns:28px minmax(0,1fr);gap:4px 12px;padding:12px 0;border-top:1px solid var(--line-soft)}
 .ico{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:700;flex:none}
 .ico.sm{width:20px;height:20px;font-size:10px}
@@ -532,7 +574,7 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .ico.unknown{background:var(--warn-soft);color:var(--warn)}
 .vitem .t{font-weight:500;font-size:15px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .vitem .d{grid-column:2;color:var(--ink-2);font-size:13px}
-.fix{grid-column:2;margin-top:6px;background:var(--soft);border-radius:var(--r-sm);padding:10px 14px;font-size:13px}
+.fix{grid-column:1 / -1;margin-top:8px;background:var(--soft);border-radius:var(--r-sm);padding:10px 14px;font-size:13px}
 .advice-block{margin-top:14px;padding:14px 16px;border:1px solid var(--line);border-radius:var(--r-md)}
 .advice-block > .row:first-child,.advice-block > .mid:first-child{margin-bottom:12px}
 .advice .fix{margin-top:0}
@@ -678,12 +720,15 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .palette-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .palette-empty{padding:16px 14px}
 .palette-foot{padding:10px 22px;border-top:1px solid var(--line-soft);font-size:12px}
-#toasts{position:fixed;right:20px;bottom:20px;z-index:80;display:flex;flex-direction:column;gap:10px;max-width:420px}
+/* Уведомления — внизу по центру, над содержимым, как на макетах. */
+#toasts{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;align-items:center;gap:10px;width:max-content;max-width:min(620px,calc(100vw - 40px))}
 .toast{display:flex;align-items:flex-start;gap:12px;background:var(--deep);color:#fff;border-radius:var(--r-md);
   padding:12px 18px 12px 12px;font-size:13.5px;line-height:20px;font-weight:500;box-shadow:0 12px 32px rgba(6,42,106,.35);
   animation:slide .22s cubic-bezier(.2,.8,.3,1)}
 .toast{cursor:pointer}
 .toast:hover{filter:brightness(1.15)}
+.toast-action{margin-left:auto;flex:none;border:0;background:none;color:#79b3ff;font:600 14px/20px Inter,system-ui,sans-serif;cursor:pointer;padding:0 0 0 8px}
+.toast-action:hover{color:#fff}
 .toast-ico{flex:none;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;
   background:var(--brand);color:#fff;margin-top:-1px}
 .toast.ok .toast-ico{background:#22a35e}
@@ -692,12 +737,12 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 
 /* ------------------------------ замечания --------------------------------- */
 /* Замечание: цвет важности — короткая полоска над заголовком, а не рамка на всю высоту. */
-.issue{position:relative;border:1px solid transparent;border-radius:var(--r-lg);padding:26px 20px 16px;margin-bottom:12px;
+.issue{position:relative;border:1px solid transparent;border-radius:var(--r-lg);padding:18px 20px 16px;margin-bottom:12px;
   background:var(--panel);box-shadow:var(--shadow)}
-.issue::before{content:"";position:absolute;top:12px;left:20px;width:36px;height:4px;border-radius:2px;background:var(--ink-3)}
-.issue.error::before{background:var(--danger)}
-.issue.warning::before{background:var(--warn-line)}
-.issue.info::before{background:var(--brand)}
+details.tech{margin-top:8px}
+details.tech summary{cursor:pointer;color:var(--brand);font-size:13px}
+details.tech .dim{margin-top:6px}
+/* Важность — одной меткой в заголовке; цветной полосы над карточкой нет: она её дублировала. */
 .issue h4{margin:0 0 6px;font-size:15px;font-weight:600;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .issue .detail{color:var(--ink-2);font-size:13.5px}
 .issue .items{margin-top:11px;display:flex;flex-direction:column;gap:5px}
@@ -707,11 +752,20 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .issue .item.example .dim{margin-top:3px}
 
 /* ------------------------------ настройки --------------------------------- */
-.settings .setting{display:flex;gap:18px;align-items:flex-start;padding:16px 22px}
-.settings .setting + .setting{border-top:1px solid var(--line-soft)}
+/* Настройки: оглавление слева, группы справа; пояснение — одной строкой, полностью по «Подробнее». */
+.settings-layout{display:grid;grid-template-columns:200px minmax(0,1fr);gap:24px;align-items:start}
+.settings-toc{position:sticky;top:0;display:flex;flex-direction:column;gap:2px}
+.settings-toc a{padding:9px 14px;border-radius:12px;color:var(--ink-2);text-decoration:none}
+.settings-toc a:hover{background:var(--soft);color:var(--brand)}
+.settings-toc a[aria-current="true"]{background:var(--soft);color:var(--brand);font-weight:600}
+.link-btn{border:0;background:none;padding:0 0 0 6px;color:var(--brand);font:inherit;cursor:pointer}
+.settings{margin-bottom:16px}
+.settings-head{padding:22px 22px 14px}
+.settings-head h2{font-size:18px;line-height:24px}
+.settings .setting{display:flex;gap:18px;align-items:center;padding:14px 22px;border-top:1px solid var(--line-soft)}
 .settings .muted{font-size:13.5px;margin-top:3px}
 .settings .text{flex:1;min-width:0}
-.settings .control{flex:none}
+.settings .control{flex:none;display:flex;align-items:center;gap:8px}
 .settings .control input[type=number]{flex:none;width:84px;padding:7px 10px;text-align:right;appearance:textfield;-moz-appearance:textfield}
 .settings .control input[type=number]::-webkit-inner-spin-button{appearance:none;-webkit-appearance:none}
 .settings .control input[aria-invalid="true"]{border-color:var(--danger)}
@@ -733,6 +787,20 @@ mark.hl:hover::before,mark.hl:focus-visible::before{opacity:1;visibility:visible
 .tile .small{font-size:14px}
 .tile b{display:block;font-size:36px;font-weight:700;line-height:46px;margin:6px 0 4px;letter-spacing:-.02em}
 .tile.warn{border-color:var(--warn-line);background:var(--warn-soft)}
+.tile-row{display:flex;align-items:flex-end;gap:12px;justify-content:space-between}
+.tile-flag{margin-left:8px;vertical-align:1px}
+.spark{width:120px;height:40px;flex:none;margin-bottom:8px}
+.spark .line{fill:none;stroke:var(--brand);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.spark .area{fill:var(--brand);opacity:.08}
+/* «Сейчас»: итог, четыре главных плитки крупно и полоса второстепенных показателей. */
+.now-title{display:flex;align-items:baseline;gap:8px}
+.now-title .badge{margin-left:auto;font-size:13px;letter-spacing:0}
+.tiles-main{grid-template-columns:repeat(4,minmax(0,1fr))}
+.now-minor{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin-top:16px;padding:16px 0}
+.now-minor > div{display:flex;flex-direction:column;gap:2px;padding:0 22px;border-left:1px solid var(--line-soft);min-width:0}
+.now-minor > div:first-child{border-left:0}
+.now-minor b{font-size:17px}
+.now-minor .warn b{color:var(--warn)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin:12px 0}
 .chart svg{display:block;width:100%;height:auto;margin-top:8px}
 .chart text{font-size:11px;fill:var(--ink-3)}
@@ -759,7 +827,7 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .graph-box .node.selected .dot{stroke:var(--ink);stroke-width:2.5}
 .graph-box .node.archived{opacity:.45}
 .graph-box .node.faded{opacity:.2}
-.graph-box .node text{font-size:11px;fill:var(--ink-2);pointer-events:none;paint-order:stroke;stroke:var(--panel);stroke-width:3px}
+.graph-box .node text{fill:var(--ink-2);pointer-events:none;paint-order:stroke;stroke:var(--panel);stroke-width:3px}
 .graph-zoom{position:absolute;right:12px;top:12px;display:flex;gap:6px}
 .graph-tip{position:absolute;z-index:5;max-width:280px;padding:8px 12px;border-radius:12px;background:var(--panel);
   border:1px solid var(--line-soft);box-shadow:var(--shadow-lg);pointer-events:none}
@@ -868,6 +936,14 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .batch-time{margin-top:14px;font-size:12.5px}
 .batch-detail > .verdict{margin:18px 0 0;padding:0;border:0;border-radius:0;box-shadow:none;background:none}
 .batch-empty{display:flex;flex-direction:column;align-items:flex-start;gap:12px;padding:22px}
+/* Пустой пакет: пунктирная зона для файла Excel и вставки строк из таблицы. */
+.batch-empty.drop{align-items:center;text-align:center;gap:10px;margin:18px;padding:40px 24px;border:2px dashed var(--brand-3);
+  border-radius:var(--r-lg);background:var(--row-selected);outline:none;transition:background .15s,border-color .15s}
+.batch-empty.drop:focus-visible,.batch-empty.drop.over{background:var(--soft);border-color:var(--brand)}
+.batch-empty.drop b{font-size:20px;line-height:26px}
+.batch-empty.drop .row{margin-top:6px;flex-wrap:wrap;justify-content:center}
+.drop-ico{display:grid;place-items:center;width:64px;height:64px;border-radius:50%;background:var(--soft);color:var(--brand)}
+.drop-ico svg{width:30px;height:30px}
 .row-issues{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:6px;font-size:12.5px;line-height:18px}
 .row-issues .error{color:var(--danger)}
 .row-issues .warning{color:var(--warn)}
@@ -888,7 +964,15 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
   background:var(--panel);box-shadow:var(--shadow-lg)}
 .too-narrow b{font-size:17px}
 .too-narrow span{color:var(--ink-2)}
-@media (max-width:1099px){.too-narrow{display:grid}}
+@media (max-width:959px){.too-narrow{display:grid}}
+/* Узкое окно (ноутбук с масштабом 125%): правая колонка проверки уходит под ответ. */
+@media (max-width:1199px){
+  .check-page{grid-template-columns:minmax(0,1fr)}
+  .main{padding:22px 22px 60px}
+  .settings-layout{grid-template-columns:minmax(0,1fr)}
+  .settings-toc{position:static;flex-direction:row;flex-wrap:wrap}
+  .tiles-main,.now-minor{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 
 /* ----------------------------- обучение ----------------------------------- */
 /* Прозрачный слой перехватывает щелчки, подсветка — вырез в затемнении
@@ -920,3 +1004,24 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
   font-size:13px;font-weight:500;line-height:18px;animation:slide .2s ease-out}
 .tour-foot{display:flex;align-items:center;gap:8px;margin-top:14px}
 @media (prefers-reduced-motion:reduce){.tour-spot,.tour-card,.tour-hint,.tour-scrim.dim,.tour-click::after{transition:none;animation:none}}
+
+/* Поиск узла над графом: иконка и «1 из N» внутри поля; справа — карточка узла и легенда. */
+.graph-search{display:flex;align-items:center;gap:10px;width:280px;padding:0 16px;height:42px;border:1.5px solid var(--line);
+  border-radius:50px;background:var(--panel)}
+.graph-search:focus-within{border-color:var(--brand)}
+.graph-search svg{width:18px;height:18px;flex:none;fill:none;stroke:var(--ink-2);stroke-width:1.6;stroke-linecap:round}
+.graph-search input{flex:1;min-width:0;border:0;outline:0;background:none;padding:0}
+.graph-search .dim{flex:none;font-size:12px}
+.graph-side{display:flex;flex-direction:column;gap:16px;min-width:0}
+.node-kind{gap:8px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)}
+.node-title{margin:6px 0 6px;font-size:20px;line-height:26px}
+.node-detail{font-size:13px;line-height:19px;margin:0}
+.graph-legend{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.graph-legend > span{display:flex;align-items:center;gap:8px}
+
+/* Правило в справочниках — синяя метка с текстом правила; длинный текст переносится. */
+.rule-badge{white-space:normal;text-align:left;line-height:17px;padding:4px 10px;height:auto}
+.graph-side .graph-link{flex-direction:row;align-items:baseline;gap:10px;margin-top:2px;padding:6px 8px}
+.graph-side .graph-link .dim{flex:none;font-size:13px}
+.issue-fix{margin-left:auto;font-weight:400}
+.toolbar .legend{margin-left:4px}

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
 import type { CheckResult, GraphEdge, GraphNode, NodeKind } from "../../api/types";
 import { useCatalog } from "../../state/catalog";
-import { Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
+import { attributeTitle, Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
 import { errorText } from "../../ui/Toasts";
 import { layoutGraph } from "./layout";
 
@@ -121,16 +121,40 @@ interface View { x: number; y: number; scale: number }
 
 const short = (text: string, max = 22) => (text.length > max ? text.slice(0, max - 1) + "…" : text);
 
+/** Правило на графе — без общего начала «Цель обязана содержать…»: иначе обрезанные подписи не различить. */
+const ruleShort = (text: string) => {
+  const rest = text.replace(/^цель(\s+студента)?\s+(обязана|должна)(\s+(содержать|иметь|называть|указывать))?\s+/i, "");
+  return rest ? rest[0].toUpperCase() + rest.slice(1) : text;
+};
+
+/** Название узла для людей: правило — текстом, а не кодом; пункт — «п. 2.4»; атрибут — без подчёркиваний. */
+const nameOf = (n: GraphNode) =>
+  n.label === "Rule" && n.detail ? ruleShort(n.detail)
+    : n.label === "Clause" ? `п. ${n.title}`
+    : n.label === "CheckTarget" ? attributeTitle(n.title) : n.title;
+
 export function GraphTab() {
   const { goToNode, trace: traced, setTrace } = useCatalog();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [off, setOff] = useState<Set<NodeKind>>(() => new Set<NodeKind>(["ViolationExample"]));
   const [archived, setArchived] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  // Поиск узла по названию: Enter переходит к следующему найденному.
+  const [query, setQuery] = useState("");
+  const [hit, setHit] = useState(0);
   const [hover, setHover] = useState<{ id: string; x: number; y: number } | null>(null);
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 1 });
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const box = useRef<HTMLDivElement>(null);
+  // Размер холста: от него зависит, во сколько раз вписанный граф уменьшен, а значит — размер подписей.
+  const [boxSize, setBoxSize] = useState({ w: 800, h: 560 });
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => setBoxSize({ w: entry.contentRect.width, h: entry.contentRect.height }));
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
 
   const [busy, setBusy] = useState(false);
   // Номер обновления: с ним слой графа пересоздаётся, и анимация трассировки идёт заново.
@@ -178,8 +202,12 @@ export function GraphTab() {
     // Справа запас больше: подписи узлов стоят правее точки.
     const width = Math.max(...points.map((p) => p.x), 0) + pad + 90 - minX;
     const height = Math.max(...points.map((p) => p.y), 0) + pad - minY;
-    return { nodes, edges, goalEdges, positions, viewBox: { minX, minY, width, height }, byId: new Map(nodes.map((n) => [n.id, n])) };
-  }, [state, layout, off, archived, trace]);
+    // Вписанный в холст граф уменьшен: точки и подписи растут обратно, чтобы на экране
+    // подпись оставалась около 13px, а точка — заметной.
+    const fit = Math.min(boxSize.w / width, boxSize.h / height);
+    const k = Math.min(4, Math.max(1, 1 / fit));
+    return { nodes, edges, goalEdges, positions, k, viewBox: { minX, minY, width, height }, byId: new Map(nodes.map((n) => [n.id, n])) };
+  }, [state, layout, off, archived, trace, boxSize]);
 
   // Новая трассировка — показать граф целиком. Обновление данных масштаб не трогает.
   useEffect(() => { setView({ x: 0, y: 0, scale: 1 }); }, [traced]);
@@ -208,6 +236,24 @@ export function GraphTab() {
     if (!next.delete(kind)) next.add(kind);
     return next;
   });
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return q && graph ? graph.nodes.filter((n) => [n.title, n.detail ?? "", nameOf(n)].some((t) => t.toLowerCase().includes(q))) : [];
+  }, [query, graph]);
+  /** Выделить найденный узел и поставить его в центр холста, приблизив. */
+  const jump = (index: number) => {
+    if (!graph || !matches.length) return;
+    const node = matches[index % matches.length];
+    const p = graph.positions.get(node.id)!;
+    const { minX, minY, width, height } = graph.viewBox;
+    setHit(index % matches.length);
+    setSelected(node.id);
+    setView((v) => {
+      const scale = Math.max(v.scale, 1.6);
+      return { scale, x: minX + width / 2 - p.x * scale, y: minY + height / 2 - p.y * scale };
+    });
+  };
 
   const zoom = (factor: number) => setView((v) => ({ ...v, scale: Math.min(6, Math.max(0.4, v.scale * factor)) }));
 
@@ -261,22 +307,22 @@ export function GraphTab() {
               setHover({ id: n.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
             }}
             onMouseLeave={() => setHover(null)}>
-            <circle r={kind.r + 6} className="hit" />
-            {role && role !== "path" && <circle r={kind.r + 5} className="halo" style={arrive(n.id)} />}
-            <circle r={kind.r} fill={kind.color} className="dot" style={role ? arrive(n.id) : undefined} />
+            <circle r={(kind.r + 6) * graph.k} className="hit" />
+            {role && role !== "path" && <circle r={(kind.r + 5) * graph.k} className="halo" style={arrive(n.id)} />}
+            <circle r={kind.r * graph.k} fill={kind.color} className="dot" style={role ? arrive(n.id) : undefined} />
             {role && ROLE_MARK[role] && (
-              <g transform={`translate(${kind.r} ${-kind.r})`} className="mark" style={arrive(n.id)}>
+              <g transform={`translate(${kind.r * graph.k} ${-kind.r * graph.k}) scale(${graph.k})`} className="mark" style={arrive(n.id)}>
                 <circle r={6.5} /><text textAnchor="middle" y={3.5}>{ROLE_MARK[role]}</text>
               </g>
             )}
-            {label && <text x={kind.r + (role ? 12 : 5)} y={4}>{short(n.title)}</text>}
+            {label && <text textAnchor="middle" y={(kind.r + 15) * graph.k} style={{ fontSize: 13 * graph.k }}>{short(nameOf(n), 26)}</text>}
           </g>
         );
       })}
       {trace && (() => {
         const p = graph.positions.get(GOAL)!;
         return (
-          <g transform={`translate(${p.x} ${p.y})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
+          <g transform={`translate(${p.x} ${p.y}) scale(${graph.k})`} className="node goal" onMouseDown={(e) => e.stopPropagation()}
             onClick={() => setSelected(null)}>
             <rect x={-30} y={-13} width={60} height={26} rx={13} />
             <text textAnchor="middle" y={4}>Цель</text>
@@ -296,7 +342,15 @@ export function GraphTab() {
         </button>
       </PageHead>
       <div className="toolbar">
-        {KINDS.map((k) => (
+        <label className="graph-search">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5" /><path d="M13.5 13.5L17 17" /></svg>
+          <input type="search" aria-label="Найти узел" placeholder="Найти узел" value={query}
+            onChange={(e) => { setQuery(e.target.value); setHit(0); }}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); jump(matches.length && selected === matches[hit]?.id ? hit + 1 : hit); } }} />
+          {query.trim() && <span className="dim">{matches.length ? `${hit + 1} из ${matches.length}` : "не найдено"}</span>}
+        </label>
+        {/* Типы, которых в каталоге нет, не занимают место в панели. */}
+        {KINDS.filter((k) => (counts.get(k.kind) ?? 0) > 0).map((k) => (
           <button key={k.kind} className={`chip chip-btn legend ${off.has(k.kind) ? "off" : ""}`}
             aria-pressed={!off.has(k.kind)} onClick={() => toggle(k.kind)}>
             <span className="swatch" style={{ background: k.color }} />{k.name}
@@ -344,43 +398,46 @@ export function GraphTab() {
             {hoverNode && hover && (
               <div className="graph-tip" style={{ left: hover.x + 14, top: hover.y + 14 }}>
                 <div className="small dim">{KIND_ONE[hoverNode.label]}</div>
-                <div className="mid">{hoverNode.title}</div>
+                <div className="mid">{nameOf(hoverNode)}</div>
                 {hoverNode.detail && <div className="small muted">{short(hoverNode.detail, 140)}</div>}
               </div>
             )}
           </div>
 
-          <aside className="card pad">
+          <aside className="graph-side">
+            <div className="card pad">
             {selectedNode ? (
               <>
-                <div className="row" style={{ gap: 8 }}>
+                <div className="row node-kind">
                   <span className="swatch" style={{ background: KIND[selectedNode.label].color }} />
-                  <span className="small dim">{KIND_ONE[selectedNode.label]}</span>
+                  <span>{KIND_ONE[selectedNode.label]}</span>
                   {selectedNode.status === "archived" && <span className="badge archived">в архиве</span>}
                   {selectedNode.type && (
                     <span className="badge">{selectedNode.type === "PROHIBITION" ? "запрет" : "требование"}</span>
                   )}
                 </div>
-                <h3 style={{ margin: "8px 0 4px" }}>{selectedNode.title}</h3>
-                {selectedNode.detail && <p className="muted">{selectedNode.detail}</p>}
-                {OPENABLE.includes(selectedNode.label) && (
-                  <button className="btn sm" onClick={() => void goToNode(selectedNode.id, selectedNode.label)}>
-                    Открыть в каталоге
-                  </button>
-                )}
-                <h3 style={{ margin: "16px 0 6px" }}>Связи: {links.length}</h3>
+                <h2 className="node-title">{nameOf(selectedNode)}</h2>
+                {selectedNode.label === "Rule" && <div className="dim">{selectedNode.title}</div>}
+                {selectedNode.detail && selectedNode.label !== "Rule" && <p className="muted node-detail">{selectedNode.detail}</p>}
+                <div className="node-kind" style={{ marginTop: 12 }}>Связи: {links.length}</div>
                 {links.map((e, i) => {
                   const out = e.source === selectedNode.id;
                   const other = graph.byId.get(out ? e.target : e.source)!;
                   return (
-                    <button key={i} className="graph-link" onClick={() => setSelected(other.id)}>
-                      <span className="small dim">
-                        {out ? "→" : "←"} {EDGE_NAMES[e.type] ?? e.type}
-                      </span>
-                      <span><span className="swatch" style={{ background: KIND[other.label].color }} /> {other.title}</span>
+                    <button key={i} className="graph-link" onClick={() => setSelected(other.id)}
+                      title={EDGE_NAMES[e.type] ?? e.type}>
+                      {/* Тип соседа, а у области действия — сама связь: «действует только в АГД». */}
+                      <span className="dim">{e.type === "ONLY_IN" && out ? EDGE_NAMES.ONLY_IN : KIND_ONE[other.label]}</span>
+                      <span>{nameOf(other)}</span>
                     </button>
                   );
                 })}
+                {OPENABLE.includes(selectedNode.label) && (
+                  <button className="btn sm primary" style={{ marginTop: 12 }}
+                    onClick={() => void goToNode(selectedNode.id, selectedNode.label)}>
+                    Открыть {KIND_ONE[selectedNode.label].toLowerCase()}
+                  </button>
+                )}
               </>
             ) : traced && trace ? (
               <TraceSummary result={traced}
@@ -392,12 +449,21 @@ export function GraphTab() {
             ) : (
               <>
                 <h3>Узлов: {graph.nodes.length} · связей: {graph.edges.length}</h3>
-                <p className="muted" style={{ marginTop: 8 }}>
-                  Колесо мыши — масштаб, перетаскивание — сдвиг. Типы узлов включаются и
-                  выключаются кнопками над графом.
-                </p>
+                <p className="muted" style={{ marginTop: 8 }}>Выберите узел на графе или найдите его по названию.</p>
               </>
             )}
+            </div>
+            <div className="card pad">
+              <h3>Легенда</h3>
+              <div className="graph-legend">
+                {KINDS.filter((k) => !off.has(k.kind)).map((k) => (
+                  <span key={k.kind}><span className="swatch" style={{ background: k.color }} />{KIND_ONE[k.kind]}</span>
+                ))}
+              </div>
+              <p className="small dim" style={{ marginTop: 10 }}>
+                Колесо мыши — масштаб, перетаскивание — сдвиг. Наведите на узел, чтобы подсветить его связи.
+              </p>
+            </div>
           </aside>
         </div>
       )}

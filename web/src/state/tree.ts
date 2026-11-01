@@ -54,6 +54,10 @@ export interface RuleRef {
 export const allRuleRefs = (orders: Order[]): RuleRef[] =>
   orders.flatMap((order) => order.clauses.flatMap((clause) => clause.rules.map((rule) => ({ order, clause, rule }))));
 
+/** Текст правила по его ruleId: в справочниках правило показывается текстом, а код — в подсказке. */
+export const ruleTexts = (orders: Order[]): Map<string, string> =>
+  new Map(allRuleRefs(orders).flatMap(({ rule }) => (rule.ruleId && rule.description ? [[rule.ruleId, rule.description]] : [])));
+
 export const findRuleRef = (orders: Order[], nodeId: string): RuleRef | undefined =>
   allRuleRefs(orders).find((ref) => ref.rule.nodeId === nodeId || ref.rule.examples.some((e) => e.nodeId === nodeId));
 

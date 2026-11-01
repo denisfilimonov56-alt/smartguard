@@ -45,8 +45,8 @@ export function summaryOf(results: CheckResult[]): BatchCheck["summary"] {
     manual_review: count("NEEDS_MANUAL_REVIEW"), unchecked: results.filter((r) => r.unchecked).length };
 }
 
-export const place = (v: Violation) =>
-  `Приказ ${v.order_number ?? "?"}, пункт ${v.clause_code ?? "?"}${v.clause_text ? " — " + v.clause_text : ""}`;
+/** Где правило: «Приказ ПР-01, пункт 2.4». Текст пункта — отдельно (clause_text), в подсказке. */
+export const place = (v: Violation) => `Приказ ${v.order_number ?? "?"}, пункт ${v.clause_code ?? "?"}`;
 
 /** Ключ правила нарушения: nodeId, а у ответов без него — ruleId или текст правила. */
 export const ruleKey = (v: Violation) => v.rule_node_id ?? v.rule_id ?? v.rule_text ?? "";

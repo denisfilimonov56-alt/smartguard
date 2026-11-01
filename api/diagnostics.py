@@ -231,10 +231,11 @@ WHERE (n:Order OR n:Clause OR n:Rule OR n:CheckTarget OR n:ViolationExample OR n
 RETURN head(labels(n)) AS kind, count(*) AS total
 """
 
+# Названия типов узлов в начале строки замечания: «Приказ: ПР-02», «Пункт: 3.1».
 KIND_NAMES = {
-    "Order": "приказ", "Clause": "пункт", "Rule": "правило",
-    "CheckTarget": "атрибут", "ViolationExample": "пример",
-    "Department": "подразделение", "JobDescription": "должностная инструкция",
+    "Order": "Приказ", "Clause": "Пункт", "Rule": "Правило",
+    "CheckTarget": "Атрибут", "ViolationExample": "Пример",
+    "Department": "Подразделение", "JobDescription": "Должностная инструкция",
 }
 
 
@@ -290,9 +291,8 @@ def collect() -> dict[str, Any]:
         issues.append(_issue(
             "targets_without_description", ERROR,
             "Атрибуты без описания",
-            "Промпт строится из CheckTarget.description. Без него модель получает "
-            "только имя, без критерия, и системно не распознаёт атрибут — правило "
-            "начинает срабатывать всегда.",
+            "Без описания модель не узнает атрибут в формулировке цели, и правило "
+            "на нём будет срабатывать всегда.",
             items=[{"label": t["name"], "nodeId": t["nodeId"], "kind": "CheckTarget"}
                    for t in no_description],
         ))
@@ -324,10 +324,9 @@ def collect() -> dict[str, Any]:
     if missing_ids:
         issues.append(_issue(
             "missing_identifiers", ERROR,
-            "Узлы без идентификатора",
-            "orderId / clauseId / ruleId / exampleId — ключи, по которым строится "
-            "MERGE при выгрузке в seed.cypher. Без них состояние базы невозможно "
-            "зафиксировать в репозитории.",
+            "Не заданы идентификаторы",
+            "Без идентификатора приказ, пункт, правило или пример не попадут "
+            "в резервную копию каталога, и состояние базы нельзя будет восстановить.",
             items=[{"label": f"{KIND_NAMES.get(m['kind'], m['kind'])}: {m['label']}",
                     "nodeId": m["nodeId"], "kind": m["kind"]} for m in missing_ids],
             fix={"action": "repair_identifiers", "label": "Проставить идентификаторы"},
@@ -460,10 +459,9 @@ def collect() -> dict[str, Any]:
         issues.append(_issue(
             "departments_without_id", WARNING,
             "Подразделения без идентификатора",
-            "departmentId приходит в запросе проверки. Без него на подразделение "
-            "нельзя сослаться: его цели проверяются по всем правилам, а в выгрузку "
-            "seed.cypher оно не попадает. Идентификатор задаёт кадровая система, "
-            "поэтому автоматически он не проставляется.",
+            "Идентификатор подразделения приходит из кадровой системы в запросе проверки. Без него "
+            "на подразделение нельзя сослаться: его цели проверяются по всем правилам, а в резервную "
+            "копию каталога оно не попадает. Автоматически идентификатор не проставляется.",
             items=[{"label": d["label"], "nodeId": d["nodeId"], "kind": "Department"}
                    for d in departments_without_id],
         ))
@@ -557,7 +555,7 @@ def collect() -> dict[str, Any]:
             "archived_nodes", INFO,
             "В архиве",
             "Архивные узлы не участвуют в проверках, но остаются в графе "
-            "и попадают в выгрузку seed.cypher.",
+            "и попадают в резервную копию каталога.",
             items=[{"label": f"{KIND_NAMES.get(row['kind'], row['kind'])}: {row['total']}"}
                    for row in archived],
         ))

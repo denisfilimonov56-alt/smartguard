@@ -11,41 +11,33 @@ test("матрица показывает состояние каждой яче
   await expect(cell(app, PROJECT, "Финансовое управление")).toHaveAttribute("data-state", "off");
   await expect(cell(app, DEADLINE, "АГД")).toHaveAttribute("data-state", "applies");
   await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "applies");
-  // У ячейки два состояния: исключений нет.
-  await cell(app, DEADLINE, "АГД").click();
-  await expect(modal(app).getByRole("radio")).toHaveCount(2);
-  await expect(modal(app).getByRole("radio", { name: /Исключение/ })).toHaveCount(0);
 });
 
-test("«не действует» ограничивает правило остальными подразделениями", async ({ app }) => {
+test("щелчок по ячейке «не действует» ограничивает правило остальными подразделениями", async ({ app }) => {
   await go(app, "Правила");
-  const save = modal(app).getByRole("button", { name: "Сохранить" });
-  const off = modal(app).getByRole("radio", { name: /Не действует/ });
-
+  // Без окна выбора: щелчок сразу переключает.
   await cell(app, TRAINING, "УЦТ").click();
-  await off.click();
-  await save.click();
   await expect(cell(app, TRAINING, "УЦТ")).toHaveAttribute("data-state", "off");
   await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "applies");
+  await expect(modal(app).getByRole("dialog")).toHaveCount(0);
+  // Правило было «для всех»: уведомление предупреждает о новых подразделениях.
+  await expect(toast(app, "больше не действует для «УЦТ»")).toContainText("заведённые позже");
 
   await cell(app, TRAINING, "АГД").click();
-  await off.click();
-  await save.click();
   await expect(cell(app, TRAINING, "АГД")).toHaveAttribute("data-state", "off");
 
   // Последнее подразделение отключить нельзя: пустой список означал бы «для всех».
   await cell(app, TRAINING, "Финансовое управление").click();
-  await off.click();
-  await save.click();
   await expect(toast(app, "хотя бы в одном подразделении")).toBeVisible();
+  await expect(cell(app, TRAINING, "Финансовое управление")).toHaveAttribute("data-state", "applies");
 });
 
-test("ячейку «не действует» можно вернуть в «действует»", async ({ app }) => {
+test("ячейку «не действует» можно вернуть щелчком, а ошибочный щелчок — отменить", async ({ app }) => {
   await go(app, "Правила");
   await cell(app, PROJECT, "Финансовое управление").click();
-  await modal(app).getByRole("radio", { name: "Правило действует" }).click();
-  await modal(app).getByRole("button", { name: "Сохранить" }).click();
   await expect(cell(app, PROJECT, "Финансовое управление")).toHaveAttribute("data-state", "applies");
+  await toast(app, "теперь действует для «Финансовое управление»").getByRole("button", { name: "Отменить" }).click();
+  await expect(cell(app, PROJECT, "Финансовое управление")).toHaveAttribute("data-state", "off");
 });
 
 test("поиск и фильтр по приказу в матрице", async ({ app }) => {
@@ -407,8 +399,6 @@ test("ячейка матрицы из старого снимка не зати
     app.waitForRequest((r) => r.url().endsWith("/departments") && r.method() === "PUT"),
     (async () => {
       await cell(app, TRAINING, "АГД").click();
-      await modal(app).getByRole("radio", { name: /Не действует/ }).click();
-      await modal(app).getByRole("button", { name: "Сохранить" }).click();
     })(),
   ]);
   expect(request.postDataJSON()).toMatchObject({ expected: [] });

@@ -443,6 +443,41 @@ async def check(request: Request, req: GoalRequest, user: auth.Principal = Depen
     return await anyio.to_thread.run_sync(work, limiter=limiter)
 
 
+class SuggestProblem(BaseModel):
+    rule_text: Optional[str] = Field(None, max_length=2000)
+    check_instruction: Optional[str] = Field(None, max_length=2000)
+
+
+class SuggestRequest(BaseModel):
+    goal: schemas.GoalText = Field(..., description="Формулировка цели, которую проверяли")
+    violations: list[SuggestProblem] = Field(
+        ..., min_length=1, max_length=20, description="Нарушения из ответа /check-goal: текст правила и как исправить")
+
+
+@app.post("/suggest-goal", dependencies=[Depends(_admit_check)])
+async def suggest(request: Request, req: SuggestRequest, user: auth.Principal = Depends(auth.checker)):
+    """Рекомендованная формулировка цели, которая выполняет нарушенные правила.
+
+    Отдельный запрос к модели после проверки: ответ /check-goal не меняется,
+    а модель спрашивают, только когда нарушения есть и пользователь на экране."""
+    if agent.looks_like_injection(req.goal):
+        raise HTTPException(status_code=422, detail="Цель похожа на указания модели: переписать её автоматически нельзя")
+
+    # Лимит проверок в минуту не тратится: это подсказка к уже посчитанной проверке,
+    # а не новая цель; одновременных запросов к модели не больше, чем проверок (_admit_check).
+    def work() -> dict[str, Any]:
+        metrics.set_actor(user.login)
+        try:
+            return {"goal": agent.suggest_goal(req.goal, [v.model_dump() for v in req.violations])}
+        except agent.ExtractionError as exc:
+            raise HTTPException(status_code=502, detail=f"Модель не предложила формулировку: {exc}") from exc
+        finally:
+            metrics.set_actor(None)
+
+    limiter = getattr(request.app.state, "check_limiter", None)
+    return await anyio.to_thread.run_sync(work, limiter=limiter)
+
+
 MAX_BATCH = int(os.getenv("MAX_GOALS_PER_REQUEST", "200"))
 
 

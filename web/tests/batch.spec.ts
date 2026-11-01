@@ -117,8 +117,9 @@ test("отметка «Студент» включает правила толь
 
 test("без подразделения и с пустой целью строки не отправляются", async ({ app }) => {
   await batchMode(app);
-  await run(app);
-  await expect(toast(app, "Добавьте хотя бы одну цель")).toBeVisible();
+  // Без целей проверять нечего: кнопка неактивна, рядом подсказка.
+  await expect(app.locator("#batchRun")).toBeDisabled();
+  await expect(app.getByText("Добавьте цели, чтобы проверить")).toBeVisible();
 
   await add(app);
   await expect(status(app, 0)).toHaveText("ошибка в строке");
@@ -552,4 +553,16 @@ test("подразделение из Excel по названию: одноим�
   await expect(dialog.locator("#importSummary")).toContainText("с ошибками: 1");
   await expect(dialog.locator(".preview-table tbody tr").nth(2)).toContainText("STORE");
   await expect(dialog.locator(".preview-table tbody tr").nth(2)).not.toContainText("OLD-STORE");
+});
+
+test("строки, вставленные из таблицы в пустой пакет, становятся целями", async ({ app }) => {
+  await batchMode(app);
+  await app.locator("#batchDrop").focus();
+  await app.locator("#batchDrop").evaluate((zone) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "Цель\tПодразделение\nВнедрить мониторинг до 15.09.2026\tUCT\nСнизить долю просрочек\tAGD\n");
+    zone.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+  });
+  await expect(toast(app, "Вставлено: 2 строки")).toBeVisible();
+  await expect(app.locator("#batchRun")).toHaveText("Проверить (2)");
 });

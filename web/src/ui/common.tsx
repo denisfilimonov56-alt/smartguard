@@ -13,7 +13,18 @@ export const IdBadge = ({ value, name }: { value: unknown; name: string }) =>
     <span className="badge warn" title={`Без ${name} узел не попадёт в выгрузку`}>нет {name}</span>
   );
 
-export const Chip = ({ children }: { children: React.ReactNode }) => <span className="chip">{children}</span>;
+export const Chip = ({ children, title }: { children: React.ReactNode; title?: string }) =>
+  <span className="chip" title={title}>{children}</span>;
+
+/** Правило в справочниках: текст правила синей меткой, код (ruleId) — в подсказке. */
+export const RuleBadge = ({ code, text }: { code: string; text?: string }) =>
+  <span className="badge requirement rule-badge" title={text ? code : undefined}>{text ?? code}</span>;
+
+/** Имя атрибута для людей: «срок_исполнения» → «Срок исполнения». Служебное имя остаётся рядом мелко. */
+export const attributeTitle = (name: string) => {
+  const text = name.replace(/_/g, " ").trim();
+  return text ? text[0].toUpperCase() + text.slice(1) : name;
+};
 
 export const archivedClass = (status?: Status) => (status === "archived" ? "is-archived" : "");
 

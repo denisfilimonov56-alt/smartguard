@@ -111,7 +111,7 @@ export function HealthTab() {
 
   return (
     <section id="tab-health">
-      <PageHead title="Замечания к данным" sub="Что мешает проверкам работать честно. «Показать» ведёт к конкретному объекту.">
+      <PageHead title="Замечания к данным" sub="Что мешает проверкам работать правильно. «Показать» ведёт к нужному месту в каталоге.">
         <button className="btn" onClick={() => void load()}>Проверить снова</button>
       </PageHead>
       <div id="healthPanel">
@@ -122,7 +122,7 @@ export function HealthTab() {
             <div className="dim" style={{ marginTop: 8 }}>{state.message}</div>
           </div>
         )}
-        {state.kind === "ready" && <Report report={state.report} repairing={repairing} fixes={isAdmin ? fixes : null}
+        {state.kind === "ready" && <Report report={state.report} repairing={repairing} fixes={isAdmin ? fixes : null} isAdmin={isAdmin}
           onGoTo={(nodeId, kind) => void goToNode(nodeId, kind)} />}
       </div>
       <ExamplesCheck onGoTo={(nodeId, kind) => void goToNode(nodeId, kind)} />
@@ -130,8 +130,9 @@ export function HealthTab() {
   );
 }
 
-function Report({ report, repairing, fixes, onGoTo }: {
+function Report({ report, repairing, fixes, isAdmin, onGoTo }: {
   report: Diagnostics;
+  isAdmin: boolean;
   repairing: boolean;
   /** Исправления по fix.action; null — чинить может только администратор. */
   fixes: Record<string, () => void> | null;
@@ -142,18 +143,26 @@ function Report({ report, repairing, fixes, onGoTo }: {
       <div className="card pad" style={{ marginBottom: 16 }}>
         <div className="row" style={{ alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <span className={`badge ${report.ready ? "ok" : "err"}`}>
-            {report.ready ? "Граф готов к проверкам" : "Граф не готов к проверкам"}
+            {report.ready ? "Проверка работает на полных данных" : "Проверка может ошибаться"}
           </span>
-          <span className="dim">
-            активных атрибутов: {report.check_targets} · ошибок: {report.counts.error} ·
-            предупреждений: {report.counts.warning}
+          <span className="mid">
+            ошибок: {report.counts.error} · предупреждений: {report.counts.warning}
           </span>
         </div>
         {!report.ready && (
-          <div className="dim" style={{ marginTop: 8 }}>
-            Пока есть ошибки, <span className="mono">/ready</span> отдаёт 503: проверка целей
-            даёт неполный или неверный результат.
+          <div className="muted" style={{ marginTop: 8 }}>
+            Пока ошибки не исправлены, часть целей получит неполный или неверный результат.
           </div>
+        )}
+        {/* Служебные подробности — тем, кто разбирается в устройстве сервиса. */}
+        {isAdmin && (
+          <details className="tech">
+            <summary>Подробнее для администратора</summary>
+            <div className="dim">
+              Активных атрибутов: {report.check_targets}. {report.ready ? "Проба готовности (/ready) отвечает 200."
+                : "Пока есть ошибки, проба готовности (/ready) отвечает 503 — балансировщик и мониторинг считают сервис неготовым."}
+            </div>
+          </details>
         )}
       </div>
       {report.issues.length ? report.issues.map((issue) => {
@@ -163,17 +172,18 @@ function Report({ report, repairing, fixes, onGoTo }: {
             <h4>
               <span className={`badge ${sev.cls}`}>{sev.label}</span> {issue.title}
               {issue.items.length > 0 && <span className="badge count">{issue.items.length}</span>}
+              {/* Исправление — справа в шапке карточки. */}
+              {issue.fix && (fixes === null || fixes[issue.fix.action]) && (
+                <span className="issue-fix">
+                  {fixes ? (
+                    <button className="btn sm primary" disabled={repairing} onClick={fixes[issue.fix.action]}>
+                      {repairing ? <><Spinner /> Чиним…</> : issue.fix.label}
+                    </button>
+                  ) : <span className="dim">Исправить может администратор.</span>}
+                </span>
+              )}
             </h4>
             <div className="detail">{issue.detail}</div>
-            {issue.fix && (fixes === null || fixes[issue.fix.action]) && (
-              <div style={{ marginTop: 11 }}>
-                {fixes ? (
-                  <button className="btn sm primary" disabled={repairing} onClick={fixes[issue.fix.action]}>
-                    {repairing ? <><Spinner /> Чиним…</> : issue.fix.label}
-                  </button>
-                ) : <span className="dim">Исправить может администратор.</span>}
-              </div>
-            )}
             {issue.items.length > 0 && (
               <div className="items">
                 {issue.items.map((item, i) => (

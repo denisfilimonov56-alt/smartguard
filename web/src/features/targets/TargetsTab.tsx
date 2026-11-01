@@ -1,6 +1,9 @@
+import { useMemo } from "react";
+
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { ArchivedBadge, archivedClass, Chip, Empty, PageHead } from "../../ui/common";
+import { ruleTexts } from "../../state/tree";
+import { ArchivedBadge, archivedClass, attributeTitle, Empty, PageHead, RuleBadge } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
 import { useActions } from "../actions";
 
@@ -8,7 +11,8 @@ import { useActions } from "../actions";
    атрибут и у каких нет описания. */
 
 export function TargetsTab() {
-  const { targets, showArchivedTargets, reload } = useCatalog();
+  const { targets, orders, showArchivedTargets, reload } = useCatalog();
+  const texts = useMemo(() => ruleTexts(orders), [orders]);
   const actions = useActions();
   const { canEdit } = useAuth();
 
@@ -28,15 +32,16 @@ export function TargetsTab() {
         <div className="card"><table>
           <thead>
             <tr>
-              <th style={{ width: "24%" }}>Имя</th><th>Описание для модели</th>
-              <th style={{ width: "15%" }}>Правила</th><th style={{ width: 70 }} />
+              <th style={{ width: "24%" }}>Название</th><th>Описание для модели</th>
+              <th style={{ width: "24%" }}>Правила</th><th style={{ width: 70 }} />
             </tr>
           </thead>
           <tbody>
             {targets.map((t) => (
               <tr key={t.nodeId} className={archivedClass(t.status)} data-node={t.nodeId}>
                 <td>
-                  <span className="mono">{t.name}</span> <ArchivedBadge status={t.status} />
+                  <div className="mid">{attributeTitle(t.name)} <ArchivedBadge status={t.status} /></div>
+                  <div className="mono dim">{t.name}</div>
                   {t.source === "job_descriptions" && (
                     <span className="badge" title="Определяется сравнением цели с должностными инструкциями подразделения">
                       по должностным инструкциям
@@ -45,7 +50,7 @@ export function TargetsTab() {
                 </td>
                 <td>{t.description || <span className="badge warn">нет описания — модель не распознает атрибут</span>}</td>
                 <td>{t.rules.length
-                  ? t.rules.map((r) => <Chip key={r}>{r}</Chip>)
+                  ? <div className="chips">{t.rules.map((r) => <RuleBadge key={r} code={r} text={texts.get(r)} />)}</div>
                   : <span className="dim">не используется</span>}</td>
                 <td><div className="actions"><MenuButton items={() => actions.targetMenu(t)} /></div></td>
               </tr>

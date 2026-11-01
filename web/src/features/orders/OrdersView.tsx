@@ -6,7 +6,7 @@ import { useCatalog } from "../../state/catalog";
 import { scopeSummary } from "../../state/scope";
 import { normalizeQuery, orderMatches } from "../../state/tree";
 import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge } from "../../ui/common";
-import { MenuButton } from "../../ui/Menu";
+import { MenuButton, useMenu } from "../../ui/Menu";
 import { useActions } from "../actions";
 
 /* Приказ читается как документ: пункт, под ним правила простыми словами.
@@ -66,6 +66,7 @@ export function OrdersView() {
 
 function OrderDocument({ order }: { order: Order }) {
   const actions = useActions();
+  const openMenu = useMenu();
   const { canEdit } = useAuth();
   return (
     <div data-node={order.nodeId} className={archivedClass(order.status)} style={{ borderRadius: 16 }}>
@@ -79,6 +80,16 @@ function OrderDocument({ order }: { order: Order }) {
         </div>
         <div className="row">
           {canEdit && <button className="btn sm" onClick={actions.editOrder(order)}>Изменить</button>}
+          {/* Заметная кнопка добавления: пункт в конец или правило к любому пункту — в одном меню. */}
+          {canEdit && (
+            <button className="btn sm primary" id="orderAdd" aria-haspopup="menu"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => openMenu(e.currentTarget, [
+                { label: "Пункт приказа", run: actions.addClause(order.nodeId) },
+                ...(order.clauses.length ? [null] : []),
+                ...order.clauses.map((c) => ({ label: `Правило к пункту ${c.code || "?"}`, run: actions.addRule(c) })),
+              ])}>Добавить ▾</button>
+          )}
           <MenuButton items={() => actions.orderMenu(order)} />
         </div>
       </div>

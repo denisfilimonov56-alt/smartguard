@@ -216,7 +216,7 @@ test("свойства: шлют только изменённое и прежн
 });
 
 test("переход к архивному правилу открывает панель, даже если перечитку каталога обогнала другая", async ({ app }) => {
-  // Правило без ruleId — в «Узлах без идентификатора»; в архиве его нет в дереве без архива.
+  // Правило без ruleId — в «Не заданы идентификаторы»; в архиве его нет в дереве без архива.
   await app.evaluate((headers) => fetch("/api/catalog/nodes/r:3/status", { method: "POST", headers,
     body: JSON.stringify({ status: "archived" }) }), apiHeaders());
   await app.getByRole("button", { name: "Меню пользователя" }).click();
@@ -230,7 +230,7 @@ test("переход к архивному правилу открывает п�
     await new Promise((resolve) => setTimeout(resolve, 1500));
     return route.fallback();
   });
-  const item = app.locator(".issue .item").filter({ hasText: "Rule r:3" });
+  const item = app.locator(".issue .item").filter({ hasText: "Правило: r:3" });
   await item.getByRole("button", { name: "Показать" }).click();
   await app.getByRole("button", { name: "Меню пользователя" }).click();
   await app.getByRole("menuitem", { name: "Обновить" }).click();

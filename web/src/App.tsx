@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 
 import logo from "./assets/logo.png";
 import { CheckView } from "./features/check/CheckView";
@@ -29,20 +29,47 @@ const icon = (path: ReactNode) => (
     aria-hidden="true">{path}</svg>
 );
 
-const SECTIONS: { id: Section; label: string; icon: ReactNode; view: () => ReactNode; adminOnly?: boolean }[] = [
-  { id: "check", view: () => <CheckView />, label: "Проверка цели", icon: icon(<path d="M4 10l4 4 8-9" />) },
-  { id: "rules", view: () => <RulesView />, label: "Правила", icon: icon(<path d="M3 3h14v14H3zM3 8h14M3 13h14M8 3v14M13 3v14" />) },
-  { id: "orders", view: () => <OrdersView />, label: "Приказы", icon: icon(<path d="M5 2h8l3 3v13H5zM8 8h6M8 12h6" />) },
-  { id: "departments", view: () => <DepartmentsTab />, label: "Подразделения", icon: icon(<><circle cx="10" cy="7" r="3" /><path d="M4 17c0-3 3-5 6-5s6 2 6 5" /></>) },
-  { id: "targets", view: () => <TargetsTab />, label: "Атрибуты", icon: icon(<path d="M3 5h9l5 5-5 5H3zM7 10h.01" />) },
-  { id: "graph", view: () => <GraphTab />, label: "Граф", icon: icon(<><circle cx="5" cy="5" r="2" /><circle cx="15" cy="7" r="2" /><circle cx="8" cy="15" r="2" /><path d="M7 5.5l6 1M6 7l1.5 6M13.5 8.5L9.5 13.5" /></>) },
-  { id: "health", view: () => <HealthTab />, label: "Замечания", icon: icon(<path d="M10 3l8 14H2zM10 8v4M10 14.5v.5" />) },
-  { id: "monitoring", view: () => <MonitoringTab />, label: "Мониторинг", adminOnly: true, icon: icon(<path d="M2 11h3l2-6 4 11 2.5-7 1.5 2h3" />) },
-  { id: "users", view: () => <UsersTab />, label: "Пользователи", adminOnly: true,
+/** Группы разделов в панели: каждый день — «Работа», справочники — «Каталог», служебное — «Администрирование». */
+type Group = "Работа" | "Каталог" | "Администрирование";
+
+const SECTIONS: { id: Section; label: string; icon: ReactNode; view: () => ReactNode; group: Group; adminOnly?: boolean }[] = [
+  { id: "check", group: "Работа", view: () => <CheckView />, label: "Проверка цели", icon: icon(<path d="M4 10l4 4 8-9" />) },
+  { id: "rules", group: "Каталог", view: () => <RulesView />, label: "Правила", icon: icon(<path d="M3 3h14v14H3zM3 8h14M3 13h14M8 3v14M13 3v14" />) },
+  { id: "orders", group: "Каталог", view: () => <OrdersView />, label: "Приказы", icon: icon(<path d="M5 2h8l3 3v13H5zM8 8h6M8 12h6" />) },
+  { id: "departments", group: "Каталог", view: () => <DepartmentsTab />, label: "Подразделения", icon: icon(<><circle cx="10" cy="7" r="3" /><path d="M4 17c0-3 3-5 6-5s6 2 6 5" /></>) },
+  { id: "targets", group: "Каталог", view: () => <TargetsTab />, label: "Атрибуты", icon: icon(<path d="M3 5h9l5 5-5 5H3zM7 10h.01" />) },
+  { id: "graph", group: "Каталог", view: () => <GraphTab />, label: "Граф", icon: icon(<><circle cx="5" cy="5" r="2" /><circle cx="15" cy="7" r="2" /><circle cx="8" cy="15" r="2" /><path d="M7 5.5l6 1M6 7l1.5 6M13.5 8.5L9.5 13.5" /></>) },
+  { id: "health", group: "Работа", view: () => <HealthTab />, label: "Замечания", icon: icon(<path d="M10 3l8 14H2zM10 8v4M10 14.5v.5" />) },
+  { id: "monitoring", group: "Администрирование", view: () => <MonitoringTab />, label: "Мониторинг", adminOnly: true, icon: icon(<path d="M2 11h3l2-6 4 11 2.5-7 1.5 2h3" />) },
+  { id: "users", group: "Администрирование", view: () => <UsersTab />, label: "Пользователи", adminOnly: true,
     icon: icon(<><circle cx="7.5" cy="7" r="2.6" /><path d="M2.5 16c0-2.6 2.2-4.4 5-4.4s5 1.8 5 4.4M13.5 4.6a2.6 2.6 0 010 4.8M15 11.8c1.6.6 2.6 2 2.6 4.2" /></>) },
-  { id: "settings", view: () => <SettingsTab />, label: "Настройки", adminOnly: true,
+  { id: "settings", group: "Администрирование", view: () => <SettingsTab />, label: "Настройки", adminOnly: true,
     icon: icon(<><path d="M3 6h7M14 6h3M3 14h3M10 14h7" /><circle cx="12" cy="6" r="2" /><circle cx="8" cy="14" r="2" /></>) },
 ];
+
+const GROUPS: Group[] = ["Работа", "Каталог", "Администрирование"];
+
+/** Закреплена ли панель: выбор хранится в localStorage; пока не выбирали — закреплена, чтобы подписи были видны сразу. */
+const DOCK_KEY = "gc.sidebar";
+function readDocked() {
+  try { return localStorage.getItem(DOCK_KEY) !== "folded"; } catch { return true; }
+}
+function saveDocked(docked: boolean) {
+  try { localStorage.setItem(DOCK_KEY, docked ? "docked" : "folded"); } catch { /* приватный режим */ }
+}
+
+/** Окно от 1440px — места хватает и раскрытой панели, и разделу. */
+function useWide() {
+  const query = "(min-width: 1440px)";
+  const [wide, setWide] = useState(() => matchMedia(query).matches);
+  useEffect(() => {
+    const list = matchMedia(query);
+    const on = () => setWide(list.matches);
+    list.addEventListener("change", on);
+    return () => list.removeEventListener("change", on);
+  }, []);
+  return wide;
+}
 
 /** Инициалы для аватара: первые буквы двух первых слов имени или логина. */
 const initials = (name: string) =>
@@ -102,9 +129,12 @@ export function App() {
       message: "Несохранённые изменения в открытых формах будут потеряны." })) void logout();
   };
   // Раздел администратора по прямому адресу остальным не показывается.
-  const allowed = SECTIONS.filter((s) => isAdmin || !s.adminOnly);
+  const allowed = SECTIONS.filter((s) => isAdmin || !s.adminOnly)
+    .sort((a, b) => GROUPS.indexOf(a.group) - GROUPS.indexOf(b.group));
   const current = allowed.find((s) => s.id === requested) ?? allowed[0];
   const section = current.id;
+  // У каждого раздела своё название вкладки: несколько открытых вкладок различимы.
+  useEffect(() => { document.title = `${current.label} — Проверка целей`; }, [current.label]);
   useEffect(() => {
     if (section === requested) return;
     history.replaceState(null, "", sectionPath(section));
@@ -122,6 +152,12 @@ export function App() {
   const [folded, setFolded] = useState(false);
   // Пока открыто меню пользователя (оно рендерится вне панели), панель остаётся раскрытой.
   const [pinned, setPinned] = useState(false);
+  // Панель можно закрепить раскрытой (кнопка-булавка): тогда она стоит рядом с разделом, а не поверх.
+  // На окне уже 1440px закреплённая панель всё равно сворачивается до иконок.
+  const [dockPref, setDockPref] = useState(readDocked);
+  const wide = useWide();
+  const docked = dockPref && wide;
+  const toggleDock = () => { setDockPref(!dockPref); saveDocked(!dockPref); };
   // Поиск по каталогу (ui/Palette.tsx): открывается кнопкой в панели и по Ctrl+K.
   const [paletteOpen, setPaletteOpen] = useState(false);
   // «Обновить» показывает ожидание не меньше секунды: иначе мгновенный ответ выглядит как «ничего не произошло».
@@ -148,15 +184,22 @@ export function App() {
   }, [section, isAdmin]);
 
   return (
-    <div className={`shell ${withPanel ? "with-panel" : ""}`}>
+    <div className={`shell ${withPanel ? "with-panel" : ""} ${docked ? "docked" : ""}`}>
       <CheckDraftKeeper />
       <RestoredDialogs />
       {/* На шагах обучения про панель она раскрыта, как при наведении. */}
-      <aside className={`side ${folded && !tour.pinSide ? "folded" : ""} ${pinned || tour.pinSide ? "pinned" : ""}`}
+      <aside className={`side ${folded && !tour.pinSide && !docked ? "folded" : ""} ${pinned || tour.pinSide || docked ? "pinned" : ""} ${docked ? "docked" : ""}`}
         onMouseLeave={() => setFolded(false)} onKeyDown={() => setFolded(false)}>
         <div className="brand">
           <img src={logo} alt="" />
           <div>Проверка целей<small>каталог требований</small></div>
+          {wide && (
+            <button type="button" className="pin-btn label" aria-pressed={dockPref} onClick={toggleDock}
+              title={dockPref ? "Открепить панель: сворачивать до иконок" : "Закрепить панель раскрытой"}
+              aria-label={dockPref ? "Открепить панель" : "Закрепить панель"}>
+              {icon(<path d="M12 2l6 6-3 1-3 3 .5 4L11 17.5 7.5 14 3 18.5M7.5 14L2.5 9l1.5-1.5 4 .5 3-3 1-3z" />)}
+            </button>
+          )}
         </div>
         {/* Поиск по каталогу: та же палитра, что по Ctrl+K, но с видимой кнопкой. */}
         <button type="button" className="nav-item search-btn" title={folded ? "Поиск" : undefined}
@@ -170,12 +213,15 @@ export function App() {
             <div className="nav-ind" aria-hidden="true"
               style={{ transform: `translateY(${indicator.top}px)`, height: indicator.height }} />
           )}
-          {allowed.map((s) => (
-            <a key={s.id} role="tab" className="nav-item" aria-selected={section === s.id} href={sectionPath(s.id)}
+          {allowed.map((s, i) => (
+            <Fragment key={s.id}>
+            {s.group !== allowed[i - 1]?.group && <div className="nav-group label" aria-hidden="true">{s.group}</div>}
+            <a role="tab" className="nav-item" aria-selected={section === s.id} href={sectionPath(s.id)}
               title={folded ? s.label : undefined} onClick={(event) => open(event, s.id)}>
               {s.icon}<span className="label">{s.label}</span>
               {s.id === "health" && badge > 0 && <span className={`n ${health?.error ? "err" : "warn"}`}>{badge}</span>}
             </a>
+            </Fragment>
           ))}
         </nav>
         <div className="spacer" />
@@ -232,11 +278,12 @@ export function App() {
         <Palette open={paletteOpen} onOpenChange={setPaletteOpen} />
       </ErrorBoundary>
 
-      {/* Интерфейс рассчитан на настольный экран: уже 1100px он не перестраивается, а просит увеличить окно. */}
+      {/* Интерфейс рассчитан на настольный экран: уже 960px он не перестраивается, а просит увеличить окно.
+          От 960 до 1200px (ноутбук с масштабом 125%) проверка цели идёт в одну колонку (styles.css). */}
       <div className="too-narrow" role="alert">
         <div>
           <b>Увеличьте окно браузера</b>
-          <span>Интерфейс рассчитан на ширину от 1100 пикселей.</span>
+          <span>Интерфейс рассчитан на ширину от 960 пикселей.</span>
         </div>
       </div>
     </div>

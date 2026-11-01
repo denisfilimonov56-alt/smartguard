@@ -75,7 +75,7 @@ def test_finds_missing_identifiers_and_offers_a_fix(db):
     issue = next(i for i in diagnostics.collect()["issues"] if i["code"] == "missing_identifiers")
     assert issue["severity"] == "error"
     assert issue["fix"]["action"] == "repair_identifiers"
-    assert "приказ" in issue["items"][0]["label"]
+    assert issue["items"][0]["label"].startswith("Приказ")
 
 
 def test_finds_rules_without_target(db):

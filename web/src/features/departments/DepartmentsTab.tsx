@@ -1,7 +1,10 @@
+import { useMemo } from "react";
+
 import type { JobDescriptionRef } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
-import { ArchivedBadge, archivedClass, Chip, Empty, IdBadge, PageHead } from "../../ui/common";
+import { ruleTexts } from "../../state/tree";
+import { ArchivedBadge, archivedClass, Empty, IdBadge, PageHead, RuleBadge } from "../../ui/common";
 import { MenuButton } from "../../ui/Menu";
 import { useActions } from "../actions";
 
@@ -18,7 +21,8 @@ const dutiesNote = (j: JobDescriptionRef) =>
     : !j.duties ? " · нет списка обязанностей" : j.dutiesReviewed ? "" : " · проверьте обязанности";
 
 export function DepartmentsTab() {
-  const { departments, showArchivedDepartments, reload } = useCatalog();
+  const { departments, orders, showArchivedDepartments, reload } = useCatalog();
+  const texts = useMemo(() => ruleTexts(orders), [orders]);
   const actions = useActions();
   const { canEdit } = useAuth();
 
@@ -38,8 +42,8 @@ export function DepartmentsTab() {
         <div className="card"><table>
           <thead>
             <tr>
-              <th style={{ width: "18%" }}>Идентификатор</th><th>Название</th>
-              <th style={{ width: "17%" }}>Только здесь действуют</th>
+              <th style={{ width: "28%" }}>Подразделение</th>
+              <th>Действуют только здесь</th>
               <th style={{ width: "26%" }}>Должностные инструкции</th>
               <th style={{ width: 70 }} />
             </tr>
@@ -47,13 +51,13 @@ export function DepartmentsTab() {
           <tbody>
             {departments.map((d) => (
               <tr key={d.nodeId} className={archivedClass(d.status)} data-node={d.nodeId}>
+                {/* Название крупно, идентификатор кадровой системы — мелко под ним. */}
                 <td>
-                  <span className="mono">{d.departmentId}</span>{" "}
-                  <IdBadge value={d.departmentId} name="departmentId" /><ArchivedBadge status={d.status} />
+                  <div className="mid">{d.name || <span className="dim">без названия</span>} <ArchivedBadge status={d.status} /></div>
+                  <div><span className="mono dim">{d.departmentId}</span> <IdBadge value={d.departmentId} name="departmentId" /></div>
                 </td>
-                <td>{d.name || <span className="dim">без названия</span>}</td>
                 <td>{d.onlyRules.length
-                  ? d.onlyRules.map((r) => <Chip key={r}>{r}</Chip>)
+                  ? <div className="chips">{d.onlyRules.map((r) => <RuleBadge key={r} code={r} text={texts.get(r)} />)}</div>
                   : <span className="dim">—</span>}</td>
                 <td><div className="chips">
                   {d.jobDescriptions.map((j) => (

@@ -15,18 +15,25 @@ test("ответ проверки объясняет, что не так и ка
   await expect(violation).toContainText("Пример: «В рамках проекта «Альфа»");
   // Найденный атрибут подтверждён цитатой из цели.
   await expect(result.locator(".quote")).toHaveText("«31.12.2025»");
-  // Под вердиктом — ответ API как есть; по умолчанию свёрнут.
-  await expect(app.locator("#checkJson pre")).toBeHidden();
-  await app.locator("#checkJson summary").click();
+  // Ответ API — в меню «⋯» шапки ответа, а не в конце страницы.
+  await expect(app.locator("#checkJson")).toHaveCount(0);
+  await app.locator("#checkMenu").click();
+  await app.getByRole("menuitem", { name: "Показать ответ API (JSON)" }).click();
   expect(JSON.parse(await app.locator("#checkJson pre").innerText())).toMatchObject(
     { goal: GOAL, status: "VIOLATIONS_FOUND", attribute_quotes: { срок_исполнения: "31.12.2025" } });
+  await app.locator("#checkJson").getByRole("button", { name: "Закрыть" }).click();
 
-  // Кнопка в заголовке копирует ответ, не сворачивая и не разворачивая блок.
+  // Тот же ответ копируется пунктом меню.
   await app.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-  await app.locator("#checkJson").getByRole("button", { name: "Скопировать JSON" }).click();
+  await app.locator("#checkMenu").click();
+  await app.getByRole("menuitem", { name: "Скопировать ответ API (JSON)" }).click();
   await expect(toast(app, "JSON скопирован")).toBeVisible();
-  await expect(app.locator("#checkJson pre")).toBeVisible();
   expect(JSON.parse(await app.evaluate(() => navigator.clipboard.readText()))).toMatchObject({ goal: GOAL });
+
+  // Рекомендованная формулировка по нарушенным правилам подставляется в поле.
+  const suggestion = result.locator("#checkSuggestion");
+  await expect(suggestion).toContainText("В рамках проекта [название проекта]");
+  await expect(suggestion).not.toContainText("до [дата]");
 
   // Результат не теряется при переходе между разделами.
   await go(app, "Атрибуты");
@@ -42,7 +49,9 @@ test("после проверки формулировка остаётся в �
   await expect(app.locator("#goalInput")).toHaveCount(0);
   await expect(app.locator("#tab-check .hero").getByRole("button", { name: "Проверить" })).toBeVisible();
 
-  // Пять кругов SMART: срок в цели назван, значимость не видна.
+  // SMART свёрнут в строку оценок; «Подробнее» раскрывает пять кругов: срок в цели назван, значимость не видна.
+  await expect(result.locator("#checkSmart")).toHaveCount(0);
+  await result.locator(".smart-block").getByRole("button", { name: "Подробнее" }).click();
   const smart = result.locator("#checkSmart .ring");
   await expect(smart).toHaveCount(5);
   await expect(smart.filter({ hasText: "В срок" })).toHaveClass(/\bok\b/);
@@ -56,7 +65,7 @@ test("после проверки формулировка остаётся в �
 
   // Чип атрибута в ответе — тоже ссылка; «Изменить» возвращает поле ввода.
   await go(app, "Проверка цели");
-  await result.locator(".chip-btn", { hasText: "срок_исполнения" }).click();
+  await result.locator(".chip-btn", { hasText: "Срок исполнения" }).click();
   await expect(app.getByRole("tab", { name: "Атрибуты" })).toHaveAttribute("aria-selected", "true");
   await go(app, "Проверка цели");
   await summary.getByRole("button", { name: "Изменить" }).click();
@@ -72,7 +81,7 @@ test("после правки формулировки прежний ответ
   await app.locator("#goalSummary").getByRole("button", { name: "Изменить" }).click();
   await app.locator("#goalInput").fill(GOAL + " в рамках проекта «Альфа»");
   await expect(app.locator("#checkResult")).toHaveCount(0);
-  await expect(app.locator("#checkJson")).toHaveCount(0);
+  await expect(app.locator("#checkMenu")).toHaveCount(0);
   // Уход из раздела и возврат не показывают старый вердикт под новым текстом.
   await go(app, "Атрибуты");
   await go(app, "Проверка цели");
@@ -82,7 +91,6 @@ test("после правки формулировки прежний ответ
 
 test("без подразделения применяются все правила, причина — в заметках", async ({ app }) => {
   const result = await check(app, "Улучшить работу с заявками");
-  await expect(result.getByText("подразделение: не определено")).toBeVisible();
   await expect(result.getByText(/Подразделение не передано: применены все правила/)).toBeVisible();
   await expect(result.locator(".violation")).toHaveCount(2);
 });
@@ -90,8 +98,10 @@ test("без подразделения применяются все прави
 test("правило «только в» не применяется к другому подразделению", async ({ app }) => {
   let result = await check(app, GOAL, "FIN");
   await expect(result.getByText("Нарушений нет")).toBeVisible();
-  await expect(result.locator(".chip", { hasText: "Финансовое управление" })).toBeVisible();
-  await expect(app.getByText("правил: 2 · не для этого подразделения: 1")).toBeVisible();
+  // Подразделение видно в «Что проверяется», в шапке ответа его не повторяем.
+  await expect(app.locator("#tab-check aside h3").first()).toContainText("«Финансовое управление»");
+  await expect(app.locator("aside .counts")).toContainText("не для этого подразделения: 1");
+  await expect(app.locator("aside .counts").getByText("применимо 2 из 4")).toBeVisible();
 
   result = await check(app, GOAL, "UCT");
   await expect(result.getByText("Нужно доработать")).toBeVisible();
@@ -102,19 +112,21 @@ test("правило только для студентов проверяетс
   // Сотрудник: правило для студентов не считается и в списке справа отмечено отдельно.
   let result = await check(app, GOAL, "UCT");
   await expect(result.getByText("не выполнено правил: 1 из 3")).toBeVisible();
-  await expect(app.getByText("правил: 3 · только для студентов: 1")).toBeVisible();
+  await expect(app.locator("aside .counts")).toContainText("только для студентов: 1");
+  await expect(app.locator("aside .counts").getByText("применимо 3 из 4")).toBeVisible();
   await expect(result.locator(".violation")).not.toContainText("наставника");
 
   // Студент: правило проверяется, ответ помечен.
   result = await check(app, GOAL, "UCT", true);
   await expect(result.getByText("не выполнено правил: 2 из 4")).toBeVisible();
-  await expect(result.locator(".chip", { hasText: "студент" })).toBeVisible();
   await expect(result.locator(".violation").filter({ hasText: "наставника" })).toContainText("Приказ ПР-02, пункт 4.2");
-  await expect(app.getByText("правил: 4")).toBeVisible();
+  await expect(app.getByText("применимо 4 из 4")).toBeVisible();
 
   // Признак уходит в запрос булевым полем.
-  await app.locator("#checkJson summary").click();
+  await app.locator("#checkMenu").click();
+  await app.getByRole("menuitem", { name: "Показать ответ API (JSON)" }).click();
   expect(JSON.parse(await app.locator("#checkJson pre").innerText())).toMatchObject({ is_student: true });
+  await app.locator("#checkJson").getByRole("button", { name: "Закрыть" }).click();
 
   // Наставник назван — требование выполнено.
   result = await check(app, GOAL + " под руководством наставника", "UCT", true);
@@ -158,8 +170,8 @@ test("путь проверки показывается на графе", async
   const graph = app.locator("#tab-graph");
   await expect(graph.locator(".node.goal")).toBeVisible();
   // Найденный атрибут, нарушенное правило с его пунктом и приказом, ненайденный обязательный атрибут.
-  await expect(graph.locator(".node.traced.ok")).toContainText(["срок_исполнения"]);
-  await expect(graph.locator(".node.traced.bad").filter({ hasText: "R-1.1" })).toBeVisible();
+  await expect(graph.locator(".node.traced.ok")).toContainText(["Срок исполнения"]);
+  await expect(graph.locator(".node.traced.bad").filter({ hasText: "Упоминание проекта" })).toBeVisible();
   await expect(graph.locator(".node.traced.bad").filter({ hasText: "ПР-01" })).toBeVisible();
   await expect(graph.locator(".edge.trace.missing")).toHaveCount(1);
   await expect(graph.locator("aside")).toContainText("Нарушения: 2");
@@ -205,13 +217,11 @@ test("несогласие с ответом: советчик предлага�
 
 test("советчик: атрибут выбирается в окне; если модель уже согласна, менять нечего", async ({ app }) => {
   await check(app, GOAL);
-  // Блок советчика — между формой и ответом.
-  await expect(app.locator("#checkDispute + #checkResult")).toBeVisible();
-  await app.locator("#checkDispute").getByRole("button", { name: "Предложить правку графа" }).click();
+  // Советчик открывается из нарушения; отдельной карточки над ответом нет.
+  await expect(app.locator("#checkDispute")).toHaveCount(0);
+  await app.locator("#checkResult .violation").getByRole("button", { name: "Не согласен" }).click();
   const dialog = modal(app).getByRole("dialog");
-  await dialog.getByRole("button", { name: "Предложить правку" }).click();
-  await expect(toast(app, "Выберите атрибут")).toBeVisible();
-
+  // Атрибут нарушения уже выбран; меняем на найденный.
   await choose(dialog.locator("#adviceAttribute"), "срок_исполнения — сейчас найден");
   await expect(dialog.locator("#adviceExpected")).toContainText("по фрагменту «31.12.2025». Должно быть: не найден");
   await dialog.getByLabel("Обоснование").fill("это не срок, а отчётная дата");
@@ -226,7 +236,7 @@ test.describe("читатель", () => {
     const result = await check(app, GOAL);
     await expect(result.locator(".violation")).toBeVisible();
     await expect(result.getByRole("button", { name: "Не согласен" })).toHaveCount(0);
-    await expect(app.locator("#checkDispute")).toHaveCount(0);
+    await expect(app.locator("#checkJson")).toHaveCount(0);
   });
 });
 
@@ -281,7 +291,8 @@ test("ручная проверка и непроверенные правила
   // Не «не выполнено 1 из N» как будто остальные выполнены: непроверенное правило названо отдельно, со знаком «?».
   await expect(result.locator("[data-rules-line]")).toContainText(/^не выполнено правил: 1 из \d+ · не проверено: 1$/);
   await expect(result.locator(".vitem.unverified .ico")).toHaveText("?");
-  await app.locator("#checkJson summary").click();
+  await app.locator("#checkMenu").click();
+  await app.getByRole("menuitem", { name: "Показать ответ API (JSON)" }).click();
   expect(JSON.parse(await app.locator("#checkJson pre").innerText()).unverified_rule_node_ids).toHaveLength(1);
 });
 
