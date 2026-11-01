@@ -607,6 +607,8 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     assertLinksUnchanged(onlyIn.filter(([rule]) => rule === id).map(([, d]) => nodes.get(d)?.props.departmentId), body.expected);
     const only: string[] = body.only ?? [];
     const ids = scopeDepartments(only);
+    if (statusOf(get(id)) === "active")
+      assertOneJobRule(id, appliesTo.filter(([r]) => r === id).map(([, t]) => t), ids);
     onlyIn = [...onlyIn.filter(([rule]) => rule !== id), ...ids.map((d): [string, string] => [id, d])];
     return { only };
   }
@@ -684,9 +686,22 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       const clash = [...nodes.values()].find((o) => o.label === n.label && o.id !== id && o.props[key] === value);
       if (clash) throw new HttpError(409, `${key} '${value}' уже занят другим узлом :${n.label}`);
     }
+    const before = { ...n.props };
     for (const [k, v] of Object.entries(properties)) {
       if (v === null || (k === "date" && v === "")) delete n.props[k];
       else n.props[k] = v;
+    }
+    // Атрибут стал «инструкционным»: его правила теперь под ограничением (иначе — откат).
+    if (n.label === "CheckTarget" && properties.source === "job_descriptions") {
+      try {
+        for (const [r] of appliesTo.filter(([, t]) => t === id)) {
+          if (statusOf(get(r)) === "active")
+            assertOneJobRule(r, appliesTo.filter(([x]) => x === r).map(([, t]) => t), ruleDepts(r));
+        }
+      } catch (err) {
+        n.props = before;
+        throw err;
+      }
     }
     return { nodeId: n.id, labels: [n.label], ...n.props };
   }
@@ -708,10 +723,38 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     return names.map((name) => find(name)!.id);
   }
 
+  /** Как catalog._assert_one_job_rule: в подразделении — не больше одного действующего правила
+      по должностным инструкциям, у правила — не больше одного такого атрибута. rule — правило
+      (null — ещё не создано), targetsOf и depts — его атрибуты и подразделения (id узлов) после записи. */
+  function assertOneJobRule(rule: string | null, targetsOf: string[], depts: string[]) {
+    const isJob = (t: string) => nodes.get(t)?.props.source === "job_descriptions";
+    const jobs = new Set(targetsOf.filter(isJob));
+    if (!jobs.size) return;
+    if (jobs.size > 1)
+      throw new HttpError(409, "У правила может быть только один атрибут, который определяется по должностным инструкциям.");
+    const deptId = (d: string) => String(nodes.get(d)?.props.departmentId ?? d);
+    const mine = new Set(depts.map(deptId));
+    for (const other of nodes.values()) {
+      if (other.label !== "Rule" || other.id === rule || statusOf(other) !== "active") continue;
+      if (!appliesTo.some(([r, t]) => r === other.id && isJob(t))) continue;
+      const theirs = new Set(onlyIn.filter(([r]) => r === other.id).map(([, d]) => deptId(d)));
+      const common = !mine.size ? theirs : !theirs.size ? mine : new Set([...mine].filter((d) => theirs.has(d)));
+      if (mine.size && theirs.size && !common.size) continue;
+      const list = [...common].sort();
+      const where = !list.length ? "во всех подразделениях"
+        : list.length > 1 ? "в подразделениях " + list.join(", ") : `в подразделении ${list[0]}`;
+      throw new HttpError(409, `Правило по должностным инструкциям ${other.props.ruleId ?? "(без ruleId)"} уже действует ${where}: `
+        + "в подразделении может действовать только одно такое правило. "
+        + "Сузьте область действия одного из правил или отправьте его в архив.");
+    }
+  }
+  const ruleDepts = (id: string) => onlyIn.filter(([r]) => r === id).map(([, d]) => d);
+
   function setRuleTargets(id: string, names: string[], expected?: unknown) {
     ofLabel(id, "Rule");
     assertLinksUnchanged(ruleTargets(id), expected);
     const ids = targetIds(names);
+    if (statusOf(get(id)) === "active") assertOneJobRule(id, ids, ruleDepts(id));
     appliesTo = [...appliesTo.filter(([r]) => r !== id), ...ids.map((t): [string, string] => [id, t])];
     return { targets: ruleTargets(id) };
   }
@@ -1463,6 +1506,9 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       if (p[2] === "status" && method === "POST") {
         if (body?.status !== "active" && body?.status !== "archived")
           throw new HttpError(422, "status: Input should be 'active' or 'archived'");
+        // Правило из архива снова занимает своё подразделение.
+        if (get(id).label === "Rule" && body.status === "active")
+          assertOneJobRule(id, appliesTo.filter(([r]) => r === id).map(([, t]) => t), ruleDepts(id));
         get(id).props.status = body.status;
         return { nodeId: id, status: body.status };
       }
@@ -1489,6 +1535,7 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
       ofLabel(body.clauseNodeId, "Clause");
       const targetsOf = targetIds(body.targets ?? []);
       const only = scopeDepartments(body.only ?? []);
+      assertOneJobRule(null, targetsOf, only);
       const rule = create("r", "Rule", { type: body.type, description: body.description,
         checkInstruction: body.checkInstruction ?? "", studentsOnly: !!body.studentsOnly, ruleId: `R-${counter + 1}` },
       body.clauseNodeId);

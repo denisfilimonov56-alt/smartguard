@@ -142,6 +142,19 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
   }, [setWizardGuard]);
 
   const label = (id: string) => known.find((d) => d.departmentId === id)?.name || id;
+
+  // В подразделении действует не больше одного правила по должностным инструкциям
+  // (так же проверяет сервер): каждое — отдельное сравнение цели со всеми инструкциями.
+  const jobNames = new Set(targets.filter((t) => t.source === "job_descriptions").map((t) => t.name));
+  const pickedJob = picked.filter((name) => jobNames.has(name));
+  const jobRules = catalog.orders.flatMap((o) => o.clauses.flatMap((c) => c.rules))
+    .filter((r) => r.status === "active" && r.nodeId !== created.current.rule && r.targets.some((n) => jobNames.has(n)));
+  const jobEverywhere = pickedJob.length ? jobRules.find((r) => !r.onlyIn.length) : undefined;
+  const jobTaken = new Map<string, string>();
+  if (pickedJob.length) {
+    for (const r of jobRules) for (const d of r.onlyIn) jobTaken.set(d.departmentId, r.ruleId || "без ruleId");
+  }
+  const takenWhere = (ids: string[]) => ids.filter((id) => jobTaken.has(id));
   const clauseCode = useNewClause ? code.trim() : clause?.code ?? "";
   const clauseText = useNewClause ? text.trim() : clause?.text ?? "";
 
@@ -154,9 +167,14 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
       if (!description.trim()) return "Сформулируйте правило";
       if (hasNewTarget && !newDescription.trim()) return "Опишите новый атрибут: без описания модель его не распознает";
       if (!picked.length && !hasNewTarget) return "Выберите хотя бы один атрибут или заведите новый — иначе правило не сработает";
+      if (pickedJob.length > 1) return "У правила может быть только один атрибут по должностным инструкциям";
+      if (jobEverywhere) return `Правило по должностным инструкциям ${jobEverywhere.ruleId || ""} уже действует во всех подразделениях: второе такое правило не добавить`;
     }
     if (at === 2) {
       if (limited && !only.length) return "Отметьте подразделения, в которых действует правило";
+      if (pickedJob.length && !limited && jobRules.length) return "Правило по должностным инструкциям уже есть в части подразделений — выберите подразделения, где его ещё нет";
+      const taken = takenWhere(only);
+      if (pickedJob.length && limited && taken.length) return `В подразделении ${label(taken[0])} уже действует правило по должностным инструкциям ${jobTaken.get(taken[0])}`;
     }
     return null;
   }
@@ -448,6 +466,12 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
             <>
               <h2>В каких подразделениях действует правило?</h2>
               <div className="muted" style={{ marginTop: 4 }}>Цели остальных подразделений по этому правилу проверяться не будут.</div>
+              {pickedJob.length > 0 && (
+                <div className="muted" style={{ marginTop: 4 }}>
+                  Правило сравнивает цель с должностными инструкциями: в подразделении может действовать только одно такое
+                  правило.{jobTaken.size > 0 && " Подразделения, где оно уже есть, выбрать нельзя."}
+                </div>
+              )}
               <div role="radiogroup" aria-label="Где действует" style={{ marginTop: 6 }}>
                 <button type="button" role="radio" aria-checked={!limited} className="opt"
                   onClick={() => { setLimited(false); }}>
@@ -463,12 +487,14 @@ export function RuleWizard({ preset }: { preset: WizardPreset }) {
                       {known.map((d) => {
                         const id = d.departmentId!;
                         const on = only.includes(id);
+                        const takenBy = jobTaken.get(id);
                         return (
-                          <label key={d.nodeId} className={`box ${on ? "on" : ""}`}>
-                            <input type="checkbox" checked={on} onChange={(e) => {
+                          <label key={d.nodeId} className={`box ${on ? "on" : ""}`}
+                            title={takenBy ? `Уже действует правило по должностным инструкциям ${takenBy}` : undefined}>
+                            <input type="checkbox" checked={on} disabled={!!takenBy && !on} onChange={(e) => {
                               setOnly(e.target.checked ? [...only, id] : only.filter((x) => x !== id));
                             }} />
-                            {d.name || id}
+                            {d.name || id}{takenBy && <span className="dim"> · {takenBy}</span>}
                           </label>
                         );
                       })}

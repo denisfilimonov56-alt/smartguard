@@ -502,11 +502,15 @@ def get_node(node_id: str) -> dict[str, Any]:
 def set_status(node_id: str, status: str) -> dict[str, Any]:
     _require_status(status)
     node = _fetch_node(node_id)
-    _run(
-        "MATCH (n) WHERE elementId(n) = $node_id SET n.status = $status",
-        node_id=node_id,
-        status=status,
-    )
+
+    def work(run: Runner) -> None:
+        run("MATCH (n) WHERE elementId(n) = $node_id SET n.status = $status",
+            node_id=node_id, status=status)
+        # Правило из архива снова занимает своё подразделение.
+        if "Rule" in node["labels"] and status == ACTIVE_STATUS:
+            _assert_one_job_rule(run, [node_id])
+
+    _write(work)
     log.info("%s %s -> %s", node["labels"], node_id, status)
     return _fetch_node(node_id)
 
@@ -723,6 +727,9 @@ def update_properties(node_id: str, properties: dict[str, Any],
         if props:
             run("MATCH (n) WHERE elementId(n) = $node_id SET n += $props",
                 node_id=node_id, props=props)
+        # Атрибут стал «инструкционным»: его правила теперь под ограничением.
+        if label == "CheckTarget" and props.get("source") == JOB_SOURCE:
+            _assert_one_job_rule(run, [r["nodeId"] for r in run(Q_TARGET_RULES, node_id=node_id)])
 
     _write(work)
     return _fetch_node(node_id)
@@ -968,6 +975,7 @@ def create_rule(clause_node_id: str, rule_type: str, description: str,
             _replace_links(run, row["nodeId"], "targets", targets)
         if only:
             _replace_links(run, row["nodeId"], "only", only)
+        _assert_one_job_rule(run, [row["nodeId"]])
         return {"nodeId": row["nodeId"], **_props(row["props"])}
 
     # Журнал — после фиксации: драйвер может повторить транзакцию.
@@ -1331,6 +1339,56 @@ def _replace_links(run: Runner, node_id: str, kind: str, values: list[str]) -> N
         raise Conflict("Каталог изменился во время сохранения. Обновите страницу и повторите.")
 
 
+# Правила на атрибутах, которые определяются по должностным инструкциям: каждое
+# такое правило — отдельное сравнение цели со всеми инструкциями подразделения,
+# самый дорогой запрос к модели. Поэтому в подразделении действует не больше
+# одного такого правила, а у правила не больше одного такого атрибута.
+# Учитывается статус самого правила, а не приказа, пункта или атрибута:
+# иначе восстановление приказа из архива молча нарушило бы ограничение.
+Q_JOB_RULES = f"""
+MATCH (r:Rule)-[:APPLIES_TO]->(t:CheckTarget {{source: $source}})
+WHERE {ACTIVE.format('r')}
+WITH r, count(DISTINCT t) AS targets
+OPTIONAL MATCH (r)-[:ONLY_IN]->(d:Department)
+RETURN elementId(r) AS nodeId, coalesce(r.ruleId, '(без ruleId)') AS ruleId, targets,
+       collect(d.departmentId) AS only
+"""
+Q_TARGET_RULES = "MATCH (r:Rule)-[:APPLIES_TO]->(t) WHERE elementId(t) = $node_id RETURN elementId(r) AS nodeId"
+JOB_RULE_HINT = "Сузьте область действия одного из правил или отправьте его в архив."
+
+
+def _assert_one_job_rule(run: Runner, rule_node_ids: list[str]) -> None:
+    """Правила rule_node_ids после записи не нарушают «одно правило по
+    должностным инструкциям на подразделение»; иначе Conflict (запись откатится).
+
+    Вызывается в той же транзакции после записи связей или статуса.
+    """
+    if not rule_node_ids:
+        return
+    # Две одновременные записи иначе обе не увидели бы друг друга.
+    _lock_key(run, "Rule.jobDescriptions")
+    rows = run(Q_JOB_RULES, source=JOB_SOURCE)
+    for own in (row for row in rows if row["nodeId"] in rule_node_ids):
+        if own["targets"] > 1:
+            raise Conflict("У правила может быть только один атрибут, который определяется "
+                           "по должностным инструкциям.")
+        mine = set(own["only"] or [])
+        for other in rows:
+            if other["nodeId"] == own["nodeId"]:
+                continue
+            theirs = set(other["only"] or [])
+            common = theirs if not mine else mine if not theirs else mine & theirs
+            if mine and theirs and not common:
+                continue
+            where = ("во всех подразделениях" if not common
+                     else "в подразделениях " + ", ".join(sorted(common)) if len(common) > 1
+                     else f"в подразделении {next(iter(common))}")
+            raise Conflict(
+                f"Правило по должностным инструкциям {other['ruleId']} уже действует {where}: "
+                f"в подразделении может действовать только одно такое правило. {JOB_RULE_HINT}"
+            )
+
+
 def _check_targets_known(run: Runner, targets: list[str]) -> None:
     if not targets:
         return
@@ -1392,6 +1450,7 @@ def set_rule_targets(rule_node_id: str, targets: list[str],
         _assert_links_unchanged(run, rule_node_id, "targets", expected)
         _check_targets_known(run, targets)
         _replace_links(run, rule_node_id, "targets", targets)
+        _assert_one_job_rule(run, [rule_node_id])
 
     _write(work)
     log.info("Правило %s теперь применяется к %s", rule_node_id, targets)
@@ -1411,6 +1470,7 @@ def set_rule_scope(rule_node_id: str, only: list[str],
         _assert_links_unchanged(run, rule_node_id, "only", expected)
         _check_departments_known(run, only)
         _replace_links(run, rule_node_id, "only", only)
+        _assert_one_job_rule(run, [rule_node_id])
 
     _write(work)
     log.info("Правило %s: только в %s", rule_node_id, only)

@@ -497,6 +497,74 @@ def test_empty_scope_only_clears(db):
     assert params[0]["values"] == [], "пустая область — правило для всех"
 
 
+# --------------- одно правило по должностным инструкциям ---------------------
+
+OTHER_RULE = "4:db:30"
+
+
+def _job_rules(db, *rules):
+    """Правила на «инструкционных» атрибутах, какими их видит проверка после записи."""
+    db.rows[catalog.Q_JOB_RULES] = [
+        {"nodeId": node, "ruleId": rule_id, "targets": targets, "only": list(only)}
+        for node, rule_id, targets, only in rules
+    ]
+
+
+def test_job_rule_in_taken_department_is_refused(db):
+    _rule_with_departments(db, "UCT")
+    _job_rules(db, (RULE_NODE, "R-1.1", 1, ["UCT"]), (OTHER_RULE, "R-2.1", 1, ["UCT", "FIN"]))
+    with pytest.raises(Conflict) as exc:
+        catalog.set_rule_scope(RULE_NODE, ["UCT"])
+    assert "R-2.1" in str(exc.value) and "UCT" in str(exc.value)
+
+
+def test_job_rules_in_different_departments_coexist(db):
+    _rule_with_departments(db, "UCT")
+    _job_rules(db, (RULE_NODE, "R-1.1", 1, ["UCT"]), (OTHER_RULE, "R-2.1", 1, ["FIN"]))
+    assert catalog.set_rule_scope(RULE_NODE, ["UCT"]) == {"only": ["UCT"]}
+
+
+@pytest.mark.parametrize("mine, theirs", [([], ["FIN"]), (["UCT"], []), ([], [])])
+def test_job_rule_for_all_departments_overlaps_any(db, mine, theirs):
+    _rule_with_departments(db, *mine)
+    _job_rules(db, (RULE_NODE, "R-1.1", 1, mine), (OTHER_RULE, "R-2.1", 1, theirs))
+    with pytest.raises(Conflict):
+        catalog.set_rule_scope(RULE_NODE, mine)
+
+
+def test_rule_with_two_job_targets_is_refused(db):
+    _exists(db, RULE_NODE, ["Rule"], ruleId="R-1.1")
+    db.rows[Q_KNOWN_TARGETS] = [{"name": "обязанность"}, {"name": "функция"}]
+    _job_rules(db, (RULE_NODE, "R-1.1", 2, []))
+    with pytest.raises(Conflict) as exc:
+        catalog.set_rule_targets(RULE_NODE, ["обязанность", "функция"])
+    assert "один атрибут" in str(exc.value)
+
+
+def test_restoring_job_rule_into_taken_department_is_refused(db):
+    _exists(db, RULE_NODE, ["Rule"], ruleId="R-1.1", status="archived")
+    _job_rules(db, (RULE_NODE, "R-1.1", 1, ["UCT"]), (OTHER_RULE, "R-2.1", 1, ["UCT"]))
+    with pytest.raises(Conflict):
+        catalog.set_status(RULE_NODE, "active")
+    # В архив — всегда можно: ограничение проверяется только у действующего правила.
+    catalog.set_status(RULE_NODE, "archived")
+
+
+def test_target_becoming_job_source_checks_its_rules(db):
+    _exists(db, "4:db:40", ["CheckTarget"], name="обязанность")
+    db.rows[catalog.Q_TARGET_RULES] = [{"nodeId": RULE_NODE}]
+    _job_rules(db, (RULE_NODE, "R-1.1", 1, []), (OTHER_RULE, "R-2.1", 1, ["FIN"]))
+    with pytest.raises(Conflict):
+        catalog.update_properties("4:db:40", {"source": "job_descriptions"})
+
+
+def test_text_rules_are_not_limited(db):
+    _rule_with_departments(db, "UCT")
+    catalog.set_rule_scope(RULE_NODE, ["UCT"])
+    lookups = [p for q, p in db.calls if q == catalog.Q_JOB_RULES]
+    assert lookups == [{"source": "job_descriptions"}], "правило ищется среди «инструкционных»"
+
+
 def test_clause_cannot_reference_itself(db):
     _exists(db, CLAUSE_NODE, ["Clause"], code="1.1")
     with pytest.raises(Conflict):
