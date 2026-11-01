@@ -818,23 +818,41 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .meter span{display:block;height:100%;background:var(--brand);border-radius:4px}
 
 /* --------------------------------- граф ----------------------------------- */
-.graph-page{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
-.graph-box{position:relative;height:calc(100vh - 230px);min-height:420px;cursor:grab;user-select:none}
+/* Схема колонками: карточки узлов на лёгкой сетке точек, связи — плавные кривые.
+   Холст и карточка узла справа одной высоты, карточка прокручивается сама. */
+.graph-page{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:stretch;
+  height:calc(100vh - 220px);min-height:460px}
+.graph-box{position:relative;overflow:hidden;cursor:grab;user-select:none;border:1px solid var(--line-soft);
+  background:var(--panel) radial-gradient(circle,var(--line) 1px,transparent 1.2px) 0 0/22px 22px}
 .graph-box:active{cursor:grabbing}
 .graph-box svg{display:block;width:100%;height:100%}
-.graph-box .edge{stroke:var(--line);stroke-width:1.2}
-.graph-box .edge.lit{stroke:var(--ink-2);stroke-width:2}
-.graph-box .edge.faded{opacity:.25}
-.graph-box .node{cursor:pointer}
-.graph-box .node circle{stroke:var(--panel);stroke-width:2}
-.graph-box .node .hit{fill:transparent;stroke:none}
-.graph-box .node.selected .dot{stroke:var(--ink);stroke-width:2.5}
-.graph-box .node.archived{opacity:.45}
-.graph-box .node.faded{opacity:.2}
-.graph-box .node text{fill:var(--ink-2);pointer-events:none;paint-order:stroke;stroke:var(--panel);stroke-width:3px}
-.graph-zoom{position:absolute;right:12px;top:12px;display:flex;gap:6px}
-.graph-tip{position:absolute;z-index:5;max-width:280px;padding:8px 12px;border-radius:12px;background:var(--panel);
+.graph-box .col-head{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;fill:var(--ink-3)}
+.graph-box .col-head .count{font-weight:500;letter-spacing:0;fill:var(--ink-3);opacity:.7}
+.graph-box .edge{fill:none;stroke:var(--ink-3);stroke-opacity:.4;stroke-width:1.3}
+.graph-box .edge.ref{stroke-dasharray:4 4}
+.graph-box .edge.lit{stroke:var(--brand);stroke-opacity:1;stroke-width:2}
+.graph-box .edge.faded{stroke-opacity:.12}
+.graph-box .node{cursor:pointer;outline:none}
+.graph-box .node .face{fill:var(--panel-2);stroke:var(--line);stroke-width:1;transition:stroke .15s ease}
+.graph-box .node:hover .face,.graph-box .node:focus-visible .face{stroke:var(--brand)}
+.graph-box .node.lit .face{stroke:var(--ink-3)}
+.graph-box .node.selected .face{stroke:var(--brand);stroke-width:2;fill:var(--soft)}
+.graph-box .node.archived{opacity:.5}
+.graph-box .node.archived .face{stroke-dasharray:4 3}
+.graph-box .node.faded{opacity:.28}
+.graph-box .node text{pointer-events:none}
+.graph-box .node .name{font-size:13px;font-weight:500;fill:var(--ink)}
+.graph-box .node .sub{font-size:11.5px;fill:var(--ink-3)}
+/* Сильно отдалённая схема: вторые строки уже не прочесть — их не рисуем. */
+.graph-box .far .node .sub{display:none}
+.graph-zoom{position:absolute;right:12px;top:12px;display:flex;align-items:center;gap:6px;padding:4px;border-radius:50px;
+  background:var(--panel);box-shadow:var(--shadow)}
+.graph-zoom .small{min-width:40px;text-align:center}
+.graph-hint{position:absolute;left:16px;bottom:12px;pointer-events:none}
+.graph-tip{position:absolute;z-index:5;max-width:300px;padding:8px 12px;border-radius:12px;background:var(--panel);
   border:1px solid var(--line-soft);box-shadow:var(--shadow-lg);pointer-events:none}
+.graph-toolbar .chips{flex:1;min-width:0}
+.graph-flags{display:flex;gap:16px;align-items:center;margin-left:auto}
 .swatch{display:inline-block;width:10px;height:10px;border-radius:50%;flex:none}
 .legend.off{opacity:.45}
 .legend.off .swatch{background:var(--ink-3) !important}
@@ -847,31 +865,31 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
    Линия дорисовывается (pathLength = 1), затем узел на её конце «загорается»;
    задержка шага задаётся в разметке. Остальной граф плавно уходит в фон. */
 .graph-box .edge,.graph-box .node{transition:opacity .35s ease}
-.graph-box .edge.trace{stroke-width:2.6;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;
+.graph-box .edge.trace{stroke-width:2.6;stroke-opacity:1;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;
   animation:trace-draw .45s ease-out both}
 .graph-box .edge.trace.path{stroke:var(--ink-3)}
 .graph-box .edge.trace.ok{stroke:var(--ok)}
 .graph-box .edge.trace.bad{stroke:var(--danger)}
-.graph-box .edge.trace.missing{stroke-dasharray:.03 .05;stroke-dashoffset:0;animation:trace-fade .45s ease-out both}
+.graph-box .edge.trace.missing{stroke-dasharray:.015 .025;stroke-dashoffset:0;animation:trace-fade .45s ease-out both}
 @keyframes trace-draw{to{stroke-dashoffset:0}}
 @keyframes trace-fade{from{opacity:0}}
 .graph-box .node .halo{fill:none;stroke-width:3;transform-box:fill-box;transform-origin:center;
   animation:trace-pop .4s ease-out both,trace-pulse 1.8s ease-in-out .4s infinite}
 .graph-box .node.ok .halo{stroke:var(--ok)}
 .graph-box .node.bad .halo{stroke:var(--danger)}
-.graph-box .node.traced .dot,.graph-box .node .mark{transform-box:fill-box;transform-origin:center;
+.graph-box .node.ok .face{stroke:var(--ok);stroke-width:1.5}
+.graph-box .node.bad .face{stroke:var(--danger);stroke-width:1.5}
+.graph-box .node.traced .face,.graph-box .node .mark{transform-box:fill-box;transform-origin:center;
   animation:trace-pop .4s cubic-bezier(.3,1.6,.5,1) both}
 @keyframes trace-pop{from{opacity:0;transform:scale(.3)}}
 @keyframes trace-pulse{50%{stroke-opacity:.3}}
-.graph-box .node .mark circle{stroke:var(--panel);stroke-width:1.5}
+.graph-box .node .mark circle{stroke:var(--panel);stroke-width:2}
 .graph-box .node.ok .mark circle{fill:var(--ok)}
 .graph-box .node.bad .mark circle{fill:var(--danger)}
-.graph-box .node .mark text{fill:#fff;font-size:9px;font-weight:700;stroke:none}
-.graph-box .node.traced > text{fill:var(--ink);font-weight:500}
-.graph-box .node.goal{transform-box:fill-box;transform-origin:center}
+.graph-box .node .mark text{fill:#fff;font-size:11px;font-weight:700}
 .graph-box .node.goal rect{fill:var(--navy);stroke:var(--panel);stroke-width:2;transform-box:fill-box;transform-origin:center;
   animation:trace-pop .4s cubic-bezier(.3,1.6,.5,1) both}
-.graph-box .node.goal text{fill:#fff;font-size:12px;font-weight:700;stroke:none}
+.graph-box .node.goal text{fill:var(--panel);font-size:13px;font-weight:700}
 .trace-legend{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--ink-2)}
 .trace-legend i,.trace-mark{display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;color:#fff;
   font-style:normal;font-size:10px;font-weight:700;vertical-align:-2px}
@@ -890,7 +908,7 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 
 @media (prefers-reduced-motion:reduce){
   .nav-ind,.side,.side *{transition:none}
-  .graph-box .edge.trace,.graph-box .node .halo,.graph-box .node.traced .dot,.graph-box .node .mark,
+  .graph-box .edge.trace,.graph-box .node .halo,.graph-box .node.traced .face,.graph-box .node .mark,
   .graph-box .node.goal rect{animation:none}
   .graph-box .edge.trace{stroke-dashoffset:0}
 }
@@ -1009,24 +1027,23 @@ th.r,td.r{text-align:right !important;white-space:nowrap}
 .tour-foot{display:flex;align-items:center;gap:8px;margin-top:14px}
 @media (prefers-reduced-motion:reduce){.tour-spot,.tour-card,.tour-hint,.tour-scrim.dim,.tour-click::after{transition:none;animation:none}}
 
-/* Поиск узла над графом: иконка и «1 из N» внутри поля; справа — карточка узла и легенда. */
-.graph-search{display:flex;align-items:center;gap:10px;width:280px;padding:0 16px;height:42px;border:1.5px solid var(--line);
+/* Поиск узла над графом: иконка и «1 из N» внутри поля; справа — карточка узла. */
+.graph-search{display:flex;align-items:center;gap:10px;width:240px;padding:0 16px;height:42px;border:1.5px solid var(--line);
   border-radius:50px;background:var(--panel)}
 .graph-search:focus-within{border-color:var(--brand)}
 .graph-search svg{width:18px;height:18px;flex:none;fill:none;stroke:var(--ink-2);stroke-width:1.6;stroke-linecap:round}
 .graph-search input{flex:1;min-width:0;border:0;outline:0;background:none;padding:0}
 .graph-search .dim{flex:none;font-size:12px}
-.graph-side{display:flex;flex-direction:column;gap:16px;min-width:0}
+.graph-side{min-width:0;overflow-y:auto}
 .node-kind{gap:8px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)}
 .node-title{margin:6px 0 6px;font-size:20px;line-height:26px}
 .node-detail{font-size:13px;line-height:19px;margin:0}
-.graph-legend{display:flex;flex-direction:column;gap:6px;margin-top:10px}
-.graph-legend > span{display:flex;align-items:center;gap:8px}
 
 /* Правило в справочниках — синяя метка с текстом правила; длинный текст переносится. */
 /* Многострочная метка — не «таблетка»: скругление как у карточек поменьше; верх текста — вровень с соседними ячейками. */
 .rule-badge{white-space:normal;text-align:left;line-height:18px;padding:4px 10px;height:auto;border-radius:10px;margin-top:-4px}
-.graph-side .graph-link{flex-direction:row;align-items:baseline;gap:10px;margin-top:2px;padding:6px 8px}
-.graph-side .graph-link .dim{flex:none;font-size:13px}
+.graph-side .node-link{flex-direction:row;align-items:baseline;gap:10px;margin-top:4px;padding:7px 10px}
+.graph-side .node-link .swatch{width:8px;height:8px;align-self:center}
+.graph-side .node-link .dim{flex:none;font-size:13px}
 .issue-fix{margin-left:auto;font-weight:400}
 .toolbar .legend{margin-left:4px}
