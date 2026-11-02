@@ -104,7 +104,8 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   attr("color", COL, 3); attr("aDelay", delay, 1); attr("aSeed", seed, 1); attr("aScale", scl, 1);
   attr("position", new Float32Array(N * 3), 3);   // для three.js; настоящее положение — в шейдере
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 30);
-  const uni = { uP: { value: 0 }, uDur: { value: 2.6 }, uDK: { value: 1 }, uTime: { value: 0 }, uNoise: { value: .035 },
+  const uni = { uP: { value: 0 }, uDur: { value: 1.8 }, uDK: { value: .6 },   // первая сборка ≈1,6 с
+    uTime: { value: 0 }, uNoise: { value: .035 },
     uSize: { value: 3.1 }, uPR: { value: 1 }, uActive: { value: 0 } };
   const VS = `
     attribute vec3 aA, aB, color; attribute float aDelay, aSeed, aScale;
