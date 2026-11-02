@@ -37,7 +37,7 @@ export function LoginView({ notice }: { notice?: string }) {
 
   return (
     <div className="login-screen">
-      <LoginEmblem leaving={busy} />
+      <LoginEmblem dark={theme === "dark"} leaving={busy} />
       <button type="button" className="login-theme" onClick={() => { setTheme(nextTheme); saveTheme(nextTheme); }}
         aria-label={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"} title={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"}>
         <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">

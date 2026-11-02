@@ -178,10 +178,17 @@ b,strong{font-weight:600}
 .login-theme:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 .login-theme svg{width:18px;height:18px}
 .login-screen > :is(.login-head,.login-main,.login-foot){grid-column:1;position:relative;padding-left:var(--login-x);padding-right:var(--login-x)}
-.login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.3;
-  opacity:0;transition:opacity 1.2s cubic-bezier(.4,0,.2,1)}
-.login-emblem.is-ready{opacity:1}   /* LoginEmblem ставит класс после первого кадра */
-.login-emblem-fallback{position:absolute;z-index:-1;top:50%;right:25%;width:min(300px,30vw);transform:translate(50%,-50%)}
+.login-emblem{position:absolute;top:0;bottom:0;left:50%;width:50%;z-index:-1;pointer-events:none;mix-blend-mode:multiply;
+  opacity:0;transition:opacity 1.2s cubic-bezier(.4,0,.2,1),transform .6s cubic-bezier(.4,0,.2,1)}
+.login-emblem.is-ready{opacity:1}   /* LoginEmblem ставит класс, когда видео (или заставка) загрузилось */
+.login-emblem.is-leaving{opacity:0;transform:scale(1.06);transition-duration:.5s}   /* нажали «Войти» */
+/* Ролик снят на чисто белом (тёмная тема — на чисто чёрном) фоне: «умножение» / «экран» убирают фон
+   точно, и эмблема ложится на фон страницы. Квадрат по центру правой половины, крупнее её — лишнее
+   уходит под синюю карточку; маска мягко гасит пыль у краёв. */
+:root[data-theme="dark"] .login-emblem{mix-blend-mode:screen}
+.login-emblem :is(video,img){position:absolute;left:50%;top:50%;width:min(125%,100vh);aspect-ratio:1;object-fit:cover;
+  transform:translate(-50%,-50%);-webkit-mask-image:radial-gradient(closest-side,#000 72%,transparent);
+  mask-image:radial-gradient(closest-side,#000 72%,transparent)}
 .login-head{grid-row:1;padding-top:68px;font-weight:700;font-size:15px;line-height:20px;letter-spacing:-.01em}
 .login-head small{display:block;margin-top:2px;font-weight:400;font-size:11px;line-height:1.35;letter-spacing:0;color:rgba(255,255,255,.7)}
 .login-main{grid-row:2;align-self:end;padding-bottom:56px;display:flex;flex-direction:column;align-items:flex-start;
@@ -220,8 +227,8 @@ b,strong{font-weight:600}
   .login-lead{font-size:16px}
   .login-chips{display:none}   /* на телефоне карточка иначе закрывает эмблему */
   .login-foot{grid-row:4;padding-top:28px;padding-bottom:28px}
-  .login-emblem{left:0;width:100%}
-  .login-emblem-fallback{top:18%;right:50%;width:160px}
+  .login-emblem{left:0;width:100%;bottom:auto;height:58%}
+  .login-emblem :is(video,img){width:min(125vw,62vh)}
 }
 @media (prefers-reduced-motion:reduce){
   .login-main{animation:none}
