@@ -21,8 +21,6 @@ const FEATURES: [string, string][] = [
 export function LoginView({ notice }: { notice?: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [hover, setHover] = useState(false);
-  const [focus, setFocus] = useState(false);
   const [theme, setTheme] = useState<Theme>(readTheme);
   const nextTheme: Theme = theme === "dark" ? "light" : "dark";
 
@@ -39,7 +37,7 @@ export function LoginView({ notice }: { notice?: string }) {
 
   return (
     <div className="login-screen">
-      <LoginEmblem active={hover || focus} leaving={busy} />
+      <LoginEmblem leaving={busy} />
       <button type="button" className="login-theme" onClick={() => { setTheme(nextTheme); saveTheme(nextTheme); }}
         aria-label={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"} title={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"}>
         <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
@@ -63,9 +61,7 @@ export function LoginView({ notice }: { notice?: string }) {
         </ul>
         {notice && !error && <div className="alert">{notice}</div>}
         {error && <div className="alert danger" role="alert">{error}</div>}
-        <button type="button" className="login-btn" disabled={busy} onClick={() => void start()}
-          onPointerEnter={() => setHover(true)} onPointerLeave={() => setHover(false)}
-          onFocus={() => setFocus(true)} onBlur={() => setFocus(false)}>
+        <button type="button" className="login-btn" disabled={busy} onClick={() => void start()}>
           {busy ? <><Spinner /> Переход ко входу…</> : <>
             Войти
             <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor"

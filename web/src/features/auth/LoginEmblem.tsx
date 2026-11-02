@@ -4,8 +4,9 @@ import logo from "../../assets/logo.png";
 
 /* Эмблема из частиц на экране входа (three.js, WebGL). При загрузке эмблема
    уже собрана и плавно проявляется через прозрачность (класс is-ready на холсте,
-   переход в styles.css), затем мягко покачивается; пока курсор на кнопке
-   «Войти» — цвет глубже и ореол сильнее; по нажатию частицы улетают на зрителя.
+   переход в styles.css), затем мягко покачивается; по нажатию «Войти» частицы
+   улетают на зрителя. Яркость эмблемы постоянна: ни наведение, ни ступени
+   качества её не меняют.
    Частицы ложатся обычным наложением, у центра шеврона, крыльев и ромба свои
    оттенки синего (исходные на белом почти сливаются). Тема сайта (data-theme на
    <html>) отслеживается на ходу: в тёмной фон тёмный, тона светлее, ореол сильнее.
@@ -17,21 +18,20 @@ import logo from "../../assets/logo.png";
      нового перехода, поэтому прерванный переход продолжается без скачка;
    - свечение — не постобработка (bloom давал квадратные ореолы), а «ореолы»:
      первые HALO частиц второй раз рисуются крупными пятнами с гауссовым спадом;
-   - качество снижается ступенями по фактическому FPS и обратно не растёт:
-     0 — полная плотность пикселей; 1 — плотность 1; 2 — ореолов вдвое меньше;
-     3 — половина частиц и плотность 0.75. Яркость на ступенях не падает: оставшиеся
-     ореолы вдвое сильнее, частицы на ступени 3 крупнее. Слабая машина (≤4 ядер
-     или ≤4 ГБ) сразу стартует с уровня 1 и с меньшим числом частиц.
+   - качество снижается ступенями по фактическому FPS и обратно не растёт; ступень
+     меняет только плотность пикселей (1.75 → 1 → 0.75 → 0.6), так что эмблема
+     не тускнеет и не вспыхивает, а анимация не останавливается. Слабая машина
+     (≤4 ядер или ≤4 ГБ) сразу стартует с уровня 1 и с меньшим числом частиц.
    Без WebGL показывается обычная картинка эмблемы. */
 
-interface Signals { active: boolean; leaving: boolean }
+interface Signals { leaving: boolean }
 
-export function LoginEmblem({ active, leaving }: Signals) {
+export function LoginEmblem({ leaving }: Signals) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const signals = useRef<Signals>({ active, leaving });
+  const signals = useRef<Signals>({ leaving });
   const [failed, setFailed] = useState(false);
 
-  useEffect(() => { signals.current = { active, leaving }; }, [active, leaving]);
+  useEffect(() => { signals.current = { leaving }; }, [leaving]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -54,7 +54,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const nav = navigator as Navigator & { deviceMemory?: number };
   const weak = (nav.hardwareConcurrency || 8) <= 4 || (nav.deviceMemory || 8) <= 4;
   let level = weak ? 1 : 0;
-  const prFor = (l: number) => (l === 0 ? Math.min(devicePixelRatio, 1.75) : l === 3 ? .75 : 1);
+  const prFor = (l: number) => [Math.min(devicePixelRatio, 1.75), 1, .75, .6][l];
   const narrow = () => innerWidth < 760;
   // Холст уже окна (слева синяя карточка) — эмблема по центру холста, по его ширине и --emblem-scale.
   const inPart = () => !narrow() && canvas.clientWidth < innerWidth * .9;
@@ -108,17 +108,17 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   attr("position", new Float32Array(N * 3), 3);   // для three.js; настоящее положение — в шейдере
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 30);
   const uni = { uP: { value: 0 }, uDur: { value: 2.6 }, uDK: { value: 1 }, uTime: { value: 0 }, uNoise: { value: .035 }, uHalo: { value: .056 },
-    uSize: { value: 3.1 }, uPR: { value: 1 }, uActive: { value: 0 } };
+    uSize: { value: 3.1 }, uPR: { value: 1 } };
   const VS = `
     attribute vec3 aA, aB, color; attribute float aDelay, aSeed, aScale;
-    uniform float uP, uDur, uDK, uTime, uNoise, uSize, uPR, uActive, uK;
+    uniform float uP, uDur, uDK, uTime, uNoise, uSize, uPR, uK;
     varying vec3 vC;
     float ez(float t){ return t < .5 ? 4.*t*t*t : 1. - pow(-2.*t + 2., 3.) / 2.; }
     void main(){
       float k = ez(clamp((uP - aDelay*uDK) / (uDur*.6), 0., 1.));
       vec3 p = mix(aA, aB, k);
       p.x += sin(uTime*1.3 + aSeed) * uNoise; p.y += cos(uTime*1.1 + aSeed*1.7) * uNoise;
-      vC = color * (1. - uActive * .18);              // наведение на «Войти» — цвет глубже
+      vC = color;
       vec4 mv = modelViewMatrix * vec4(p, 1.); gl_Position = projectionMatrix * mv;
       gl_PointSize = uSize * uPR * aScale * uK * (10. / -mv.z);
     }`;
@@ -130,9 +130,9 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
       gl_FragColor = vec4(vC, min(1., a * 1.3));
       #include <colorspace_fragment>
     }`);
-  const haloMat = points(12 * 1.3, `uniform float uActive, uHalo; varying vec3 vC;
+  const haloMat = points(12 * 1.3, `uniform float uHalo; varying vec3 vC;
     void main(){ float d = length(gl_PointCoord - .5) * 2.;
-      float a = exp(-d*d*4.) * (1. - smoothstep(.7, 1., d)) * uHalo * (1. + uActive * .8);
+      float a = exp(-d*d*4.) * (1. - smoothstep(.7, 1., d)) * uHalo;
       gl_FragColor = vec4(vC, a);
       #include <colorspace_fragment>
     }`);
@@ -170,7 +170,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     for (let i = 0; i < N; i++) tones[tone[i]].toArray(COL, i * 3);
     colAttr.needsUpdate = true;
     bg.set(dark ? 0x0f1218 : 0xf8f9fb);
-    applyHalo();
+    uni.uHalo.value = dark ? .11 : .056;
     dustMat.color.set(dark ? 0x4d97ff : 0x8ab8f8);
     for (const r of rings) r.material.color.set(dark ? 0x4d97ff : 0x0c6ff1);
   }
@@ -204,21 +204,18 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     group.position.set(nx || part ? 0 : Math.min(3.9, halfW - 3.6), nx ? 2.2 : 0, 0);
     const k = parseFloat(getComputedStyle(canvas).getPropertyValue("--emblem-scale")) || 1;   // увеличение задаётся в styles.css
     group.scale.setScalar(nx ? .62 : part ? Math.min(1, halfW / 6) * k : 1);   // орбиты ~12 единиц в ширину
-    uni.uSize.value = (nx ? 2.5 : 3.1) * (level >= 3 ? 1.35 : 1);   // половина частиц — каждая крупнее
-    redrawIfStopped();   // анимация остановлена — setSize очистил холст, рисуем кадр заново
+    uni.uSize.value = nx ? 2.5 : 3.1;
+    redrawIfStopped();   // без анимации setSize очистил холст — рисуем кадр заново
   }
-  function redrawIfStopped() { if (still) draw(30, .016); else if (frozen) draw(now(), 1); }
+  function redrawIfStopped() { if (still) draw(30, .016); }
   function applyLevel() {
     renderer.setPixelRatio(prFor(level)); uni.uPR.value = renderer.getPixelRatio();
-    haloGeo.setDrawRange(0, level >= 2 ? HALO >> 1 : HALO); geo.setDrawRange(0, level >= 3 ? N >> 1 : N);
-    applyHalo(); resize();
+    resize();
   }
-  // ореолов вдвое меньше — каждый вдвое сильнее, общее свечение то же
-  function applyHalo() { uni.uHalo.value = (darkNow ? .11 : .056) * (level >= 2 ? 2 : 1); }
-  let rotY = 0, act = 0;
+  let rotY = 0;
   function draw(t: number, dt: number) {
     uni.uTime.value = t; uni.uP.value = t - t0;
-    const { active, leaving } = signals.current;
+    const { leaving } = signals.current;
     if (leaving && !warping && !still) {   // «Войти» нажата — частицы улетают на зрителя
       const P = now() - t0, w = new Float32Array(N * 3);
       for (let i = 0; i < N; i++) w.set([current(i, 0, P) * 4, current(i, 1, P) * 4, 22 + Math.random() * 8], i * 3);
@@ -231,27 +228,24 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     // иначе одинаковое покачивание кажется сильнее в одну сторону
     const face = Math.atan2(-group.position.x, camera.position.z - group.position.z);
     group.rotation.y = face + rotY;   // покачивается сама, за курсором не следит
-    act += ((active ? 1 : 0) - act) * Math.min(1, dt * 3);
-    uni.uActive.value = act;
     rings.forEach((r, i) => { r.rotation.z = t * (i ? -.08 : .12); });
     renderer.render(scene, camera);
   }
 
   // замер FPS: после разогрева окна по 2 с; среднее хуже 45 FPS — ступень вниз.
-  // Если тормозит и на последней ступени — эмблема застывает собранной, анимация останавливается.
-  let raf = 0, last = 0, prev = 0, acc = 0, frames = 0, watchFrom = 1.5, frozen = false;
+  // На последней ступени замер прекращается, анимация продолжается.
+  let raf = 0, last = 0, prev = 0, acc = 0, frames = 0, watchFrom = 1.5;
   function frame() {
     raf = requestAnimationFrame(frame);
     if (document.hidden) { acc = frames = 0; return; }
     const t = now(), dt = Math.min(.05, t - last); last = t;
     draw(t, dt);
-    if (t > watchFrom) {
+    if (level < 3 && t > watchFrom) {
       const step = t - prev;
       if (step < .25) { acc += step; frames++; }   // паузы (свёрнутое окно) не считаем
       if (acc > 2) {
         if (acc / frames > 1 / 45) {
-          if (level < 3) { level++; applyLevel(); watchFrom = t + 1; }
-          else { cancelAnimationFrame(raf); frozen = true; A.set(EMB); B.set(EMB); aA.needsUpdate = aB.needsUpdate = true; draw(t, 1); return; }
+          level++; applyLevel(); watchFrom = t + 1;
         }
         acc = frames = 0;
       }
