@@ -52,7 +52,9 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const weak = (nav.hardwareConcurrency || 8) <= 4 || (nav.deviceMemory || 8) <= 4;
   let level = weak ? 1 : 0;
   const prFor = (l: number) => (l === 0 ? Math.min(devicePixelRatio, 1.75) : l === 3 ? .75 : 1);
-  const narrow = () => canvas.clientWidth < 760;
+  const narrow = () => innerWidth < 760;
+  // Холст уже окна (слева синяя карточка) — эмблема по центру холста, по его ширине и --emblem-scale.
+  const inPart = () => !narrow() && canvas.clientWidth < innerWidth * .9;
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, powerPreference: "high-performance" });
   // Программный WebGL (виртуальные рабочие места без видеокарты, headless-браузер в тестах)
@@ -63,7 +65,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const camera = new THREE.PerspectiveCamera(42, 1, .1, 200);
   camera.position.set(0, 0, 15);
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xffffff);
+  scene.background = new THREE.Color(0xf8f9fb);   // --bg сайта
 
   /* ---------- эмблема из картинки ---------- */
   // не img.decode(): в фоновой вкладке он может не завершиться, и сцена не стартует
@@ -174,12 +176,16 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   function resize() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
     renderer.setSize(w, h, false);
-    camera.aspect = w / Math.max(1, h); camera.fov = w < 760 ? 58 : 42; camera.updateProjectionMatrix();
+    camera.aspect = w / Math.max(1, h); camera.fov = narrow() ? 58 : 42; camera.updateProjectionMatrix();
     // правее центра, но не дальше видимого края: на средней ширине эмблема не уезжает за экран
     const halfW = Math.tan(camera.fov * Math.PI / 360) * camera.position.z * camera.aspect;
-    const nx = narrow(); group.position.set(nx ? 0 : Math.min(3.9, halfW - 3.6), nx ? 2.2 : 0, 0); group.scale.setScalar(nx ? .62 : 1);
+    const nx = narrow(), part = inPart();
+    group.position.set(nx || part ? 0 : Math.min(3.9, halfW - 3.6), nx ? 2.2 : 0, 0);
+    const k = parseFloat(getComputedStyle(canvas).getPropertyValue("--emblem-scale")) || 1;   // увеличение задаётся в styles.css
+    group.scale.setScalar(nx ? .62 : part ? Math.min(1, halfW / 6) * k : 1);   // орбиты ~12 единиц в ширину
     uni.uSize.value = nx ? 2.5 : 3.1;
     if (still) draw(30, .016);
+    else if (frozen) draw(now(), 1);   // анимация остановлена — setSize очистил холст, рисуем кадр заново
   }
   function applyLevel() {
     renderer.setPixelRatio(prFor(level)); uni.uPR.value = renderer.getPixelRatio();
@@ -212,7 +218,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
 
   // замер FPS: после разогрева окна по 2 с; среднее хуже 45 FPS — ступень вниз.
   // Если тормозит и на последней ступени — эмблема застывает собранной, анимация останавливается.
-  let raf = 0, last = 0, prev = 0, acc = 0, frames = 0, watchFrom = 1.5;
+  let raf = 0, last = 0, prev = 0, acc = 0, frames = 0, watchFrom = 1.5, frozen = false;
   function frame() {
     raf = requestAnimationFrame(frame);
     if (document.hidden) { acc = frames = 0; return; }
@@ -224,7 +230,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
       if (acc > 2) {
         if (acc / frames > 1 / 45) {
           if (level < 3) { level++; applyLevel(); watchFrom = t + 1; }
-          else { cancelAnimationFrame(raf); A.set(EMB); B.set(EMB); aA.needsUpdate = aB.needsUpdate = true; draw(t, 1); return; }
+          else { cancelAnimationFrame(raf); frozen = true; A.set(EMB); B.set(EMB); aA.needsUpdate = aB.needsUpdate = true; draw(t, 1); return; }
         }
         acc = frames = 0;
       }

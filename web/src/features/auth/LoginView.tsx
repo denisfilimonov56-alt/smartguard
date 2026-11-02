@@ -4,8 +4,8 @@ import * as oidc from "../../lib/oidc";
 import { Spinner } from "../../ui/common";
 import { LoginEmblem } from "./LoginEmblem";
 
-/* Экран входа: справа эмблема из частиц (LoginEmblem), слева заголовок и одна
-   кнопка. Только белый вариант — в тёмной теме экран входа тоже белый.
+/* Экран входа: слева синяя карточка с заголовком и одной кнопкой, справа эмблема
+   из частиц (LoginEmblem). Только светлый вариант — в тёмной теме экран входа тоже светлый.
    Логин и пароль здесь не спрашиваются: кнопка уводит на страницу входа
    Keycloak, оттуда возвращаются уже с токеном (lib/oidc.ts). */
 
@@ -29,10 +29,10 @@ export function LoginView({ notice }: { notice?: string }) {
   return (
     <div className="login-screen">
       <LoginEmblem active={hover || focus} leaving={busy} />
-      <header className="login-head">SmartGuard</header>
+      <header className="login-head">SmartGuard<small>проверка целей по приказам</small></header>
       <main className="login-main">
         <span className="login-tag">Вход</span>
-        <h1>Проверка <span className="accent">целей</span><br />по приказам</h1>
+        <h1>Проверка целей<br />по приказам</h1>
         {notice && !error && <div className="alert">{notice}</div>}
         {error && <div className="alert danger" role="alert">{error}</div>}
         <button type="button" className="login-btn" disabled={busy} onClick={() => void start()}
