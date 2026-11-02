@@ -92,3 +92,39 @@ test("возврат на вкладку, пока опрос «Сейчас» �
   await app.waitForTimeout(500);
   expect(calls).toBe(1);
 });
+
+test("настройки раздела запоминаются в браузере", async ({ app }) => {
+  await go(app, "Мониторинг");
+  await app.getByRole("button", { name: "30 дней" }).click();
+  await app.getByRole("combobox", { name: "Периодичность" }).click();
+  await app.getByRole("option", { name: "По часам" }).click();
+  await app.getByRole("combobox", { name: "Вид проверок" }).click();
+  await app.getByRole("option", { name: "Только пакетные" }).click();
+  // Выбор записывается эффектом после отрисовки — перезагружать только после записи.
+  await expect.poll(() => app.evaluate(() => JSON.parse(localStorage.getItem("gc.monitoring:admin") ?? "{}")))
+    .toMatchObject({ preset: 30, step: "hour", mode: "bulk" });
+
+  // После перезагрузки раздел сразу считает по сохранённым настройкам.
+  const request = app.waitForRequest((r) => r.url().includes("/monitoring/stats"));
+  await app.reload();
+  const url = new URL((await request).url());
+  expect(url.searchParams.get("step")).toBe("hour");
+  expect(url.searchParams.get("mode")).toBe("bulk");
+  await expect(app.getByRole("button", { name: "30 дней" })).toHaveAttribute("aria-pressed", "true");
+  await expect(app.getByRole("combobox", { name: "Периодичность" })).toContainText("По часам");
+  await expect(app.getByRole("combobox", { name: "Вид проверок" })).toContainText("Только пакетные");
+});
+
+test("длинное слово в цели переносится и не растягивает историю", async ({ app }) => {
+  const goal = "a".repeat(300);
+  await app.route("**/api/monitoring/history*", (route) => route.fulfill({ json: { total: 1, records: [{
+    at: new Date().toISOString(), goal, violations: [], department_id: "AGD", login: "key:load-test",
+    mode: "single", batch_id: null, status: "VIOLATIONS_FOUND", ms: 17_500, cached: false, queue_ms: 0,
+  }] } }));
+  await go(app, "Мониторинг");
+  const table = app.locator("#monitoringHistory");
+  await expect(table).toContainText("aaaa");
+  // Таблица помещается в карточку: прокрутки вбок нет.
+  const fits = await table.evaluate((t) => t.parentElement!.scrollWidth <= t.parentElement!.clientWidth);
+  expect(fits).toBe(true);
+});
