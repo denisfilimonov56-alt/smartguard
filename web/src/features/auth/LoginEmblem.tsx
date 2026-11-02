@@ -18,9 +18,10 @@ import logo from "../../assets/logo.png";
    - свечение — не постобработка (bloom давал квадратные ореолы), а «ореолы»:
      первые HALO частиц второй раз рисуются крупными пятнами с гауссовым спадом;
    - качество снижается ступенями по фактическому FPS и обратно не растёт:
-     0 — полная плотность пикселей; 1 — плотность 1; 2 — без ореолов;
-     3 — половина частиц и плотность 0.75. Слабая машина (≤4 ядер или ≤4 ГБ)
-     сразу стартует с уровня 1 и с меньшим числом частиц.
+     0 — полная плотность пикселей; 1 — плотность 1; 2 — ореолов вдвое меньше;
+     3 — половина частиц и плотность 0.75. Яркость на ступенях не падает: оставшиеся
+     ореолы вдвое сильнее, частицы на ступени 3 крупнее. Слабая машина (≤4 ядер
+     или ≤4 ГБ) сразу стартует с уровня 1 и с меньшим числом частиц.
    Без WebGL показывается обычная картинка эмблемы. */
 
 interface Signals { active: boolean; leaving: boolean }
@@ -169,7 +170,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     for (let i = 0; i < N; i++) tones[tone[i]].toArray(COL, i * 3);
     colAttr.needsUpdate = true;
     bg.set(dark ? 0x0f1218 : 0xf8f9fb);
-    uni.uHalo.value = dark ? .11 : .056;
+    applyHalo();
     dustMat.color.set(dark ? 0x4d97ff : 0x8ab8f8);
     for (const r of rings) r.material.color.set(dark ? 0x4d97ff : 0x0c6ff1);
   }
@@ -203,16 +204,17 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     group.position.set(nx || part ? 0 : Math.min(3.9, halfW - 3.6), nx ? 2.2 : 0, 0);
     const k = parseFloat(getComputedStyle(canvas).getPropertyValue("--emblem-scale")) || 1;   // увеличение задаётся в styles.css
     group.scale.setScalar(nx ? .62 : part ? Math.min(1, halfW / 6) * k : 1);   // орбиты ~12 единиц в ширину
-    uni.uSize.value = nx ? 2.5 : 3.1;
+    uni.uSize.value = (nx ? 2.5 : 3.1) * (level >= 3 ? 1.35 : 1);   // половина частиц — каждая крупнее
     redrawIfStopped();   // анимация остановлена — setSize очистил холст, рисуем кадр заново
   }
   function redrawIfStopped() { if (still) draw(30, .016); else if (frozen) draw(now(), 1); }
   function applyLevel() {
     renderer.setPixelRatio(prFor(level)); uni.uPR.value = renderer.getPixelRatio();
-    halo.visible = level < 2; geo.setDrawRange(0, level >= 3 ? N >> 1 : N); resize();
+    haloGeo.setDrawRange(0, level >= 2 ? HALO >> 1 : HALO); geo.setDrawRange(0, level >= 3 ? N >> 1 : N);
+    applyHalo(); resize();
   }
-  const pointer = { x: 0, y: 0, sx: 0, sy: 0 };
-  const onMove = (e: PointerEvent) => { pointer.x = e.clientX / innerWidth * 2 - 1; pointer.y = -(e.clientY / innerHeight * 2 - 1); };
+  // ореолов вдвое меньше — каждый вдвое сильнее, общее свечение то же
+  function applyHalo() { uni.uHalo.value = (darkNow ? .11 : .056) * (level >= 2 ? 2 : 1); }
   let rotY = 0, act = 0;
   function draw(t: number, dt: number) {
     uni.uTime.value = t; uni.uP.value = t - t0;
@@ -224,12 +226,11 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     } else if (!leaving && warping) {      // вход не начался (ошибка) — эмблема собирается обратно
       morph(EMB, 2.4, 1); warping = false;
     }
-    pointer.sx += (pointer.x - pointer.sx) * Math.min(1, dt * 3); pointer.sy += (pointer.y - pointer.sy) * Math.min(1, dt * 3);
     rotY += (Math.sin(t * .35) * .38 - rotY) * Math.min(1, dt * 2);
     // эмблема правее центра, камера видит её под углом: базовый поворот — лицом к камере,
     // иначе одинаковое покачивание кажется сильнее в одну сторону
     const face = Math.atan2(-group.position.x, camera.position.z - group.position.z);
-    group.rotation.y = face + rotY + pointer.sx * .12; group.rotation.x = -pointer.sy * .12;
+    group.rotation.y = face + rotY;   // покачивается сама, за курсором не следит
     act += ((active ? 1 : 0) - act) * Math.min(1, dt * 3);
     uni.uActive.value = act;
     rings.forEach((r, i) => { r.rotation.z = t * (i ? -.08 : .12); });
@@ -259,13 +260,12 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   }
 
   const ro = new ResizeObserver(resize); ro.observe(canvas);
-  addEventListener("pointermove", onMove);
   applyLevel();
   if (still) { t0 = -30; draw(30, .016); } else frame();
   requestAnimationFrame(() => canvas.classList.add("is-ready"));   // первый кадр нарисован — проявляем
 
   return () => {
-    cancelAnimationFrame(raf); ro.disconnect(); themeWatch.disconnect(); removeEventListener("pointermove", onMove);
+    cancelAnimationFrame(raf); ro.disconnect(); themeWatch.disconnect();
     for (const o of [geo, haloGeo, dustGeo, mat, haloMat, dustMat, ...rings.flatMap((r) => [r.geometry, r.material])]) o.dispose();
     renderer.dispose();
   };

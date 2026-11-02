@@ -178,7 +178,7 @@ b,strong{font-weight:600}
 .login-theme:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 .login-theme svg{width:18px;height:18px}
 .login-screen > :is(.login-head,.login-main,.login-foot){grid-column:1;position:relative;padding-left:var(--login-x);padding-right:var(--login-x)}
-.login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.4;
+.login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.15;
   opacity:0;transition:opacity 1.2s cubic-bezier(.4,0,.2,1)}
 .login-emblem.is-ready{opacity:1}   /* LoginEmblem ставит класс после первого кадра */
 .login-emblem-fallback{position:absolute;z-index:-1;top:50%;right:25%;width:min(300px,30vw);transform:translate(50%,-50%)}
