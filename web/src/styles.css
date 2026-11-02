@@ -159,55 +159,61 @@ b,strong{font-weight:600}
   background:radial-gradient(40% 55% at 50% 44%,var(--soft) 0%,transparent 72%)}
 .login-card{width:min(440px,100%);padding:36px 44px;box-sizing:border-box}
 
-/* Экран входа: во весь экран canvas с эмблемой из частиц (LoginEmblem), слева текст и кнопка.
-   Только белый вариант: токены цвета здесь переопределены светлыми значениями, чтобы и в тёмной
-   теме экран, предупреждения и спиннер оставались светлыми. */
+/* Экран входа: слева синяя карточка (фон hero-bg, как блок ввода цели) с названием, крупным заголовком
+   у нижнего края и кнопкой, справа на фоне сайта эмблема из частиц (LoginEmblem; холст сужен до правой
+   половины, эмблема встаёт по его центру). Токены цвета переопределены светлыми значениями, чтобы
+   и в тёмной теме экран, предупреждения и спиннер оставались светлыми. */
 .login-screen{
-  --brand:#0c6ff1; --brand-2:#0a5bd1; --ink:#0f1626; --ink-2:#4b4f58; --ink-3:#8b909a;
-  --line:#e2e5eb; --soft:#e8f1ff; --soft-2:#d5e5ff; --panel:#fff;
+  --brand:#0c6ff1; --brand-2:#0a5bd1; --ink:#111111; --ink-2:#4b4f58; --ink-3:#8b909a;
+  --line:#e2e5eb; --line-soft:#eef0f4; --bg:#f8f9fb; --soft:#e8f1ff; --soft-2:#d5e5ff; --panel:#fff;
   --warn:#a15c00; --warn-soft:#fff3dc; --danger:#c0342b; --danger-soft:#fdecea;
+  --login-x:clamp(40px,6vw,96px);
   color-scheme:light;
   position:relative;isolation:isolate;min-height:100%;box-sizing:border-box;overflow:hidden;
-  display:grid;grid-template-rows:auto 1fr auto;
-  padding:28px max(16px,3vw) 24px clamp(16px,7vw,120px);background:#fff;color:var(--ink)}
-/* белая вуаль слева: эмблема не спорит с текстом */
-.login-screen::after{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
-  background:linear-gradient(90deg,rgba(255,255,255,.94) 0%,rgba(255,255,255,.6) 34%,rgba(255,255,255,0) 58%)}
-.login-emblem{position:absolute;inset:0;z-index:-2;display:block;width:100%;height:100%}
-.login-emblem-fallback{position:absolute;z-index:-2;top:50%;right:14%;width:min(300px,30vw);transform:translateY(-50%)}
-.login-head{font-weight:700;font-size:17px;line-height:22px;letter-spacing:-.01em}
-.login-main{align-self:center;display:flex;flex-direction:column;align-items:flex-start;max-width:min(780px,100%)}
-.login-tag{display:flex;align-items:center;gap:10px;font-size:12px;line-height:16px;font-weight:600;letter-spacing:.16em;
-  text-transform:uppercase;color:#2f7ff2;animation:login-rise 1s .15s cubic-bezier(.2,.8,.2,1) both}
-.login-tag::before{content:"";width:28px;height:1.5px;background:currentColor;opacity:.7}
-.login-main h1{margin:18px 0 0;font-size:clamp(40px,6.2vw,84px);line-height:1.02;font-weight:700;letter-spacing:-.045em;
-  animation:login-rise 1s .25s cubic-bezier(.2,.8,.2,1) both}
-.login-main h1 .accent{background:linear-gradient(100deg,#0a2e7a 0%,#2f7ff2 45%,#0c6ff1 100%);
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-.login-main .alert{margin-top:20px;max-width:440px}
+  display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr auto;background:var(--bg);color:#fff}
+.login-screen::before{content:"";grid-row:1 / 4;grid-column:1;margin:20px 0 20px 20px;border-radius:var(--r-xl);
+  background:var(--deep) url(./assets/hero-bg.svg) center / cover no-repeat;box-shadow:0 18px 48px rgba(12,111,241,.25)}
+.login-screen > :is(.login-head,.login-main,.login-foot){grid-column:1;position:relative;padding-left:var(--login-x);padding-right:var(--login-x)}
+.login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.4}
+.login-emblem-fallback{position:absolute;z-index:-1;top:50%;right:25%;width:min(300px,30vw);transform:translate(50%,-50%)}
+.login-head{grid-row:1;padding-top:68px;font-weight:700;font-size:15px;line-height:20px;letter-spacing:-.01em}
+.login-head small{display:block;margin-top:2px;font-weight:400;font-size:11px;line-height:1.35;letter-spacing:0;color:rgba(255,255,255,.7)}
+.login-main{grid-row:2;align-self:end;padding-bottom:56px;display:flex;flex-direction:column;align-items:flex-start;
+  animation:login-rise .8s .15s cubic-bezier(.2,.8,.2,1) both}
+.login-tag{display:flex;align-items:center;gap:10px;font-size:12px;line-height:16px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;color:rgba(255,255,255,.72)}
+.login-tag::before{content:"";width:28px;height:1.5px;background:rgba(255,255,255,.5)}
+.login-main h1{margin:14px 0 0;font-size:clamp(36px,4.4vw,64px);line-height:1.04;font-weight:700;letter-spacing:-.03em;color:#fff}
+.login-main .alert{margin-top:20px;max-width:440px;color:var(--ink)}
 @keyframes login-rise{from{transform:translateY(.45em);filter:blur(10px);opacity:.15}to{transform:none;filter:none;opacity:1}}
-/* Кнопка: при наведении меняется цвет и вправо удлиняется стрелка (древко растёт, наконечник сдвигается). */
-.login-btn{margin-top:44px;display:inline-flex;align-items:center;gap:14px;height:60px;padding:0 34px 0 38px;border:0;
-  border-radius:999px;font:inherit;font-size:17px;font-weight:600;color:#fff;cursor:pointer;background:var(--brand);
-  box-shadow:0 10px 36px -10px rgba(12,111,241,.35);animation:login-rise 1s .5s cubic-bezier(.2,.8,.2,1) both}
-.login-btn:hover{background:#2b80f4}
-.login-btn:focus-visible{outline:2px solid #2f7ff2;outline-offset:4px}
-.login-btn[disabled]{cursor:progress;background:var(--brand)}
-.login-btn .spinner{border-color:rgba(255,255,255,.35);border-top-color:#fff}
+/* Кнопка — белая «пилюля», как главная кнопка на синем блоке ввода цели (.hero .btn.primary):
+   при наведении светло-голубая и вправо удлиняется стрелка (древко растёт, наконечник сдвигается). */
+.login-btn{margin-top:36px;display:inline-flex;align-items:center;gap:12px;height:52px;padding:0 28px 0 32px;
+  border:1.5px solid #fff;border-radius:50px;font:inherit;font-size:16px;font-weight:600;color:var(--brand);cursor:pointer;
+  background:#fff;transition:background .15s,border-color .15s}
+.login-btn:hover{background:var(--soft);border-color:var(--soft)}
+.login-btn:focus-visible{outline:2px solid #fff;outline-offset:3px}
+.login-btn[disabled]{cursor:progress;background:#fff;border-color:#fff}
+.login-btn .spinner{border-color:var(--soft-2);border-top-color:var(--brand)}
 .login-btn svg{overflow:visible}
 .login-btn .shaft,.login-btn .head{transition:transform .28s cubic-bezier(.2,.8,.2,1)}
 .login-btn .shaft{transform-box:fill-box;transform-origin:left center}
 .login-btn:hover .shaft,.login-btn:focus-visible .shaft{transform:scaleX(1.6)}
 .login-btn:hover .head,.login-btn:focus-visible .head{transform:translateX(6px)}
-.login-foot{display:flex;justify-content:flex-end;font-size:12.5px;line-height:18px;color:var(--ink-3)}
+.login-foot{grid-row:3;padding-bottom:68px;font-size:12.5px;line-height:18px;color:rgba(255,255,255,.6)}
+/* Узкий экран: эмблема сверху во всю ширину, синяя карточка снизу со скруглёнными верхними углами. */
 @media (max-width:760px){
-  .login-screen::after{background:linear-gradient(0deg,rgba(255,255,255,.95) 0%,rgba(255,255,255,.6) 45%,rgba(255,255,255,.1) 75%)}
-  .login-main{align-self:end;margin-bottom:28px}
-  .login-btn{margin-top:28px}
-  .login-emblem-fallback{top:18%;right:50%;transform:translate(50%,-50%);width:160px}
+  .login-screen{--login-x:24px;grid-template-columns:1fr;grid-template-rows:1fr auto auto auto}
+  .login-screen::before{grid-row:2 / 5;margin:0;border-radius:var(--r-xl) var(--r-xl) 0 0}
+  .login-head{grid-row:1;align-self:start;padding-top:24px;color:var(--ink)}
+  .login-head small{color:var(--ink-3)}
+  .login-main{grid-row:3;padding-top:36px;padding-bottom:0}
+  .login-foot{grid-row:4;padding-top:28px;padding-bottom:28px}
+  .login-emblem{left:0;width:100%}
+  .login-emblem-fallback{top:18%;right:50%;width:160px}
 }
 @media (prefers-reduced-motion:reduce){
-  .login-tag,.login-main h1,.login-btn{animation:none}
+  .login-main{animation:none}
   .login-btn .shaft,.login-btn .head{transition:none}
 }
 
