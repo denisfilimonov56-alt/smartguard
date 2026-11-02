@@ -1,12 +1,14 @@
-# Работающий стек в интернет не ходит. Сеть нужна только при релизе
-# (docs/release.md): скачать образы, собрать API и интерфейс (pip и npm)
-# и докачать веса модели — после этого стек поднимается без сети.
+# Работающий стек в интернет не ходит. Сеть нужна только при первом запуске
+# и релизе (docs/release.md): скачать образы, собрать API и интерфейс (pip и
+# npm) и докачать веса модели — после этого стек поднимается без сети.
 #
-#   * pull_policy: ${PULL_POLICY:-never} — compose сам в реестр не ходит;
-#     образы скачиваются только при релизе: PULL_POLICY=always docker compose pull.
-#   * Веса модели читаются из локального каталога ${MODELS_DIR}, а не
-#     скачиваются с Hugging Face; HF_HUB_OFFLINE запрещает любые попытки.
-#     Скачивает их при релизе разовый сервис model (профиль release).
+#   * pull_policy: missing — образ скачивается, только если его нет локально:
+#     первый запуск качает, последующие берут скачанный. Новый тег в релизе —
+#     новый образ, он скачается так же.
+#   * Веса модели читаются из локального каталога
+#     ${MODELS_DIR}/${VLLM_MODEL_DIR}, а не скачиваются с Hugging Face;
+#     HF_HUB_OFFLINE запрещает любые попытки. Веса кладут в каталог отдельно,
+#     compose только монтирует его.
 #
 #   * Наружу может быть опубликован только интерфейс (порт 3000, адрес — в
 #     WEB_BIND). Neo4j, vLLM и API слушают 127.0.0.1: у Neo4j
@@ -36,7 +38,7 @@ x-logging: &default-logging
 services:
   neo4j:
     image: neo4j:5.26
-    pull_policy: ${PULL_POLICY:-never}
+    pull_policy: missing
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -95,7 +97,7 @@ services:
     # Тег зафиксирован: «latest» означал бы «что скачалось при последнем
     # релизе», а версия должна быть видна в конфигурации.
     image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
-    pull_policy: ${PULL_POLICY:-never}
+    pull_policy: missing
     restart: unless-stopped
     logging: *default-logging
     labels:
@@ -306,7 +308,7 @@ services:
   # AUTOHEAL_REPLICAS=0 и systemd-таймер (docs/deployment.md).
   autoheal:
     image: ${AUTOHEAL_IMAGE:-willfarrell/autoheal:1.2.0}
-    pull_policy: ${PULL_POLICY:-never}
+    pull_policy: missing
     restart: unless-stopped
     logging: *default-logging
     network_mode: none
@@ -321,50 +323,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     deploy:
       replicas: ${AUTOHEAL_REPLICAS:-1}
-
-  # Разовый сервис релиза: скачивает (докачивает) веса модели с Hugging Face
-  # в ${MODELS_DIR}/${VLLM_MODEL_DIR} и проверяет, что все шарды на месте.
-  # Профиль release: при docker compose up не запускается, только явно —
-  #   PULL_POLICY=always docker compose run --rm model
-  # Закрытая модель — HF_TOKEN=<токен> перед командой.
-  model:
-    # Тот же базовый образ, что у API (api/Dockerfile).
-    image: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
-    pull_policy: ${PULL_POLICY:-never}
-    profiles: ["release"]
-    restart: "no"
-    logging: *default-logging
-    environment:
-      VLLM_MODEL: ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
-      VLLM_MODEL_DIR: ${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
-      HF_TOKEN: ${HF_TOKEN:-}
-      HF_HUB_DISABLE_TELEMETRY: "1"
-    volumes:
-      - ${MODELS_DIR:-./models}:/models
-    # hf download идемпотентен: скачанное не качает заново, прерванное
-    # докачивает. config.json появляется первым, шарды — последними, поэтому
-    # после загрузки сверяются все файлы из model.safetensors.index.json.
-    command:
-      - bash
-      - -ec
-      - |
-        pip install --quiet --disable-pip-version-check --root-user-action=ignore "huggingface_hub[cli]"
-        hf download "$$VLLM_MODEL" --local-dir "/models/$$VLLM_MODEL_DIR" \
-          --exclude "*.pth" --exclude "original/*" --exclude "*.gguf"
-        python - <<'PY'
-        import json, os, pathlib, sys
-        d = pathlib.Path("/models", os.environ["VLLM_MODEL_DIR"])
-        index = d / "model.safetensors.index.json"
-        if index.is_file():
-            shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
-        else:
-            shards = sorted(p.name for p in d.glob("*.safetensors"))
-        bad = [s for s in shards if not (d / s).is_file() or (d / s).stat().st_size == 0]
-        if not (d / "config.json").is_file() or not shards or bad:
-            sys.exit(f"веса в {d} неполные: {bad or 'нет config.json или *.safetensors'} — запустите ещё раз")
-        size = sum((d / s).stat().st_size for s in shards) / 2**30
-        print(f"веса на месте: {d}, шардов {len(shards)}, {size:.1f} ГБ")
-        PY
 
 volumes:
   neo4j_data:
