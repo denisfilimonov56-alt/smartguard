@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -338,6 +339,8 @@ app.add_middleware(Guard)
 # Опрос, который интерфейс повторяет каждые несколько секунд, пока раздел открыт:
 # удачные ответы не журналируются, иначе строки опроса вытеснили бы действия.
 POLL_PATHS = {"/monitoring/now", "/catalog/examples-check"}
+# Ход проверки интерфейс спрашивает несколько раз в секунду (номер — в пути).
+POLL_PREFIXES = ("/check-progress/", "/batch-progress/")
 
 
 def _audit_request(request: Request, path: str, status: int, started: float, body: Optional[str]) -> None:
@@ -360,7 +363,7 @@ def _audit_request(request: Request, path: str, status: int, started: float, bod
         audit.anonymous("request", audit.client_ip(request), **fields,
                         query=query[:audit.ANONYMOUS_QUERY_MAX] if query else None)
         return
-    if not unsafe and status < 400 and path.rstrip("/") in POLL_PATHS:
+    if not unsafe and status < 400 and (path.rstrip("/") in POLL_PATHS or path.startswith(POLL_PREFIXES)):
         return
     audit.event("request", login=user.login, role=user.role, ip=audit.client_ip(request), **fields,
                 query=query[:audit.QUERY_MAX] if query else None, body=body)
@@ -433,21 +436,87 @@ async def _admit_check(request: Request):
         check_admission.leave(key)
 
 
+# Ход проверки для интерфейса: X-Check-Id в POST /check-goal и /check-goals,
+# опрос — GET /check-progress/{id} и /batch-progress/{id}. Только пользователю
+# с сессией и только свой: внешней системе с ключом ход не пишется, ответы
+# проверки для неё те же. Ход живёт в памяти процесса API (он один: uvicorn
+# без --workers); законченный хранится PROGRESS_KEEP_SECONDS — интерфейс берёт
+# последний снимок после ответа, — а записей не больше PROGRESS_MAX: сверх него
+# проверка идёт без хода.
+PROGRESS_KEEP_SECONDS = 60.0
+PROGRESS_MAX = 1000
+CHECK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_progress: dict[tuple[str, str], tuple[str, Any]] = {}
+_progress_lock = threading.Lock()
+
+
+def _start_progress(kind: str, request: Request, user: auth.Principal, make) -> Optional[Any]:
+    """Завести ход проверки (kind — check или batch), если интерфейс прислал X-Check-Id.
+
+    None — ход не нужен (ключ внешней системы, нет или кривой заголовок) или
+    этот номер уже занят: чужой ход им не подменить.
+    """
+    check_id = request.headers.get("x-check-id")
+    if not check_id or user.role == auth.SERVICE_ROLE or not CHECK_ID_RE.match(check_id):
+        return None
+    now = time.monotonic()
+    with _progress_lock:
+        for key, (_, trace) in list(_progress.items()):
+            if trace.finished is not None and now - trace.finished > PROGRESS_KEEP_SECONDS:
+                del _progress[key]
+        if (kind, check_id) in _progress or len(_progress) >= PROGRESS_MAX:
+            return None
+        trace = make()
+        _progress[(kind, check_id)] = (user.login, trace)
+    return trace
+
+
+def _progress_view(kind: str, check_id: str, user: auth.Principal) -> dict[str, Any]:
+    with _progress_lock:
+        entry = _progress.get((kind, check_id))
+    # Чужой ход — как несуществующий: по 404 не узнать, что номер занят.
+    if entry is None or entry[0] != user.login:
+        raise HTTPException(status_code=404, detail="Проверка не найдена" if kind == "check" else "Пакет не найден")
+    return entry[1].view()
+
+
+@app.get("/check-progress/{check_id}")
+async def check_progress(check_id: str, user: auth.Principal = Depends(auth.viewer)):
+    """Ход проверки цели, запущенной интерфейсом с X-Check-Id (тип CheckProgress)."""
+    return _progress_view("check", check_id, user)
+
+
+@app.get("/batch-progress/{check_id}")
+async def batch_progress(check_id: str, user: auth.Principal = Depends(auth.viewer)):
+    """Ход пакетного запроса, запущенного интерфейсом с X-Check-Id (тип BatchProgress)."""
+    return _progress_view("batch", check_id, user)
+
+
 @app.post("/check-goal", dependencies=[Depends(_admit_check)])
 async def check(request: Request, req: GoalRequest, user: auth.Principal = Depends(auth.checker)):
     """Проверка цели на соответствие действующим приказам."""
+    trace = _start_progress("check", request, user, agent.CheckTrace)
 
     def work() -> dict[str, Any]:
-        auth.spend_checks(user, 1)
-        metrics.set_actor(user.login)
+        result = None
         try:
-            return check_goal(req.goal, department_id=req.department_id, is_student=req.is_student)
+            auth.spend_checks(user, 1)
+            metrics.set_actor(user.login)
+            with agent.tracing(trace):
+                result = check_goal(req.goal, department_id=req.department_id, is_student=req.is_student)
+            return result
         finally:
             # Поток пула переиспользуется: следующий запрос в нём не должен считаться чужим.
             metrics.set_actor(None)
+            if trace is not None:
+                trace.finish(result)
 
     limiter = getattr(request.app.state, "check_limiter", None)
-    return await anyio.to_thread.run_sync(work, limiter=limiter)
+    try:
+        return await anyio.to_thread.run_sync(work, limiter=limiter)
+    finally:
+        if trace is not None:
+            trace.finish()  # до потока не дошло (обрыв, отмена): ход не должен висеть «идущим»
 
 
 class SuggestProblem(BaseModel):
@@ -579,6 +648,7 @@ async def check_many(request: Request, items: list[schemas.GoalItem] = Body(...,
             detail=f"За один раз можно проверить не более {MAX_BATCH} целей, передано {len(items)}",
         )
     stop = threading.Event()
+    trace = _start_progress("batch", request, user, lambda: agent.BatchTrace(len(items)))
 
     def work() -> dict[str, Any]:
         if not settings.flag("bulkChecks"):
@@ -596,7 +666,8 @@ async def check_many(request: Request, items: list[schemas.GoalItem] = Body(...,
             spent = auth.spend_checks(user, len(items))
             metrics.set_actor(user.login)
             try:
-                outcome = _run_batch([item.model_dump() for item in items], stop)
+                with agent.tracing_batch(trace):
+                    outcome = _run_batch([item.model_dump() for item in items], stop)
             finally:
                 metrics.set_actor(None)
             # Непроверенные цели (пакет остановлен) клиент отправит снова:
@@ -608,7 +679,11 @@ async def check_many(request: Request, items: list[schemas.GoalItem] = Body(...,
         finally:
             _bulk_requests.release()
 
-    return await _until_done(request, work, stop)
+    try:
+        return await _until_done(request, work, stop)
+    finally:
+        if trace is not None:
+            trace.finish()
 
 
 @app.get("/check-targets", dependencies=VIEWER)
