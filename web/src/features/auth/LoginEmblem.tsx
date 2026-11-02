@@ -143,12 +143,24 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const halo = new THREE.Points(haloGeo, haloMat);
   group.add(halo, new THREE.Points(geo, mat));
 
-  // пунктирные орбиты вокруг эмблемы
+  // Пунктирные орбиты: каждый штрих — 4 мягкие круглые точки (сглаженные, как частицы; линии
+  // WebGL без сглаживания шли лесенкой). Орбиты в своей группе: место и масштаб как у эмблемы,
+  // но её покачивание не наследуют — иначе эллипсы перекашивались.
+  const orbits = new THREE.Group(); scene.add(orbits);
+  const ringColor = { value: new THREE.Color(0x0c6ff1) };
   const rings = ([[3.9, .4], [5.1, .24]] as const).map(([r, o]) => {
-    const ring = new THREE.LineLoop(
-      new THREE.BufferGeometry().setFromPoints(new THREE.EllipseCurve(0, 0, r, r).getPoints(160).map((p) => new THREE.Vector3(p.x, p.y, 0))),
-      new THREE.LineDashedMaterial({ color: 0x0c6ff1, transparent: true, opacity: o, dashSize: .12, gapSize: .2 }));
-    ring.computeLineDistances(); ring.rotation.x = 1.25; group.add(ring); return ring;
+    const pts: number[] = [];
+    for (let a = 0, step = .04 / r; a < Math.PI * 2 - .2 / r; a += .32 / r)
+      for (let j = 0; j < 4; j++) pts.push(Math.cos(a + j * step) * r, Math.sin(a + j * step) * r, 0);
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+    const ring = new THREE.Points(g, new THREE.ShaderMaterial({
+      uniforms: { uPR: uni.uPR, uC: ringColor, uO: { value: o } }, transparent: true, depthWrite: false,
+      vertexShader: `uniform float uPR; void main(){ gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); gl_PointSize = 2.4 * uPR; }`,
+      fragmentShader: `uniform vec3 uC; uniform float uO;
+        void main(){ float d = length(gl_PointCoord - .5); gl_FragColor = vec4(uC, uO * smoothstep(.5, .1, d));
+          #include <colorspace_fragment>
+        }` }));
+    ring.rotation.x = 1.25; orbits.add(ring); return ring;
   });
   // фоновая пыль — по одной вершине на точку
   const dustGeo = new THREE.BufferGeometry();
@@ -172,7 +184,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     bg.set(dark ? 0x0f1218 : 0xf8f9fb);
     uni.uHalo.value = dark ? .11 : .056;
     dustMat.color.set(dark ? 0x4d97ff : 0x8ab8f8);
-    for (const r of rings) r.material.color.set(dark ? 0x4d97ff : 0x0c6ff1);
+    ringColor.value.set(dark ? 0x4d97ff : 0x0c6ff1);
   }
   applyTheme();
   const themeWatch = new MutationObserver(() => { applyTheme(); redrawIfStopped(); });
@@ -204,6 +216,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     group.position.set(nx || part ? 0 : Math.min(3.9, halfW - 3.6), nx ? 2.2 : 0, 0);
     const k = parseFloat(getComputedStyle(canvas).getPropertyValue("--emblem-scale")) || 1;   // увеличение задаётся в styles.css
     group.scale.setScalar(nx ? .62 : part ? Math.min(1, halfW / 6) * k : 1);   // орбиты ~12 единиц в ширину
+    orbits.position.copy(group.position); orbits.scale.copy(group.scale);
     uni.uSize.value = nx ? 2.5 : 3.1;
     redrawIfStopped();   // без анимации setSize очистил холст — рисуем кадр заново
   }
@@ -228,6 +241,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     // иначе одинаковое покачивание кажется сильнее в одну сторону
     const face = Math.atan2(-group.position.x, camera.position.z - group.position.z);
     group.rotation.y = face + rotY;   // покачивается сама, за курсором не следит
+    orbits.rotation.y = face;
     rings.forEach((r, i) => { r.rotation.z = t * (i ? -.08 : .12); });
     renderer.render(scene, camera);
   }
