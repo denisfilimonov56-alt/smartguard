@@ -3,10 +3,8 @@
 # идёт через корпоративный Keycloak.
 #
 # На стенде файл подключает .env стенда (COMPOSE_FILE), то есть обычные
-# docker compose up / pull / ps видят оба файла. Явно, с надстройкой для
-# разработки:
-#   docker compose -f docker-compose.yml -f docker-compose.stand.yml \
-#     -f docker-compose.online.yml up -d --build
+# docker compose up / pull / ps видят оба файла. Явно:
+#   docker compose -f docker-compose.yml -f docker-compose.stand.yml up -d
 #
 # Realm, клиент интерфейса и учётка стенда импортируются из keycloak/ при
 # первом старте; данные (сессии, смена пароля) живут в томе keycloak_data.
@@ -20,8 +18,7 @@ x-logging: &default-logging
 services:
   keycloak:
     image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.3}
-    # Стенду можно скачать образ, если его нет; PULL_POLICY=never — запретить.
-    pull_policy: ${PULL_POLICY:-missing}
+    pull_policy: missing
     restart: unless-stopped
     logging: *default-logging
     command: ["start-dev", "--import-realm"]

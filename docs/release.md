@@ -86,16 +86,16 @@ git status --short                  # кроме .env правок быть не
 ### 6. Образы Neo4j, vLLM и autoheal
 
 ```bash
-PULL_POLICY=always docker compose pull --ignore-buildable
+docker compose pull --ignore-buildable
 ```
 
-`PULL_POLICY=always` разрешает compose скачивать образы (по умолчанию у всех
-сервисов `pull_policy: never`), `--ignore-buildable` пропускает API и
+Скачиваются только образы, которых ещё нет на сервере (`pull_policy:
+missing`): тег не менялся — команда ничего не качает. `--ignore-buildable` пропускает API и
 интерфейс — их не скачивают, а собирают на шаге 7
-([подробнее](deployment.md#шаг-10-образы-сборка-и-веса-модели)).
+([подробнее](deployment.md#шаг-10-образы-и-сборка)).
 
 Модель на другом сервере (`VLLM_REPLICAS=0`) — образ vLLM (около 10 ГБ)
-не нужен: `PULL_POLICY=always docker compose pull neo4j autoheal`
+не нужен: `docker compose pull neo4j autoheal`
 (без autoheal, если `AUTOHEAL_REPLICAS=0`).
 
 ### 7. Сборка API и интерфейса
@@ -111,16 +111,10 @@ npm — по `web/package-lock.json`. Ошибка сборки останавл
 
 ### 8. Веса модели
 
-Только для локальной модели:
-
-```bash
-PULL_POLICY=always docker compose run --rm model
-```
-
-Скачивается только недостающее: если модель в релизе не менялась, команда
-быстро закончится проверкой шардов. Прервалось — запустите ещё раз.
-Закрытая модель — с токеном:
-`HF_TOKEN=hf_… PULL_POLICY=always docker compose run --rm model`.
+Только для локальной модели и только если модель в релизе меняется. Веса
+docker не скачивает: положите новую модель в каталог внутри `MODELS_DIR` и
+укажите его в `VLLM_MODEL_DIR` в `.env` (имя для API — `VLLM_MODEL`).
+Прежний каталог не удаляйте до проверки — он нужен для отката.
 
 ### 9. Переключение на новую версию
 
@@ -131,8 +125,7 @@ docker compose up -d --no-build
 ```
 
 Compose пересоздаёт контейнеры, у которых поменялись образ или настройки.
-Без `PULL_POLICY` он ничего не скачивает: недостающий образ даёт ошибку,
-а не тихую загрузку.
+Все образы уже на сервере (шаги 6–7), поэтому он ничего не скачивает.
 
 ### 10. Проверка
 
@@ -199,7 +192,6 @@ overwritten» (git не охраняет игнорируемые файлы; п
 |---|---|
 | 6. `docker compose pull` | образы качает демон Docker, а не контейнер: прокси демона — `/etc/systemd/system/docker.service.d/http-proxy.conf` с `Environment="HTTPS_PROXY=http://proxy:3128"`, затем `systemctl daemon-reload && systemctl restart docker` (перезапуск демона перезапустит и стек — делайте до шага 9 или в окно обслуживания). В контейнеры прокси демона не попадает |
 | 7. `docker compose build` | `docker compose build --pull --build-arg HTTP_PROXY=http://proxy:3128 --build-arg HTTPS_PROXY=http://proxy:3128` — переменные действуют только на время сборки (pip, npm) и в образ не записываются |
-| 8. веса модели | `PULL_POLICY=always docker compose run --rm -e HTTPS_PROXY=http://proxy:3128 model` — прокси получает только разовый контейнер `model` |
 
 Если `proxies` в `config.json` всё же есть, проверьте после шага 9, что
 модель и вход работают: `curl -s localhost:8080/ready` — `llm: true`, вход в
@@ -270,7 +262,7 @@ Keycloak выдан внутренним ЦС, `KEYCLOAK_CA_FILE` (бывший 
 обычно годится — тот же корневой сертификат домена). Роли пользователей
 сохраняются: логин берётся из `preferred_username` Keycloak, для AD это тот же
 логин без домена. Каталог весов: `VLLM_MODEL_DIR` должен указывать на уже
-скачанный каталог в `MODELS_DIR`, иначе шаг 8 релиза скачает модель заново.
+скачанный каталог в `MODELS_DIR`, иначе vLLM не найдёт модель.
 
 **5. Шаги релиза 6–10**, затем проверка и выгрузка каталога уже новой
 версией:
