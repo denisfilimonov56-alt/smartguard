@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 
 import logo from "../../assets/logo.png";
 
-/* Эмблема из частиц на экране входа (three.js, WebGL). При загрузке частицы
-   слетаются из облака в эмблему, она мягко покачивается; пока курсор на кнопке
+/* Эмблема из частиц на экране входа (three.js, WebGL). При загрузке эмблема
+   уже собрана и плавно проявляется через прозрачность (класс is-ready на холсте,
+   переход в styles.css), затем мягко покачивается; пока курсор на кнопке
    «Войти» — цвет глубже и ореол сильнее; по нажатию частицы улетают на зрителя.
    Только белый вариант: частицы ложатся обычным наложением, у центра шеврона,
    крыльев и ромба свои оттенки синего (исходные на белом почти сливаются).
@@ -85,14 +86,12 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     src.push([x, y, px[i] < 40 ? 0 : px[i] > 110 ? 2 : 1]);
   }
   const TONES = [new THREE.Color(0x0a4fc4), new THREE.Color(0x2a7bf0), new THREE.Color(0x9cc5fa)];
-  const EMB = new Float32Array(N * 3), COL = new Float32Array(N * 3), SCATTER = new Float32Array(N * 3);
+  const EMB = new Float32Array(N * 3), COL = new Float32Array(N * 3);
   const delay = new Float32Array(N), seed = new Float32Array(N), scl = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const s = src[Math.floor(Math.random() * src.length)];
     EMB.set([((s[0] + Math.random() - .5) / W - .5) * S, -((s[1] + Math.random() - .5) / H - .5) * S * H / W, (Math.random() - .5) * .45], i * 3);
     TONES[s[2]].toArray(COL, i * 3);
-    const u = Math.random() * Math.PI * 2, v = Math.acos(2 * Math.random() - 1), r = 10 + Math.random() * 16;
-    SCATTER.set([Math.sin(v) * Math.cos(u) * r, Math.sin(v) * Math.sin(u) * r * .6, Math.cos(v) * r], i * 3);
     delay[i] = Math.random() * .9; seed[i] = Math.random() * 100; scl[i] = .55 + Math.random() * .9;
   }
 
@@ -104,8 +103,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   attr("color", COL, 3); attr("aDelay", delay, 1); attr("aSeed", seed, 1); attr("aScale", scl, 1);
   attr("position", new Float32Array(N * 3), 3);   // для three.js; настоящее положение — в шейдере
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 30);
-  const uni = { uP: { value: 0 }, uDur: { value: 1.8 }, uDK: { value: .6 },   // первая сборка ≈1,6 с
-    uTime: { value: 0 }, uNoise: { value: .035 },
+  const uni = { uP: { value: 0 }, uDur: { value: 2.6 }, uDK: { value: 1 }, uTime: { value: 0 }, uNoise: { value: .035 },
     uSize: { value: 3.1 }, uPR: { value: 1 }, uActive: { value: 0 } };
   const VS = `
     attribute vec3 aA, aB, color; attribute float aDelay, aSeed, aScale;
@@ -171,7 +169,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     B.set(to); aA.needsUpdate = aB.needsUpdate = true;
     uni.uDur.value = dur; uni.uDK.value = dk; t0 = now();
   }
-  A.set(still ? EMB : SCATTER); B.set(EMB);   // старт: из облака в эмблему
+  A.set(EMB); B.set(EMB);   // старт: эмблема уже собрана, появляется через прозрачность холста
 
   /* ---------- кадр ---------- */
   function resize() {
@@ -243,6 +241,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   addEventListener("pointermove", onMove);
   applyLevel();
   if (still) { t0 = -30; draw(30, .016); } else frame();
+  requestAnimationFrame(() => canvas.classList.add("is-ready"));   // первый кадр нарисован — проявляем
 
   return () => {
     cancelAnimationFrame(raf); ro.disconnect(); removeEventListener("pointermove", onMove);
