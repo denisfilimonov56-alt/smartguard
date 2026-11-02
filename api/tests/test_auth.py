@@ -9,6 +9,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi.testclient import TestClient
 
+import api_docs
 import apikeys
 import audit
 import auth
@@ -170,6 +171,24 @@ def test_swagger_is_off_by_default(app):
     client = client_for(app)
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+
+
+def test_swagger_knows_the_login_scheme_and_public_routes(app):
+    """Authorize в Swagger работает, открытые маршруты помечены открытыми, у каждого есть раздел."""
+    schema = app.openapi()
+    assert api_docs.PUBLIC_PATHS | {"/metrics"} == PUBLIC
+    assert schema["components"]["securitySchemes"]["bearer"]["scheme"] == "bearer"
+    assert schema["security"] == [{"bearer": []}]
+    for path, operations in schema["paths"].items():
+        for method, operation in operations.items():
+            assert operation.get("tags"), f"{method.upper()} {path} без раздела"
+            if path in PUBLIC:
+                assert operation["security"] == []
+            else:
+                assert "security" not in operation and "401" in operation["responses"], path
+    check = schema["paths"]["/check-goal"]["post"]["responses"]
+    assert check["200"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/CheckResult"}
+    assert "Retry-After" in check["429"]["headers"]
 
 
 def test_health_stays_public(app):

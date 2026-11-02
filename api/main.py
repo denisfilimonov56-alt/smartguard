@@ -22,6 +22,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import agent
+import api_docs
 import apikeys
 import audit
 import auth
@@ -219,9 +220,11 @@ DOCS = os.getenv("ENABLE_DOCS", "0").strip().lower() in ("1", "true", "yes", "on
 
 app = FastAPI(
     title="SmartGuard", version="1.0.0", lifespan=lifespan,
+    description=api_docs.DESCRIPTION, openapi_tags=api_docs.TAGS,
     docs_url="/docs" if DOCS else None, redoc_url=None,
     openapi_url="/openapi.json" if DOCS else None,
 )
+api_docs.install(app)
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 AUDIT_BODY_LIMIT = 2000
@@ -480,19 +483,20 @@ def _progress_view(kind: str, check_id: str, user: auth.Principal) -> dict[str, 
     return entry[1].view()
 
 
-@app.get("/check-progress/{check_id}")
+@app.get("/check-progress/{check_id}", tags=["check"], responses=api_docs.PROGRESS_RESPONSES)
 async def check_progress(check_id: str, user: auth.Principal = Depends(auth.viewer)):
     """Ход проверки цели, запущенной интерфейсом с X-Check-Id (тип CheckProgress)."""
     return _progress_view("check", check_id, user)
 
 
-@app.get("/batch-progress/{check_id}")
+@app.get("/batch-progress/{check_id}", tags=["check"], responses=api_docs.PROGRESS_RESPONSES)
 async def batch_progress(check_id: str, user: auth.Principal = Depends(auth.viewer)):
     """Ход пакетного запроса, запущенного интерфейсом с X-Check-Id (тип BatchProgress)."""
     return _progress_view("batch", check_id, user)
 
 
-@app.post("/check-goal", dependencies=[Depends(_admit_check)])
+@app.post("/check-goal", tags=["check"], dependencies=[Depends(_admit_check)],
+          responses=api_docs.CHECK_RESPONSES)
 async def check(request: Request, req: GoalRequest, user: auth.Principal = Depends(auth.checker)):
     """Проверка цели на соответствие действующим приказам."""
     trace = _start_progress("check", request, user, agent.CheckTrace)
@@ -530,7 +534,8 @@ class SuggestRequest(BaseModel):
         ..., min_length=1, max_length=20, description="Нарушения из ответа /check-goal: текст правила и как исправить")
 
 
-@app.post("/suggest-goal", dependencies=[Depends(_admit_check)])
+@app.post("/suggest-goal", tags=["check"], dependencies=[Depends(_admit_check)],
+          responses=api_docs.SUGGEST_RESPONSES)
 async def suggest(request: Request, req: SuggestRequest, user: auth.Principal = Depends(auth.checker)):
     """Рекомендованная формулировка цели, которая выполняет нарушенные правила.
 
@@ -628,7 +633,7 @@ async def _until_done(request: Request, work, stop: threading.Event) -> Any:
     return outcome["value"]
 
 
-@app.post("/check-goals")
+@app.post("/check-goals", tags=["check"], responses=api_docs.BATCH_RESPONSES)
 async def check_many(request: Request, items: list[schemas.GoalItem] = Body(..., description="Массив целей"),
                      user: auth.Principal = Depends(auth.checker)):
     """Пакетная проверка целей.
@@ -686,13 +691,13 @@ async def check_many(request: Request, items: list[schemas.GoalItem] = Body(...,
             trace.finish()
 
 
-@app.get("/check-targets", dependencies=VIEWER)
+@app.get("/check-targets", tags=["check"], dependencies=VIEWER, responses=api_docs.TARGETS_RESPONSES)
 def check_targets():
     """Словарь проверяемых атрибутов из графа (полезно для отладки и UI)."""
     return {"targets": graph.get_check_targets()}
 
 
-@app.get("/health")
+@app.get("/health", tags=["service"], responses=api_docs.HEALTH_RESPONSES)
 async def health():
     """Liveness: процесс жив.
 
@@ -716,7 +721,7 @@ def _not_ready(problem: str, **fields: Any) -> JSONResponse:
     })
 
 
-@app.get("/ready")
+@app.get("/ready", tags=["service"], responses=api_docs.READY_RESPONSES)
 async def ready(request: Request):
     """Readiness: зависимости доступны, граф заполнен и внутренне непротиворечив.
 
