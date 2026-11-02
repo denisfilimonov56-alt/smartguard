@@ -2,11 +2,12 @@ import { useState } from "react";
 
 import * as oidc from "../../lib/oidc";
 import { Spinner } from "../../ui/common";
+import { readTheme, saveTheme, type Theme } from "../../ui/theme";
 import { LoginEmblem } from "./LoginEmblem";
 
 /* Экран входа: слева синяя карточка с заголовком, строкой о пользе, тремя чипами
    возможностей и одной кнопкой, справа эмблема
-   из частиц (LoginEmblem). Только светлый вариант — в тёмной теме экран входа тоже светлый.
+   из частиц (LoginEmblem). Тема — общая с сайтом (ui/theme.ts), переключатель справа вверху.
    Логин и пароль здесь не спрашиваются: кнопка уводит на страницу входа
    Keycloak, оттуда возвращаются уже с токеном (lib/oidc.ts). */
 
@@ -22,6 +23,8 @@ export function LoginView({ notice }: { notice?: string }) {
   const [error, setError] = useState("");
   const [hover, setHover] = useState(false);
   const [focus, setFocus] = useState(false);
+  const [theme, setTheme] = useState<Theme>(readTheme);
+  const nextTheme: Theme = theme === "dark" ? "light" : "dark";
 
   async function start() {
     setBusy(true);
@@ -37,6 +40,14 @@ export function LoginView({ notice }: { notice?: string }) {
   return (
     <div className="login-screen">
       <LoginEmblem active={hover || focus} leaving={busy} />
+      <button type="button" className="login-theme" onClick={() => { setTheme(nextTheme); saveTheme(nextTheme); }}
+        aria-label={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"} title={nextTheme === "dark" ? "Тёмная тема" : "Светлая тема"}>
+        <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+          {nextTheme === "dark"
+            ? <path d="M17.3 11.3A7.4 7.4 0 1 1 8.7 2.7a5.8 5.8 0 0 0 8.6 8.6z" />
+            : <><circle cx="10" cy="10" r="3.6" /><path d="M10 1.5v2.2M10 16.3v2.2M1.5 10h2.2M16.3 10h2.2M4 4l1.55 1.55M14.45 14.45L16 16M4 16l1.55-1.55M14.45 5.55L16 4" /></>}
+        </svg>
+      </button>
       <header className="login-head">SmartGuard<small>проверка целей по приказам</small></header>
       <main className="login-main">
         <h1>Проверка целей<br />по приказам</h1>

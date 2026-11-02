@@ -161,18 +161,22 @@ b,strong{font-weight:600}
 
 /* Экран входа: слева синяя карточка (фон hero-bg, как блок ввода цели) с названием, крупным заголовком
    у нижнего края и кнопкой, справа на фоне сайта эмблема из частиц (LoginEmblem; холст сужен до правой
-   половины, эмблема встаёт по его центру). Токены цвета переопределены светлыми значениями, чтобы
-   и в тёмной теме экран, предупреждения и спиннер оставались светлыми. */
+   половины, эмблема встаёт по его центру). Цвета — токены темы сайта; справа вверху переключатель темы. */
 .login-screen{
-  --brand:#0c6ff1; --brand-2:#0a5bd1; --ink:#111111; --ink-2:#4b4f58; --ink-3:#8b909a;
-  --line:#e2e5eb; --line-soft:#eef0f4; --bg:#f8f9fb; --soft:#e8f1ff; --soft-2:#d5e5ff; --panel:#fff;
-  --warn:#a15c00; --warn-soft:#fff3dc; --danger:#c0342b; --danger-soft:#fdecea;
   --login-x:clamp(40px,6vw,96px);
-  color-scheme:light;
   position:relative;isolation:isolate;min-height:100%;box-sizing:border-box;overflow:hidden;
   display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr auto;background:var(--bg);color:#fff}
 .login-screen::before{content:"";grid-row:1 / 4;grid-column:1;margin:20px 0 20px 20px;border-radius:var(--r-xl);
   background:var(--deep) url(./assets/hero-bg.svg) center / cover no-repeat;box-shadow:0 18px 48px rgba(12,111,241,.25)}
+:root[data-theme="dark"] .login-screen::before{box-shadow:0 18px 48px rgba(0,0,0,.5);
+  background:linear-gradient(rgba(3,18,58,.42),rgba(3,18,58,.42)),var(--deep) url(./assets/hero-bg.svg) center / cover no-repeat}
+/* Переключатель темы — круглая кнопка в правом верхнем углу, поверх эмблемы. */
+.login-theme{position:absolute;top:24px;right:24px;z-index:2;width:40px;height:40px;display:grid;place-items:center;padding:0;
+  border:1px solid var(--line);border-radius:50%;background:var(--panel);color:var(--ink-2);cursor:pointer;box-shadow:var(--shadow);
+  transition:color .15s,border-color .15s}
+.login-theme:hover{color:var(--brand);border-color:var(--brand)}
+.login-theme:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.login-theme svg{width:18px;height:18px}
 .login-screen > :is(.login-head,.login-main,.login-foot){grid-column:1;position:relative;padding-left:var(--login-x);padding-right:var(--login-x)}
 .login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.4;
   opacity:0;transition:opacity 1.2s cubic-bezier(.4,0,.2,1)}

@@ -6,8 +6,9 @@ import logo from "../../assets/logo.png";
    уже собрана и плавно проявляется через прозрачность (класс is-ready на холсте,
    переход в styles.css), затем мягко покачивается; пока курсор на кнопке
    «Войти» — цвет глубже и ореол сильнее; по нажатию частицы улетают на зрителя.
-   Только белый вариант: частицы ложатся обычным наложением, у центра шеврона,
-   крыльев и ромба свои оттенки синего (исходные на белом почти сливаются).
+   Частицы ложатся обычным наложением, у центра шеврона, крыльев и ромба свои
+   оттенки синего (исходные на белом почти сливаются). Тема сайта (data-theme на
+   <html>) отслеживается на ходу: в тёмной фон тёмный, тона светлее, ореол сильнее.
 
    Устроено так, чтобы не тормозить на слабых машинах:
    - three.js грузится отдельным чанком уже после того, как экран входа показан;
@@ -66,7 +67,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const camera = new THREE.PerspectiveCamera(42, 1, .1, 200);
   camera.position.set(0, 0, 15);
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xf8f9fb);   // --bg сайта
+  const bg = new THREE.Color(); scene.background = bg;   // цвет — --bg сайта, ставит applyTheme
 
   /* ---------- эмблема из картинки ---------- */
   // не img.decode(): в фоновой вкладке он может не завершиться, и сцена не стартует
@@ -86,12 +87,14 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     src.push([x, y, px[i] < 40 ? 0 : px[i] > 110 ? 2 : 1]);
   }
   const TONES = [new THREE.Color(0x0a4fc4), new THREE.Color(0x2a7bf0), new THREE.Color(0x9cc5fa)];
+  const DARK_TONES = [new THREE.Color(0x5ea2ff), new THREE.Color(0x2f86ff), new THREE.Color(0xa9cbff)];
+  const tone = new Uint8Array(N);   // часть эмблемы у частицы: 0 центр, 1 крылья, 2 ромб
   const EMB = new Float32Array(N * 3), COL = new Float32Array(N * 3);
   const delay = new Float32Array(N), seed = new Float32Array(N), scl = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const s = src[Math.floor(Math.random() * src.length)];
     EMB.set([((s[0] + Math.random() - .5) / W - .5) * S, -((s[1] + Math.random() - .5) / H - .5) * S * H / W, (Math.random() - .5) * .45], i * 3);
-    TONES[s[2]].toArray(COL, i * 3);
+    tone[i] = s[2]; TONES[s[2]].toArray(COL, i * 3);
     delay[i] = Math.random() * .9; seed[i] = Math.random() * 100; scl[i] = .55 + Math.random() * .9;
   }
 
@@ -100,10 +103,10 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   const A = new Float32Array(N * 3), B = new Float32Array(N * 3);
   const attr = (name: string, arr: Float32Array, d: number) => { const a = new THREE.BufferAttribute(arr, d); geo.setAttribute(name, a); return a; };
   const aA = attr("aA", A, 3), aB = attr("aB", B, 3);
-  attr("color", COL, 3); attr("aDelay", delay, 1); attr("aSeed", seed, 1); attr("aScale", scl, 1);
+  const colAttr = attr("color", COL, 3); attr("aDelay", delay, 1); attr("aSeed", seed, 1); attr("aScale", scl, 1);
   attr("position", new Float32Array(N * 3), 3);   // для three.js; настоящее положение — в шейдере
   geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 30);
-  const uni = { uP: { value: 0 }, uDur: { value: 2.6 }, uDK: { value: 1 }, uTime: { value: 0 }, uNoise: { value: .035 },
+  const uni = { uP: { value: 0 }, uDur: { value: 2.6 }, uDK: { value: 1 }, uTime: { value: 0 }, uNoise: { value: .035 }, uHalo: { value: .056 },
     uSize: { value: 3.1 }, uPR: { value: 1 }, uActive: { value: 0 } };
   const VS = `
     attribute vec3 aA, aB, color; attribute float aDelay, aSeed, aScale;
@@ -126,9 +129,9 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
       gl_FragColor = vec4(vC, min(1., a * 1.3));
       #include <colorspace_fragment>
     }`);
-  const haloMat = points(12 * 1.3, `uniform float uActive; varying vec3 vC;
+  const haloMat = points(12 * 1.3, `uniform float uActive, uHalo; varying vec3 vC;
     void main(){ float d = length(gl_PointCoord - .5) * 2.;
-      float a = exp(-d*d*4.) * (1. - smoothstep(.7, 1., d)) * .056 * (1. + uActive * .8);
+      float a = exp(-d*d*4.) * (1. - smoothstep(.7, 1., d)) * uHalo * (1. + uActive * .8);
       gl_FragColor = vec4(vC, a);
       #include <colorspace_fragment>
     }`);
@@ -155,6 +158,24 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   }
   const dustMat = new THREE.PointsMaterial({ color: 0x8ab8f8, size: 1.6, sizeAttenuation: false, transparent: true, opacity: .6 });
   scene.add(new THREE.Points(dustGeo, dustMat));
+
+  /* ---------- тема ---------- */
+  let darkNow: boolean | null = null;
+  function applyTheme() {
+    const dark = document.documentElement.dataset.theme === "dark";
+    if (dark === darkNow) return;
+    darkNow = dark;
+    const tones = dark ? DARK_TONES : TONES;
+    for (let i = 0; i < N; i++) tones[tone[i]].toArray(COL, i * 3);
+    colAttr.needsUpdate = true;
+    bg.set(dark ? 0x0f1218 : 0xf8f9fb);
+    uni.uHalo.value = dark ? .11 : .056;
+    dustMat.color.set(dark ? 0x4d97ff : 0x8ab8f8);
+    for (const r of rings) r.material.color.set(dark ? 0x4d97ff : 0x0c6ff1);
+  }
+  applyTheme();
+  const themeWatch = new MutationObserver(() => { applyTheme(); redrawIfStopped(); });
+  themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   /* ---------- переходы ---------- */
   const clock = new THREE.Clock(); const now = () => clock.getElapsedTime();
@@ -183,9 +204,9 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
     const k = parseFloat(getComputedStyle(canvas).getPropertyValue("--emblem-scale")) || 1;   // увеличение задаётся в styles.css
     group.scale.setScalar(nx ? .62 : part ? Math.min(1, halfW / 6) * k : 1);   // орбиты ~12 единиц в ширину
     uni.uSize.value = nx ? 2.5 : 3.1;
-    if (still) draw(30, .016);
-    else if (frozen) draw(now(), 1);   // анимация остановлена — setSize очистил холст, рисуем кадр заново
+    redrawIfStopped();   // анимация остановлена — setSize очистил холст, рисуем кадр заново
   }
+  function redrawIfStopped() { if (still) draw(30, .016); else if (frozen) draw(now(), 1); }
   function applyLevel() {
     renderer.setPixelRatio(prFor(level)); uni.uPR.value = renderer.getPixelRatio();
     halo.visible = level < 2; geo.setDrawRange(0, level >= 3 ? N >> 1 : N); resize();
@@ -244,7 +265,7 @@ async function startScene(canvas: HTMLCanvasElement, signals: { current: Signals
   requestAnimationFrame(() => canvas.classList.add("is-ready"));   // первый кадр нарисован — проявляем
 
   return () => {
-    cancelAnimationFrame(raf); ro.disconnect(); removeEventListener("pointermove", onMove);
+    cancelAnimationFrame(raf); ro.disconnect(); themeWatch.disconnect(); removeEventListener("pointermove", onMove);
     for (const o of [geo, haloGeo, dustGeo, mat, haloMat, dustMat, ...rings.flatMap((r) => [r.geometry, r.material])]) o.dispose();
     renderer.dispose();
   };
