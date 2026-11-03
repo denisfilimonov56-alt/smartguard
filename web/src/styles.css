@@ -161,29 +161,45 @@ b,strong{font-weight:600}
 
 /* Экран входа: слева синяя карточка (фон hero-bg, как блок ввода цели) с названием, крупным заголовком
    у нижнего края и кнопкой, справа на фоне сайта эмблема из частиц (LoginEmblem; холст сужен до правой
-   половины, эмблема встаёт по его центру). Токены цвета переопределены светлыми значениями, чтобы
-   и в тёмной теме экран, предупреждения и спиннер оставались светлыми. */
+   половины, эмблема встаёт по его центру). Цвета — токены темы сайта; справа вверху переключатель темы. */
 .login-screen{
-  --brand:#0c6ff1; --brand-2:#0a5bd1; --ink:#111111; --ink-2:#4b4f58; --ink-3:#8b909a;
-  --line:#e2e5eb; --line-soft:#eef0f4; --bg:#f8f9fb; --soft:#e8f1ff; --soft-2:#d5e5ff; --panel:#fff;
-  --warn:#a15c00; --warn-soft:#fff3dc; --danger:#c0342b; --danger-soft:#fdecea;
   --login-x:clamp(40px,6vw,96px);
-  color-scheme:light;
   position:relative;isolation:isolate;min-height:100%;box-sizing:border-box;overflow:hidden;
   display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr auto;background:var(--bg);color:#fff}
 .login-screen::before{content:"";grid-row:1 / 4;grid-column:1;margin:20px 0 20px 20px;border-radius:var(--r-xl);
   background:var(--deep) url(./assets/hero-bg.svg) center / cover no-repeat;box-shadow:0 18px 48px rgba(12,111,241,.25)}
+:root[data-theme="dark"] .login-screen::before{box-shadow:0 18px 48px rgba(0,0,0,.5);
+  background:linear-gradient(rgba(3,18,58,.42),rgba(3,18,58,.42)),var(--deep) url(./assets/hero-bg.svg) center / cover no-repeat}
+/* Переключатель темы — круглая кнопка в правом верхнем углу, поверх эмблемы. */
+.login-theme{position:absolute;top:24px;right:24px;z-index:2;width:40px;height:40px;display:grid;place-items:center;padding:0;
+  border:1px solid var(--line);border-radius:50%;background:var(--panel);color:var(--ink-2);cursor:pointer;box-shadow:var(--shadow);
+  transition:color .15s,border-color .15s}
+.login-theme:hover{color:var(--brand);border-color:var(--brand)}
+.login-theme:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.login-theme svg{width:18px;height:18px}
 .login-screen > :is(.login-head,.login-main,.login-foot){grid-column:1;position:relative;padding-left:var(--login-x);padding-right:var(--login-x)}
-.login-emblem{position:absolute;top:0;bottom:0;left:50%;z-index:-1;display:block;width:50%;height:100%;--emblem-scale:1.4}
-.login-emblem-fallback{position:absolute;z-index:-1;top:50%;right:25%;width:min(300px,30vw);transform:translate(50%,-50%)}
+.login-emblem{position:absolute;top:0;bottom:0;left:50%;width:50%;z-index:-1;pointer-events:none;mix-blend-mode:multiply;
+  opacity:0;transition:opacity 1.2s cubic-bezier(.4,0,.2,1),transform .6s cubic-bezier(.4,0,.2,1)}
+.login-emblem.is-ready{opacity:1}   /* LoginEmblem ставит класс, когда видео (или заставка) загрузилось */
+.login-emblem.is-leaving{opacity:0;transform:scale(1.06);transition-duration:.5s}   /* нажали «Войти» */
+/* Ролик снят на чисто белом (тёмная тема — на чисто чёрном) фоне: «умножение» / «экран» убирают фон
+   точно, и эмблема ложится на фон страницы. Квадрат по центру правой половины, крупнее её — лишнее
+   уходит под синюю карточку; маска мягко гасит пыль у краёв. */
+:root[data-theme="dark"] .login-emblem{mix-blend-mode:screen}
+.login-emblem :is(video,img){position:absolute;left:50%;top:50%;width:min(125%,100vh);aspect-ratio:1;object-fit:cover;
+  transform:translate(-50%,-50%);-webkit-mask-image:radial-gradient(closest-side,#000 72%,transparent);
+  mask-image:radial-gradient(closest-side,#000 72%,transparent)}
 .login-head{grid-row:1;padding-top:68px;font-weight:700;font-size:15px;line-height:20px;letter-spacing:-.01em}
 .login-head small{display:block;margin-top:2px;font-weight:400;font-size:11px;line-height:1.35;letter-spacing:0;color:rgba(255,255,255,.7)}
 .login-main{grid-row:2;align-self:end;padding-bottom:56px;display:flex;flex-direction:column;align-items:flex-start;
   animation:login-rise .8s .15s cubic-bezier(.2,.8,.2,1) both}
-.login-tag{display:flex;align-items:center;gap:10px;font-size:12px;line-height:16px;font-weight:600;letter-spacing:.08em;
-  text-transform:uppercase;color:rgba(255,255,255,.72)}
-.login-tag::before{content:"";width:28px;height:1.5px;background:rgba(255,255,255,.5)}
-.login-main h1{margin:14px 0 0;font-size:clamp(36px,4.4vw,64px);line-height:1.04;font-weight:700;letter-spacing:-.03em;color:#fff}
+.login-main h1{margin:0;font-size:clamp(36px,4.4vw,64px);line-height:1.04;font-weight:700;letter-spacing:-.03em;color:#fff}
+.login-lead{margin:18px 0 0;max-width:500px;font-size:18px;line-height:1.4;color:rgba(255,255,255,.85)}
+/* Чипы возможностей — полупрозрачные «пилюли» на синем, как чипы на блоке ввода цели. */
+.login-chips{display:flex;flex-wrap:wrap;gap:8px;margin:24px 0 0;padding:0;list-style:none}
+.login-chips li{display:inline-flex;align-items:center;gap:8px;padding:7px 14px 7px 12px;border-radius:50px;
+  background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);font-size:14px;line-height:18px;font-weight:500}
+.login-chips svg{flex:none}
 .login-main .alert{margin-top:20px;max-width:440px;color:var(--ink)}
 @keyframes login-rise{from{transform:translateY(.45em);filter:blur(10px);opacity:.15}to{transform:none;filter:none;opacity:1}}
 /* Кнопка — белая «пилюля», как главная кнопка на синем блоке ввода цели (.hero .btn.primary):
@@ -208,9 +224,11 @@ b,strong{font-weight:600}
   .login-head{grid-row:1;align-self:start;padding-top:24px;color:var(--ink)}
   .login-head small{color:var(--ink-3)}
   .login-main{grid-row:3;padding-top:36px;padding-bottom:0}
+  .login-lead{font-size:16px}
+  .login-chips{display:none}   /* на телефоне карточка иначе закрывает эмблему */
   .login-foot{grid-row:4;padding-top:28px;padding-bottom:28px}
-  .login-emblem{left:0;width:100%}
-  .login-emblem-fallback{top:18%;right:50%;width:160px}
+  .login-emblem{left:0;width:100%;bottom:auto;height:58%}
+  .login-emblem :is(video,img){width:min(125vw,62vh)}
 }
 @media (prefers-reduced-motion:reduce){
   .login-main{animation:none}
