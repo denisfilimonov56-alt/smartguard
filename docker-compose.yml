@@ -117,12 +117,17 @@ services:
     # с v0.30 это по умолчанию, флаг --enable-log-requests сюда не добавлять.
     # --language-model-only: картинки проекту не нужны, энкодер изображений
     # не грузится и не занимает память GPU.
+    # --tensor-parallel-size: на сколько карт делится модель (две A10 по 24 ГБ — 2).
     command: >
       --model /models/${VLLM_MODEL_DIR:-Qwen3.8-27B-INT4}
       --served-model-name ${VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      --tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE:-1}
       --language-model-only
+    # Карты обмениваются данными (NCCL) через общую память: 64 МБ docker
+    # по умолчанию на двух картах не хватает, vLLM падает при старте.
+    shm_size: 8gb
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
