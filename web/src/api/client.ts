@@ -393,9 +393,6 @@ export const api = {
   checkGoal: (goal: string, departmentId: string, isStudent: boolean, signal?: AbortSignal, checkId?: string) =>
     request<CheckResult>("POST", "/check-goal", { goal, department_id: departmentId, is_student: isStudent },
       { signal, timeoutMs: CHECK_TIMEOUT_MS, headers: checkId ? { "X-Check-Id": checkId } : undefined }),
-  /** Рекомендованная формулировка цели по нарушениям из ответа проверки. */
-  suggestGoal: (goal: string, violations: { rule_text: string | null; check_instruction: string | null }[], signal?: AbortSignal) =>
-    request<{ goal: string }>("POST", "/suggest-goal", { goal, violations }, { signal, timeoutMs: CHECK_TIMEOUT_MS }),
   /** Ход идущей проверки — только для интерфейса; 404 — API хода не отдаёт или проверка не найдена. */
   checkProgress: (checkId: string) =>
     request<CheckProgress>("GET", `/check-progress/${enc(checkId)}`, undefined, { timeoutMs: 3000 }),

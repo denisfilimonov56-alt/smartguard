@@ -20,8 +20,8 @@ DESCRIPTION = """
 API проверки целей сотрудников на соответствие приказам и каталога правил.
 
 **Вход.** Все маршруты, кроме `/health`, `/ready` и `/auth/config`, требуют заголовок
-`Authorization: Bearer <токен>`: access-токен Keycloak либо — только для `/check-goal`,
-`/check-goals` и `/suggest-goal` — ключ доступа внешней системы (`gc_…`), который выдаёт
+`Authorization: Bearer <токен>`: access-токен Keycloak либо — только для `/check-goal`
+и `/check-goals` — ключ доступа внешней системы (`gc_…`), который выдаёт
 администратор в разделе «Настройки». Кнопка **Authorize** принимает и то и другое.
 
 **Изменяющие запросы** без заголовка `Authorization` должны нести
@@ -36,8 +36,8 @@ API проверки целей сотрудников на соответств
 """
 
 TAGS = [
-    {"name": "check", "description": "Проверка целей: одна цель, пакет, рекомендованная формулировка. "
-                                     "`/check-goal`, `/check-goals` и `/suggest-goal` доступны и по ключу "
+    {"name": "check", "description": "Проверка целей: одна цель и пакет. "
+                                     "`/check-goal` и `/check-goals` доступны и по ключу "
                                      "внешней системы."},
     {"name": "catalog", "description": "Каталог: приказы, пункты, правила, атрибуты, примеры, подразделения, "
                                        "должностные инструкции, диагностика и советчик. Правка — редактору."},
@@ -139,10 +139,6 @@ class BatchResult(BaseModel):
     summary: BatchSummary
 
 
-class SuggestResult(BaseModel):
-    goal: str = Field(..., description="Рекомендованная формулировка цели")
-
-
 class CheckTarget(BaseModel):
     name: str
     description: Optional[str] = None
@@ -192,11 +188,6 @@ BATCH_RESPONSES: Responses = {
     413: _error("Целей больше MAX_GOALS_PER_REQUEST"),
     **RATE_LIMITED,
     503: _error("Пакетная проверка отключена или уже идёт BULK_MAX_REQUESTS пакетов", retry_after=True),
-}
-SUGGEST_RESPONSES: Responses = {
-    200: {"model": SuggestResult, "description": "Рекомендованная формулировка"},
-    502: _error("Модель не предложила формулировку"),
-    503: _error("Слишком много проверок", retry_after=True),
 }
 PROGRESS_RESPONSES: Responses = {404: _error("Проверки с таким номером нет или она чужая")}
 TARGETS_RESPONSES: Responses = {200: {"model": CheckTargets, "description": "Словарь атрибутов"}}

@@ -30,10 +30,8 @@ test("ответ проверки объясняет, что не так и ка
   await expect(toast(app, "JSON скопирован")).toBeVisible();
   expect(JSON.parse(await app.evaluate(() => navigator.clipboard.readText()))).toMatchObject({ goal: GOAL });
 
-  // Рекомендованная формулировка по нарушенным правилам подставляется в поле.
-  const suggestion = result.locator("#checkSuggestion");
-  await expect(suggestion).toContainText("В рамках проекта [название проекта]");
-  await expect(suggestion).not.toContainText("до [дата]");
+  // Рекомендованной формулировки в ручной проверке нет: лишний запрос к модели.
+  await expect(app.locator("#checkSuggestion")).toHaveCount(0);
 
   // Результат не теряется при переходе между разделами.
   await go(app, "Атрибуты");

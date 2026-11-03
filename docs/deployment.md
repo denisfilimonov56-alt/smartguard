@@ -21,7 +21,7 @@
 | Что | Требование |
 |---|---|
 | Сервер | Ubuntu Server 22.04 или 24.04 LTS, x86_64, SSH с `sudo` |
-| Видеокарта | NVIDIA RTX PRO 6000 Blackwell (96 ГБ), драйвер 570+ ([видеокарта](#видеокарта)); нет GPU — [модель на другом сервере](#без-gpu) |
+| Видеокарта | NVIDIA RTX PRO 6000 Blackwell (96 ГБ), драйвер 570+ ([видеокарта](#видеокарта)); две карты (2 × A10) — [одна модель на двух](#две-карты); нет GPU — [модель на другом сервере](#без-gpu) |
 | Диск | от 100 ГБ: веса 19–30 ГБ, образ vLLM ~10 ГБ, остальные образы, база, копии |
 | Веса модели | каталог с моделью (`config.json` и все `*.safetensors`), скопированный на сервер |
 | Интернет | на время установки, напрямую или [через прокси](release.md#сеть-для-релиза-через-прокси) |
@@ -100,6 +100,23 @@ sudo systemctl restart docker
 docker run --rm --gpus all ubuntu:24.04 nvidia-smi
 ```
 
+Если `apt install` отвечает `you have held broken packages` и
+`nvidia-container-toolkit : Depends: libnvidia-container-tools … but it is
+not going to be installed` — провайдер заморозил пакеты NVIDIA (`apt-mark
+hold`), чтобы обновление не сломало драйвер. Заморозка распространяется и на
+ещё не установленные библиотеки Toolkit. Снимите её только с них — драйвер
+они не затрагивают — и после установки заморозьте снова:
+
+```bash
+apt-mark showhold | grep libnvidia-container        # libnvidia-container1, libnvidia-container-tools
+sudo apt-mark unhold libnvidia-container1 libnvidia-container-tools
+sudo apt install -y nvidia-container-toolkit
+sudo apt-mark hold libnvidia-container1 libnvidia-container-tools nvidia-container-toolkit nvidia-container-toolkit-base
+```
+
+Драйвер в этом случае не обновляйте и `unhold` на остальные пакеты NVIDIA
+не делайте: версию драйвера подбирает провайдер под свой гипервизор.
+
 ### Шаг 5. Код
 
 ```bash
@@ -110,6 +127,26 @@ git checkout v1.4.0                 # тег устанавливаемой ве
 ```
 
 Дальше все команды — из `/opt/goal-checker`.
+
+Репозиторий закрытый. Если на сервере нет доступа к нему (нет ключа
+развёртывания или сервер не видит git-хостинг), код привозится одним файлом —
+git bundle — с машины, где клон есть. Bundle собирается из локальной ветки
+или тега, а не из `origin/main`: ветки вида `refs/remotes/…` клон из bundle
+не переносит, и рабочая копия получается пустой (`your current branch
+'master' does not have any commits yet`).
+
+```bash
+# на своей машине, в клоне репозитория
+git fetch origin && git branch -f release origin/main
+git bundle create goal-checker.bundle release --tags
+scp goal-checker.bundle <сервер>:~
+
+# на сервере
+sudo git clone -b release ~/goal-checker.bundle /opt/goal-checker
+sudo chown -R "$USER": /opt/goal-checker
+```
+
+Следующий релиз — новым bundle: `git pull ~/goal-checker.bundle release`.
 
 ### Шаг 6. `.env`
 
@@ -390,6 +427,57 @@ Keycloak стенда — только в `docker-compose.stand.yml`, на се�
 не копятся в его очереди. Окно `VLLM_MAX_MODEL_LEN` (16K) на 24 ГБ не
 увеличивайте. При 32 ГБ оперативной памяти задайте Neo4j явные пределы heap
 и pagecache.
+
+На Ampere (A10, A100) аппаратного FP8 нет: vLLM всё равно запускает
+FP8-модель, но хранит веса в 8 битах, а считает в 16 (W8A16, ядра Marlin).
+Памяти она занимает столько же, сколько на картах с FP8.
+
+### Две карты
+
+Сервер может быть с двумя картами вместо одной большой — например 2 × A10
+по 24 ГБ. Docker отдаёт vLLM все карты (`count: all`), но без настройки
+модель грузится только на первую. Чтобы она делилась на обе (tensor
+parallel), в `.env`:
+
+```dotenv
+VLLM_TENSOR_PARALLEL_SIZE=2          # число карт: 1, 2, 4 или 8
+VLLM_GPU_MEMORY_UTILIZATION=0.85     # доля памяти каждой карты; на A10 — 0.85
+```
+
+Проверка после `docker compose up -d`:
+
+```bash
+nvidia-smi --query-gpu=index,memory.used --format=csv   # память занята на обеих картах поровну
+docker compose logs vllm | grep -i "tensor_parallel_size=2"
+```
+
+- Веса делятся пополам: INT4 (~17 ГБ) — по ~8,5 ГБ на карту, FP8 (~30 ГБ) —
+  по ~15 ГБ. FP8 на одной карте 24 ГБ не помещается вовсе, на двух — да.
+- Карты обмениваются данными через общую память контейнера, её размер задан
+  в `docker-compose.yml` (`shm_size: 8gb`). Если vLLM при старте падает с
+  ошибкой NCCL или `No space left on device` в `/dev/shm`, проверьте, что
+  этот параметр не потерялся.
+- Число карт должно сочетаться с головами внимания модели: у Qwen3.8-27B
+  их 24, из них 4 KV-головы, поэтому подходят 1, 2, 4, 8. Три карты так
+  не задействовать.
+- На A10 доступно 22,07 ГиБ, а не 24: задайте `VLLM_GPU_MEMORY_UTILIZATION=0.85`.
+  С `0.90` FP8-модель падает при старте с `CUDA out of memory` на захвате
+  CUDA graphs.
+
+Замеры на 2 × A10 (ноябрь 2026, vLLM v0.30.0, TP=2, окно 16K, 29 целей
+чек-листа, кэш проверок выключен):
+
+| | INT4 (по умолчанию) | FP8 |
+|---|---|---|
+| Веса на карту | 8,5 ГиБ | 14,3 ГиБ |
+| Кэш запросов | 296 тыс. токенов | 82 тыс. токенов (при `--max-num-seqs 64`) |
+| Проверка цели без SMART / с SMART | 2,3 с / 6,4 с | 3,2 с / 9,9 с |
+| 32 проверки одновременно: проверок в секунду, p95 | 2,2, 33 с | 1,9, 40 с |
+| Пакет из 29 целей | 35 с | 46 с |
+| Заполнение кэша под нагрузкой | до 35% | до 99% |
+
+Вердикты обеих моделей совпали во всех 29 целях. На Ampere берите INT4:
+FP8 там не точнее, но медленнее и упирается в кэш.
 
 ### Без GPU
 
@@ -807,6 +895,7 @@ docker run --rm --platform linux/amd64 -v "$PWD/api:/src:ro" \
 | `LLM_CA_FILE` | системные | корень ЦС модели (`/certs/…`, файл в `./certs`) |
 | `VLLM_MAX_MODEL_LEN` | `16384` | окно модели в токенах |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | доля памяти GPU для vLLM ([видеокарта](#видеокарта)) |
+| `VLLM_TENSOR_PARALLEL_SIZE` | `1` | на сколько карт делится модель ([две карты](#две-карты)) |
 | `LLM_TIMEOUT_SECONDS` | `60` | таймаут ответа модели |
 | `LLM_CONNECT_TIMEOUT_SECONDS` | `5` | таймаут соединения с моделью |
 | `LLM_MAX_RETRIES` | `2` | повторы при ошибке соединения и 5xx; после таймаута ответа — нет |

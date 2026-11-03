@@ -9,7 +9,7 @@ import { SmartRings } from "./Smart";
    приказа и как исправить. Используется и для одной цели, и для каждой
    цели пакета. */
 
-export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu, children }: {
+export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu }: {
   result: CheckResult;
   /** Сколько правил проверялось для подразделения цели. */
   total: number;
@@ -21,8 +21,6 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu, 
   onAttribute?: (attribute: string) => void;
   /** Кнопка «⋯» в шапке ответа (ответ API и т. п.). */
   menu?: ReactNode;
-  /** Блок сразу под шапкой: рекомендованная формулировка. */
-  children?: ReactNode;
 }) {
   // Атрибут — человеческим названием; служебное имя — в подсказке.
   const attribute = (name: string) => (onAttribute
@@ -51,8 +49,6 @@ export function Verdict({ result, total, onTrace, onDispute, onAttribute, menu, 
       </div>
 
       {result.notes.map((n, i) => <div key={i} className="alert" style={{ marginBottom: 8 }}>{n}</div>)}
-
-      {children}
 
       {unverified > 0 && (
         <div className="vitem unverified">
