@@ -354,7 +354,7 @@ test("выключенная администратором пакетная п�
 test("API занят другими пакетами (503 + Retry-After): часть повторяется, «Остановить» прерывает ожидание", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   await batchMode(page);
   await page.getByRole("button", { name: "+ Добавить цель" }).click();
   await page.getByLabel("Цель 1").fill(GOAL);
@@ -388,7 +388,7 @@ test("лимит проверок в минуту (429 + Retry-After): паке�
   const backend = await mockApi(page, "admin");
   await page.clock.install();
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   // Первая часть (50 целей) проходит при пустом окне, вторая упирается в лимит.
   expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 3 }).status).toBe(200);
   await batchMode(page);
@@ -405,7 +405,7 @@ test("лимит проверок в минуту (429 + Retry-After): паке�
 test("прерванный пакет продолжается с непроверенных строк, проверенные не отправляются снова", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   expect(backend.handle("PUT", "/settings", { checkRatePerMinute: 3 }).status).toBe(200);
   await batchMode(page);
   await uploadGoals(page, 60);
@@ -434,7 +434,7 @@ test("прерванный пакет продолжается с непрове
 test("цели, которые API не успел проверить до срока пакета (unchecked), уходят в «Проверить оставшиеся»", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   await batchMode(page);
   await uploadGoals(page, 5);
   const sent: number[] = [];
@@ -471,7 +471,7 @@ test("цели, которые API не успел проверить до ср�
 test("цели с временным сбоем модели (FAILURE_NOTE) «Проверить оставшиеся» отправляет снова", async ({ page }) => {
   const backend = await mockApi(page, "admin");
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   await batchMode(page);
   await uploadGoals(page, 3);
   const sent: string[][] = [];

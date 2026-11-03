@@ -14,13 +14,15 @@
   "dependencies": {
     "@fontsource/inter": "5.2.5",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "three": "0.160.0"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
     "@types/node": "22.15.3",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "@types/three": "0.160.0",
     "@vitejs/plugin-react": "6.1.1",
     "typescript": "5.9.3",
     "vite": "8.3.1"

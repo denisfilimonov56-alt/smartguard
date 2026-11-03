@@ -422,27 +422,44 @@ class _Streamed:
     choices: list[_Choice]
 
 
-def _read_stream(stream: Iterable[Any], on_text: Callable[[str], None]) -> _Streamed:
-    """Собирает потоковый ответ; после каждого куска отдаёт весь текст на сейчас."""
+def _read_stream(stream: Iterable[Any], on_text: Callable[[str], None],
+                 on_usage: Optional[Callable[[Any], None]] = None, limit: Optional[float] = None) -> _Streamed:
+    """Собирает потоковый ответ; после каждого куска отдаёт весь текст на сейчас.
+
+    on_usage получает usage последнего куска (stream_options.include_usage).
+    limit — предел на весь ответ, с: превышен — httpx.ReadTimeout, как у ответа без потока.
+    """
     text = ""
+    started = time.monotonic()
     for chunk in stream:
+        if limit is not None and time.monotonic() - started > limit:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+            raise httpx.ReadTimeout(f"ответ модели дольше {limit:g} с")
         delta = chunk.choices[0].delta.content if chunk.choices else None
         if delta:
             text += delta
             on_text(text)
+        usage = getattr(chunk, "usage", None)
+        if usage is not None and on_usage is not None:
+            on_usage(usage)
     return _Streamed([_Choice(_Message(text))])
 
 
 def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
               max_tokens: int, timeout: float | None,
               breaker: Optional[_Breaker] = None, probe: bool = False, count_timeouts: bool = True,
-              on_text: Optional[Callable[[str], None]] = None) -> Any:
+              on_text: Optional[Callable[[str], None]] = None,
+              on_usage: Optional[Callable[[Any], None]] = None) -> Any:
     """Вызов модели с повторами только для ошибок соединения и 5xx.
 
     breaker — чей предохранитель узнаёт об ответе и таймауте; count_timeouts=False —
     таймаут ему не засчитывается (ответ — засчитывается: модель жива).
     on_text — ответ читается потоком, и функция получает текст по мере генерации.
-    Таймаут тогда — на паузу между кусками, а не на весь ответ.
+    Таймаут тогда — на паузу между кусками, а не на весь ответ; без своего
+    timeout (проверка цели) — ещё и LLM_TIMEOUT на весь ответ, как без потока.
+    on_usage — с потоком: токены запроса и ответа (usage) по окончании ответа.
     """
     global _json_mode
     attempt = 0
@@ -461,11 +478,13 @@ def _complete(messages: list[dict[str, str]], schema: dict[str, Any] | None,
                 max_tokens=max_tokens,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},  # Qwen3
                 **({"stream": True} if on_text is not None else {}),
+                **({"stream_options": {"include_usage": True}} if on_usage is not None else {}),
                 **params,
             )
             if on_text is not None:
                 # Сбой посреди потока — внутри этого же try: те же повторы и причины.
-                response = _read_stream(response, on_text)
+                response = _read_stream(response, on_text, on_usage,
+                                        LLM_TIMEOUT if timeout is None else None)
         except BadRequestError as exc:
             if breaker is not None:
                 breaker.answered()
@@ -561,10 +580,23 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
     # Выписка обязанностей идёт в фоне со своим долгим таймаутом: предохранитель
     # проверок ей не указ и её таймауты не считает.
     guard = None if timeout is not None and not breaker else _breakers["bulk" if bulk else "single"]
+    # Ход проверки для интерфейса: очередь, токены и текст ответа по мере генерации.
+    trace, stage = _tracing()
+    on_usage = None
+    if trace is not None and stage is not None:
+        on_text, on_usage = trace.model_call(stage, on_text)
+    else:
+        trace = None  # запрос вне шага (SMART для ответа из кэша) в ход не идёт
     while True:
         probe = guard.admit(wait=bulk) if guard is not None else False
+        queued = trace is not None
+        if queued:
+            trace.queue_wait()
         try:
             with metrics.gate.slot(bulk=shared, limited=not bulk) as waited:
+                if queued:
+                    trace.queue_got()
+                    queued = False
                 # Пока запрос ждал очереди, предохранитель мог разомкнуться.
                 if guard is not None and not probe and guard.is_open():
                     if not bulk:
@@ -573,10 +605,12 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
                 started = time.monotonic()
                 try:
                     response = _complete(messages, schema, max_tokens, timeout, guard, probe, breaker,
-                                         on_text=on_text)
+                                         on_text=on_text, on_usage=on_usage)
                 finally:
                     metrics.note_llm(waited, time.monotonic() - started)
         finally:
+            if queued:
+                trace.queue_got(got=False)  # очередь не подошла (QueueTimeout, остановка пакета)
             if probe:
                 guard.release_probe()
         break
@@ -584,6 +618,331 @@ def ask_model(prompt: str, schema: dict[str, Any] | None = None,
     content = response.choices[0].message.content if response.choices else ""
     log.debug("Сырой ответ модели: %s", content)
     return content or ""
+
+
+# --------------------------------------------------------------------------
+#  Ход проверки для интерфейса (GET /check-progress, /batch-progress в main.py)
+# --------------------------------------------------------------------------
+
+# Шаги в порядке показа: attributes, jobs и smart идут одновременно (у пакета — по очереди).
+CHECK_STAGES = ("cache", "queue", "attributes", "jobs", "smart", "rules")
+STAGE_UNUSED = "не понадобилось"
+STAGE_DROPPED = "не дождались — ответ без этого шага"
+
+
+class CheckTrace:
+    """Ход одной проверки: шаги со временем, токены, найденные атрибуты и обязанности.
+
+    Пишут потоки проверки (основной и побочные), читает опрос интерфейса (view).
+    После finish ход застывает: досчитывающая в фоне оценка SMART его не меняет.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.started = time.monotonic()
+        self.finished: Optional[float] = None
+        self.cached = False
+        self.verdict: Optional[str] = None
+        self._stages: dict[str, dict[str, Any]] = {
+            key: {"status": "waiting", "start": None, "end": None, "detail": "", "tokens": None}
+            for key in CHECK_STAGES}
+        self._prompt = 0
+        self._waiting = 0
+        self._llm_start: Optional[float] = None
+        self._llm_last: Optional[float] = None
+        self._attributes: dict[str, Optional[str]] = {}
+        self._duties: list[str] = []
+
+    def _set(self, key: str, status: str, detail: str) -> None:
+        """Под замком: новое состояние шага; start — с первого запуска, end — с последнего завершения."""
+        if self.finished is not None:
+            return
+        stage, now = self._stages[key], time.monotonic()
+        if stage["start"] is None and status in ("running", "done"):
+            stage["start"] = now
+        if status == "done":
+            stage["end"] = now
+        stage["status"], stage["detail"] = status, detail
+
+    def begin(self, key: str, detail: str) -> None:
+        with self._lock:
+            self._set(key, "running", detail)
+
+    def end(self, key: str, detail: str) -> None:
+        with self._lock:
+            self._set(key, "done", detail)
+
+    def skip(self, key: str, detail: str) -> None:
+        with self._lock:
+            self._set(key, "skipped", detail)
+
+    def from_cache(self, detail: str) -> None:
+        """Ответ взят готовым: кэш — готово, остальные шаги не нужны."""
+        with self._lock:
+            self._set("cache", "done", detail)
+            for key in CHECK_STAGES[1:]:
+                self._set(key, "skipped", detail)
+            self.cached = True
+
+    def called(self, key: str) -> bool:
+        """Обращался ли шаг к модели."""
+        with self._lock:
+            return self._stages[key]["tokens"] is not None
+
+    def queue_wait(self) -> None:
+        with self._lock:
+            self._waiting += 1
+            self._set("queue", "running", "ждём свободное место")
+
+    def queue_got(self, got: bool = True) -> None:
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
+            if got and self._llm_start is None:
+                self._llm_start = time.monotonic()
+            if not self._waiting:
+                self._set("queue", "done", "место получено" if got else "место не получено")
+
+    def model_call(self, key: str, on_text: Optional[Callable[[str], None]]
+                   ) -> tuple[Callable[[str], None], Callable[[Any], None]]:
+        """Обёртки потока одного обращения шага к модели: кусок ответа — токен,
+        usage в конце — точные числа запроса и ответа вместо подсчёта по кускам."""
+        counted = 0
+        with self._lock:
+            stage = self._stages[key]
+            stage["tokens"] = stage["tokens"] or 0
+
+        def add(count: int) -> None:
+            stage["tokens"] += count
+            self._llm_last = time.monotonic()
+
+        def text(raw: str) -> None:
+            nonlocal counted
+            with self._lock:
+                if self.finished is None:
+                    counted += 1
+                    add(1)
+            if on_text is not None:
+                on_text(raw)
+
+        def usage(value: Any) -> None:
+            nonlocal counted
+            completion = getattr(value, "completion_tokens", None)
+            prompt = getattr(value, "prompt_tokens", None)
+            with self._lock:
+                if self.finished is not None:
+                    return
+                if isinstance(completion, int):
+                    add(completion - counted)
+                    counted = completion
+                if isinstance(prompt, int):
+                    self._prompt += prompt
+
+        return text, usage
+
+    def found(self, attributes: Iterable[tuple[str, Optional[str]]]) -> None:
+        """Найденные атрибуты с цитатой; уже показанные не пропадают, цитата дописывается."""
+        with self._lock:
+            if self.finished is None:
+                for name, quote in attributes:
+                    if self._attributes.get(name) is None:
+                        self._attributes[name] = quote
+
+    def matched(self, duties: Iterable[str]) -> None:
+        with self._lock:
+            if self.finished is None:
+                self._duties.extend(d for d in duties if d not in self._duties)
+
+    def finish(self, result: Optional[dict[str, Any]] = None) -> None:
+        """Проверка закончилась: идущие шаги — не дождались, ждущие — не понадобились.
+
+        result — ответ проверки: вердикт и найденные атрибуты берутся из него."""
+        with self._lock:
+            if self.finished is not None:
+                return
+            for key, stage in self._stages.items():
+                if stage["status"] == "running":
+                    self._set(key, "skipped", STAGE_DROPPED)
+                elif stage["status"] == "waiting":
+                    self._set(key, "skipped", STAGE_UNUSED)
+            if result is not None:
+                if not result.get("unchecked"):
+                    self.verdict = result.get("status")
+                quotes = result.get("attribute_quotes") or {}
+                self._attributes = {name: quotes.get(name) for name in result.get("detected_attributes") or []}
+                for row in result.get("violations") or []:
+                    for match in row.get("matched_duties") or []:
+                        if match.get("duty") and match["duty"] not in self._duties:
+                            self._duties.append(match["duty"])
+            self.finished = time.monotonic()
+
+    def current_stage(self) -> Optional[str]:
+        """Шаг, на котором проверка сейчас: первый идущий."""
+        with self._lock:
+            return next((key for key, stage in self._stages.items() if stage["status"] == "running"), None)
+
+    def view(self) -> dict[str, Any]:
+        """Ход для ответа GET /check-progress (тип CheckProgress интерфейса)."""
+        with self._lock:
+            now = self.finished if self.finished is not None else time.monotonic()
+            stages = [{
+                "key": key,
+                "status": stage["status"],
+                "seconds": (round(stage["end"] - stage["start"], 1)
+                            if stage["status"] == "done" and stage["end"] is not None else None),
+                "detail": stage["detail"],
+                "tokens": stage["tokens"],
+            } for key, stage in self._stages.items()]
+            completion = sum(stage["tokens"] or 0 for stage in self._stages.values())
+            generating = (self._llm_last - self._llm_start
+                          if self._llm_start is not None and self._llm_last is not None else 0)
+            return {
+                "elapsedSeconds": round(now - self.started, 1),
+                "stages": stages,
+                "tokens": {"prompt": self._prompt, "completion": completion},
+                "tokensPerSecond": round(completion / generating) if generating > 0.2 else None,
+                "attributes": [{"name": name, "quote": quote} for name, quote in self._attributes.items()],
+                "matchedDuties": list(self._duties),
+            }
+
+
+class BatchTrace:
+    """Ход пакетного запроса: ход каждой его цели (CheckTrace), пока не начата — None."""
+
+    def __init__(self, total: int) -> None:
+        self._lock = threading.Lock()
+        self.started = time.monotonic()
+        self.finished: Optional[float] = None
+        self._items: list[Optional[CheckTrace]] = [None] * total
+
+    def start(self, index: int) -> CheckTrace:
+        trace = CheckTrace()
+        with self._lock:
+            self._items[index] = trace
+        return trace
+
+    def copy(self, index: int, result: dict[str, Any]) -> None:
+        """Такая же цель в этом же пакете: ответ ведущей, к модели не ходили."""
+        trace = CheckTrace()
+        trace.from_cache("такая же цель в этом пакете")
+        trace.cached = not result.get("unchecked")
+        trace.finish(result)
+        with self._lock:
+            self._items[index] = trace
+
+    def finish(self) -> None:
+        with self._lock:
+            if self.finished is None:
+                self.finished = time.monotonic()
+
+    def view(self) -> dict[str, Any]:
+        """Ход для ответа GET /batch-progress (тип BatchProgress интерфейса)."""
+        with self._lock:
+            traces, finished = list(self._items), self.finished
+        elapsed = (finished if finished is not None else time.monotonic()) - self.started
+        prompt = completion = done = 0
+        stage_seconds: dict[str, dict[str, Any]] = {}
+        items: list[dict[str, Any]] = []
+        for index, trace in enumerate(traces):
+            if trace is None:
+                items.append({"index": index, "status": "queued", "stage": None, "seconds": None,
+                              "cached": False, "verdict": None})
+                continue
+            view = trace.view()
+            over = trace.finished is not None
+            prompt += view["tokens"]["prompt"]
+            completion += view["tokens"]["completion"]
+            if over:
+                done += 1
+                if not trace.cached:
+                    for stage in view["stages"]:
+                        if stage["seconds"] is not None:
+                            total = stage_seconds.setdefault(stage["key"], {"total": 0.0, "count": 0})
+                            total["total"] = round(total["total"] + stage["seconds"], 1)
+                            total["count"] += 1
+            items.append({"index": index, "status": "done" if over else "running",
+                          "stage": None if over else trace.current_stage(),
+                          "seconds": view["elapsedSeconds"], "cached": trace.cached,
+                          "verdict": trace.verdict if over else None})
+        return {
+            "elapsedSeconds": round(elapsed, 1),
+            "total": len(traces),
+            "done": done,
+            "tokens": {"prompt": prompt, "completion": completion},
+            "tokensPerSecond": round(completion / elapsed) if elapsed > 0.5 else None,
+            "stageSeconds": stage_seconds,
+            "items": items,
+        }
+
+
+class _NoTrace:
+    """Ход никто не смотрит (внешняя система, пакет без X-Check-Id): отметки шагов — впустую."""
+
+    def __getattr__(self, name: str) -> Callable[..., None]:
+        return lambda *args, **kwargs: None
+
+
+_NO_TRACE = _NoTrace()
+# Чей ход пишет этот поток: check — проверка, stage — её шаг (обращения к модели
+# относятся к нему), batch — ход пакета, который check_goals раздаёт своим целям.
+_trace = threading.local()
+
+
+def _tracing() -> tuple[Optional[CheckTrace], Optional[str]]:
+    return getattr(_trace, "check", None), getattr(_trace, "stage", None)
+
+
+def _progress() -> Any:
+    """Ход проверки этого потока или заглушка, которой отметки шагов не нужны."""
+    return getattr(_trace, "check", None) or _NO_TRACE
+
+
+@contextmanager
+def tracing(trace: Optional[CheckTrace]) -> Iterator[None]:
+    """Пока открыт, проверка в этом потоке пишет ход в trace (None — не пишет)."""
+    previous = _tracing()
+    _trace.check, _trace.stage = trace, None
+    try:
+        yield
+    finally:
+        _trace.check, _trace.stage = previous
+
+
+@contextmanager
+def tracing_batch(trace: Optional[BatchTrace]) -> Iterator[None]:
+    """Пока открыт, check_goals в этом потоке пишет ход пакета в trace."""
+    _trace.batch = trace
+    try:
+        yield
+    finally:
+        _trace.batch = None
+
+
+@contextmanager
+def _stage(key: str) -> Iterator[None]:
+    """Обращения к модели внутри — шаг key хода проверки."""
+    previous = getattr(_trace, "stage", None)
+    _trace.stage = key
+    try:
+        yield
+    finally:
+        _trace.stage = previous
+
+
+def _carry(func: Callable[..., Any]) -> Callable[..., Any]:
+    """metrics.carry и ход проверки: побочный запрос в другом потоке пишет ход туда же."""
+    check, stage = _tracing()
+    inner = metrics.carry(func)
+    if check is None:
+        return inner
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        _trace.check, _trace.stage = check, stage
+        try:
+            return inner(*args, **kwargs)
+        finally:
+            _trace.check = _trace.stage = None
+
+    return wrapper
 
 
 # Цель — данные, а не указания: это говорится модели в системном сообщении,
@@ -922,7 +1281,23 @@ def extract_attributes(
     schema = _schema({"attributes": {"type": "array", "items": _schema(
         {"name": name, "quote": {"type": "string"}}) if quotes else name}})
     system, message = extract_messages(goal, targets, examples, holdout)
-    data = parse_attributes_json(ask_model(message, schema, system=system))
+    on_text = None
+    trace, _ = _tracing()
+    if trace is not None:
+        # Ход проверки: атрибуты из словаря появляются, как только модель их дописала.
+        index, cleaned = index_targets(targets), clean_goal(goal)
+
+        def on_text(raw: str) -> None:
+            shown: list[tuple[str, Optional[str]]] = []
+            for item in attributes_so_far(raw):
+                said, quote = (item.get("name"), item.get("quote")) if isinstance(item, dict) else (item, None)
+                if not isinstance(said, str):
+                    continue
+                confirmed = quotes and isinstance(quote, str) and quote_in_goal(quote, cleaned)
+                shown += [(name, quote.strip() if confirmed else None)
+                          for name in index.get(normalize_name(said), [])]
+            trace.found(shown)
+    data = parse_attributes_json(ask_model(message, schema, system=system, on_text=on_text))
     raw_attributes = data.get("attributes")
     if not isinstance(raw_attributes, list):
         log.warning("Модель вернула attributes неверного типа: %r", raw_attributes)
@@ -1068,6 +1443,34 @@ def duties_so_far(raw: str) -> tuple[list[str], str]:
     return done, partial
 
 
+_ATTRIBUTES_ARRAY = re.compile(r'"attributes"\s*:\s*\[')
+_JSON_FLAT_OBJECT = re.compile(r'\{(?:[^{}"]|"(?:[^"\\]|\\.)*")*\}')
+
+
+def attributes_so_far(raw: str) -> list[Any]:
+    """Недописанный ответ {"attributes": [...]: дописанные элементы — имена
+    или {"name", "quote"} (с цитатами); недописанный элемент не входит."""
+    found = _ATTRIBUTES_ARRAY.search(raw)
+    if not found:
+        return []
+    rest = raw[found.end():]
+    items: list[Any] = []
+    if rest.lstrip().startswith("{"):
+        for literal in _JSON_FLAT_OBJECT.finditer(rest):
+            try:
+                items.append(json.loads(literal.group(0)))
+            except ValueError:
+                continue
+        return items
+    for literal in _JSON_STRING.finditer(rest):
+        if literal.group(2):
+            try:
+                items.append(json.loads(f'"{literal.group(1)}"'))
+            except ValueError:
+                continue
+    return items
+
+
 def comparable(descriptions: list[dict[str, Any]]) -> list[dict[str, str]]:
     """С чем сравнивать цель: со списком обязанностей, а пока его нет — с полным текстом."""
     return [
@@ -1207,6 +1610,7 @@ def check_job_targets(
 ) -> JobCheck:
     """Определяет атрибуты, зависящие от должностных инструкций подразделения."""
     result = JobCheck()
+    trace = _progress()
     names = [t["name"] for t in targets]
     department_id = department["id"] if department else None
     # Цели одного подразделения идут подряд: правила и инструкции читаются
@@ -1214,6 +1618,7 @@ def check_job_targets(
     rules = metrics.job_lookups.load(("job_rules", tuple(names), department_id, is_student),
                                      lambda: get_job_rules(names, department_id, is_student))
     if not rules:
+        trace.skip("jobs", "для этой цели правил по инструкциям нет")
         return result  # для этого подразделения (и студента / не студента) таких правил нет
     checked = [t for t in targets if any(r["attribute"] == t["name"] for r in rules)]
 
@@ -1230,11 +1635,13 @@ def check_job_targets(
                 result.unverified_rules.append(node_id)
 
     if department is None:
+        trace.skip("jobs", "подразделение не определено")
         unverified("подразделение не определено.", [t["name"] for t in checked])
         return result
     descriptions = metrics.job_lookups.load(("job_descriptions", department_id),
                                             lambda: get_job_descriptions(department_id))
     if not descriptions:
+        trace.skip("jobs", "у подразделения нет инструкций")
         unverified(f'для подразделения "{department["name"] or department["id"]}" '
                    "они не загружены.", [t["name"] for t in checked])
         return result
@@ -1244,7 +1651,9 @@ def check_job_targets(
 
     tasks = [(target, sanitize_prompt_text(target.get("description")) or target["name"], group)
              for target in checked for group in groups]
-    answers = _compare_all(goal, tasks)
+    trace.begin("jobs", f"сравниваем с инструкциями: {len(descriptions)}")
+    with _stage("jobs"):
+        answers = _compare_all(goal, tasks)
     for target in checked:
         name = target["name"]
         own = [(group, answer) for (task_target, _, group), answer in zip(tasks, answers)
@@ -1262,6 +1671,10 @@ def check_job_targets(
         elif found is not None:
             result.attributes.append(name)
             result.matches[name] = found
+    trace.matched(m["duty"] for found in result.matches.values() for m in found if m.get("duty"))
+    trace.end("jobs", "есть совпадение с обязанностью" if result.matches
+              else "не удалось сравнить — правило проверьте вручную" if result.unverified
+              else "совпадений нет")
     return result
 
 
@@ -1321,7 +1734,7 @@ def _compare_all(goal: str, tasks: list[tuple[dict[str, Any], str, list[dict[str
 
     if len(tasks) < 2 or metrics.current_batch() is not None:
         return [one(task) for task in tasks]
-    return list(_compare_pool.map(metrics.carry(one), tasks))
+    return list(_compare_pool.map(_carry(one), tasks))
 
 
 # --------------------------------------------------------------------------
@@ -1461,7 +1874,7 @@ def _side(func: Callable[..., Any], *args: Any):
     у пакетной — отложенный в поток пакета (_Deferred)."""
     if metrics.current_batch() is not None:
         return _Deferred(func, *args)
-    return _side_pool.submit(metrics.carry(func), *args)
+    return _side_pool.submit(_carry(func), *args)
 
 
 def _drop(future) -> None:
@@ -1472,6 +1885,20 @@ def _drop(future) -> None:
     """
     if future is not None:
         future.cancel()
+
+
+def _traced_smart(goal: str) -> dict[str, dict[str, Any]]:
+    """smart_score с отметками шага smart в ходе проверки."""
+    trace = _progress()
+    trace.begin("smart", "оцениваем по критериям")
+    try:
+        with _stage("smart"):
+            scores = smart_score(goal)
+    except Exception as exc:
+        trace.end("smart", f"не получена: {exc if isinstance(exc, ExtractionError) else REASON_UNAVAILABLE}")
+        raise
+    trace.end("smart", "готово" if trace.called("smart") else "из кэша оценок")
+    return scores
 
 
 def _smart_wanted() -> bool:
@@ -1774,6 +2201,7 @@ def _join_flight(flight_key: tuple) -> tuple[Optional[_Flight], bool]:
             if flight is None:
                 flight = _flights[flight_key] = _Flight()
                 return flight, True
+        _progress().begin("cache", "такая же цель уже проверяется — ждём её ответ")
         while not flight.done.wait(FLIGHT_POLL_SECONDS):
             if metrics.cancelled():
                 return None, False
@@ -1790,8 +2218,11 @@ def _check_goal_cached(goal, targets, notes_prefix, department_id, departments, 
     is_student, student_notes = resolve_student(is_student)
     key = _cache_key(goal, department_id, is_student)
     bulk = metrics.current_batch() is not None
+    trace = _progress()
+    trace.begin("cache", "ищем такую же цель среди недавних")
     with metrics.check() as done:
         def from_cache(cached: dict[str, Any]) -> dict[str, Any]:
+            trace.from_cache("ответ из кэша")
             if not _smart_wanted():
                 smart, smart_notes = None, []
             elif bulk:
@@ -1817,6 +2248,7 @@ def _check_goal_cached(goal, targets, notes_prefix, department_id, departments, 
                 # Пакет ждущего остановили: цель не проверена, в историю не пишется.
                 return unchecked_review(goal, is_student)
             if flight is not None and flight.result is not None:
+                trace.from_cache("ответ такой же проверки, шедшей одновременно")
                 result = {**flight.result, "goal": goal}
                 done(result, True)
                 return result
@@ -1835,6 +2267,7 @@ def _check_goal_cached(goal, targets, notes_prefix, department_id, departments, 
 
         result: dict[str, Any] | None = None
         stopped = False
+        trace.end("cache", "нет — проверяем заново")
         try:
             try:
                 verdict, cacheable, smart_future = _check_goal(
@@ -1889,6 +2322,7 @@ def _check_goal(
 
     # Сравнение с инструкциями от атрибутов цели не зависит — идёт одновременно
     # с их извлечением. Подразделение для него нужно знать заранее.
+    trace = _progress()
     department: Optional[dict[str, str]] = None
     department_notes: list[str] = []
     job_future = None
@@ -1897,21 +2331,31 @@ def _check_goal(
             departments = _departments()
         department, department_notes = resolve_department(department_id, departments)
         job_future = _side(check_job_targets, goal, by_job, department, is_student)
+    else:
+        trace.skip("jobs", "в каталоге нет правил по инструкциям")
     # Оценка по SMART от каталога не зависит и идёт одновременно с остальным;
     # повторная формулировка берётся из кэша оценок (smart_score).
-    smart_future = _side(smart_score, goal) if _smart_wanted() else None
+    smart_future = _side(_traced_smart, goal) if _smart_wanted() else None
+    if smart_future is None:
+        trace.skip("smart", "выключена в настройках")
 
     try:
         try:
             # Словарь из одних «инструкционных» атрибутов извлечения не требует,
             # а вот совсем пустой словарь — сбой, и о нём скажет extract_attributes.
             if by_text or not targets:
+                trace.begin("attributes", f"модель ищет атрибутов: {len(by_text)}")
                 examples = prompt_examples()
-                extraction = (extract_attributes(goal, by_text, examples) if examples
-                              else extract_attributes(goal, by_text))
+                with _stage("attributes"):
+                    extraction = (extract_attributes(goal, by_text, examples) if examples
+                                  else extract_attributes(goal, by_text))
+                trace.found((name, extraction.quotes.get(name)) for name in extraction.attributes)
+                trace.end("attributes", f"найдено {len(extraction.attributes)} из {len(by_text)}")
             else:
+                trace.skip("attributes", "в каталоге нет атрибутов, которые ищут в тексте")
                 extraction = Extraction([])
         except ExtractionError as exc:
+            trace.end("attributes", f"не удалось: {exc}")
             _drop(job_future)
             _drop(smart_future)
             # fail-closed: не подтверждаем соответствие, если не смогли разобрать цель
@@ -1929,7 +2373,9 @@ def _check_goal(
 
         job = job_future.result() if job_future is not None else JobCheck()
         attributes = extraction.attributes + job.attributes
+        trace.found((name, None) for name in job.attributes)
 
+        trace.begin("rules", "ищем сработавшие правила в графе")
         violations = find_violations(attributes, department["id"] if department else None, is_student)
     except BaseException:
         _drop(job_future)
@@ -1950,6 +2396,7 @@ def _check_goal(
         else:
             kept.append(row)
     violations = kept
+    trace.end("rules", f"нарушений: {len(violations)}")
     for row in violations:
         if row.get("attribute") in job.matches:
             row["matched_duties"] = job.matches[row["attribute"]]
@@ -2037,19 +2484,27 @@ def check_goals(items: list[dict[str, Any]], cancel: Optional[threading.Event] =
              len(items), len(groups), BULK_MAX_WORKERS)
     login = metrics.actor()
     batch = metrics.start_batch(uuid.uuid4().hex[:12], len(items), cancel=cancel)
+    progress: Optional[BatchTrace] = getattr(_trace, "batch", None)
 
     def one(indices: list[int]) -> tuple[list[int], dict[str, Any]]:
         metrics.set_actor(login, batch)  # поток пула: контекст вызвавшего сюда не доходит
         item = items[indices[0]]
+        trace = progress.start(indices[0]) if progress is not None else None
         if cancel is not None and cancel.is_set():
             # Не начатая цель в историю не пишется: её не проверяли.
-            return indices, unchecked_review(item["goal"], resolve_student(item.get("is_student"))[0])
-        try:
-            result = check_goal(item["goal"], targets, notes, item.get("department_id"), departments,
-                                item.get("is_student"), generation)
-        except Exception:  # noqa: BLE001 — check_goal не бросает; это последний рубеж
-            log.exception("Проверка цели в пакете завершилась сбоем")
-            result = failure_review(item["goal"], resolve_student(item.get("is_student"))[0])
+            result = unchecked_review(item["goal"], resolve_student(item.get("is_student"))[0])
+        else:
+            try:
+                with tracing(trace):
+                    result = check_goal(item["goal"], targets, notes, item.get("department_id"), departments,
+                                        item.get("is_student"), generation)
+            except Exception:  # noqa: BLE001 — check_goal не бросает; это последний рубеж
+                log.exception("Проверка цели в пакете завершилась сбоем")
+                result = failure_review(item["goal"], resolve_student(item.get("is_student"))[0])
+        if trace is not None:
+            trace.finish(result)
+            for index in indices[1:]:
+                progress.copy(index, result)
         for index in indices[1:]:
             if result.get("unchecked"):
                 break  # двойники непроверенной цели тоже не проверены: в историю не идут

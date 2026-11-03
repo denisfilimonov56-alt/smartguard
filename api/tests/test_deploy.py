@@ -108,7 +108,7 @@ def test_seeder_environment_matches_code():
 STAND_COMPOSE = COMPOSE.parent / "docker-compose.stand.yml"
 
 
-@pytest.mark.parametrize("service", ["neo4j", "seeder", "vllm", "api", "web", "keycloak", "model", "autoheal"])
+@pytest.mark.parametrize("service", ["neo4j", "seeder", "vllm", "api", "web", "keycloak", "autoheal"])
 def test_logs_are_rotated(service):
     path = STAND_COMPOSE if service == "keycloak" else COMPOSE
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -122,8 +122,7 @@ def test_stand_keycloak_is_not_in_production_compose():
     data = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     assert "keycloak" not in data["services"]
     assert "keycloak_data" not in (data.get("volumes") or {})
-    assert all(not svc.get("profiles") or svc["profiles"] == ["release"] for svc in data["services"].values())
-    assert "keycloak" not in yaml.safe_load((COMPOSE.parent / "docker-compose.online.yml").read_text(encoding="utf-8"))["services"]
+    assert all(not svc.get("profiles") for svc in data["services"].values())
     # .env стенда — единственный: строки стенда собраны в блок, который на сервере удаляют.
     env = (ROOT / ".env").read_text(encoding="utf-8")
     stand_block = env.split("# --- Только стенд", 1)[1].split("# ---", 1)[0]
@@ -171,7 +170,7 @@ def _no_duplicate_keys(loader, node, deep=False):
 _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys)
 
 
-@pytest.mark.parametrize("name", ["docker-compose.yml", "docker-compose.online.yml", "docker-compose.stand.yml"])
+@pytest.mark.parametrize("name", ["docker-compose.yml", "docker-compose.stand.yml"])
 def test_compose_has_no_duplicate_keys(name):
     path = COMPOSE.parent / name
     yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)

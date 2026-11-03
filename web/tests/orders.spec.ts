@@ -172,7 +172,7 @@ test("подразделение без названия правится без
   const backend = await mockApi(page, "admin");
   expect(backend.handle("PATCH", "/catalog/nodes/d:3/properties", { properties: { name: null } }).status).toBe(200);
   await page.goto("/");
-  await expect(page.getByText("API на связи")).toBeVisible();
+  await expect(page.getByRole("button", { name: /API на связи/ })).toBeVisible();
   await go(page, "Подразделения");
   const row = page.locator("#tab-departments tr").filter({ has: page.locator(".mono", { hasText: "FIN" }) });
   await row.getByRole("button", { name: "Действия" }).click();

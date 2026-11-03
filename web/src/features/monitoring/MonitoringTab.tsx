@@ -4,6 +4,8 @@ import { api, type Period } from "../../api/client";
 import type {
   CheckAggregate, CheckMode, CheckRecord, CheckStatus, MonitoringNow, MonitoringStats, StatsStep,
 } from "../../api/types";
+import { useAuth } from "../../state/auth";
+import { readMonitoringPrefs, saveMonitoringPrefs } from "../../state/monitoringPrefs";
 import { Empty, PageHead, Skeleton, Spinner } from "../../ui/common";
 import { DateTime, localDateTime } from "../../ui/DateTime";
 import { Select } from "../../ui/Select";
@@ -44,6 +46,12 @@ const dur = (ms: number | null | undefined) => {
   const s = Math.round(ms / 1000);
   return `${Math.floor(s / 60)} мин ${String(s % 60).padStart(2, "0")} с`;
 };
+/** Быстрые периоды: сегодня, 7 и 30 дней до конца сегодняшнего дня. */
+const PRESETS: [string, number][] = [["Сегодня", 1], ["7 дней", 7], ["30 дней", 30]];
+const preset = (days: number) => ({
+  from: `${localDateTime(new Date(Date.now() - (days - 1) * 86_400_000)).slice(0, 10)}T00:00`,
+  to: `${localDateTime(new Date()).slice(0, 10)}T23:59`,
+});
 const share = (part: number, total: number) => (total ? `${Math.round((part / total) * 100)}%` : "—");
 const when = (iso: string) => new Date(iso.replace(/\[.*\]$/, "")).toLocaleString("ru-RU");
 
@@ -61,25 +69,30 @@ export function MonitoringTab() {
   const [now, setNow] = useState<MonitoringNow | null>(null);
   const [nowError, setNowError] = useState<string | null>(null);
 
-  // По умолчанию — последние семь суток целиком: с начала первого дня до конца сегодняшнего.
-  const [from, setFrom] = useState(() => `${localDateTime(new Date(Date.now() - 6 * 86_400_000)).slice(0, 10)}T00:00`);
-  const [to, setTo] = useState(() => `${localDateTime(new Date()).slice(0, 10)}T23:59`);
-  // Быстрые периоды: сегодня, 7 и 30 дней до конца сегодняшнего дня.
-  const preset = (days: number) => ({
-    from: `${localDateTime(new Date(Date.now() - (days - 1) * 86_400_000)).slice(0, 10)}T00:00`,
-    to: `${localDateTime(new Date()).slice(0, 10)}T23:59`,
-  });
-  const PRESETS: [string, number][] = [["Сегодня", 1], ["7 дней", 7], ["30 дней", 30]];
+  // Настройки прошлого визита этого пользователя в этом браузере; по умолчанию —
+  // последние семь суток целиком: с начала первого дня до конца сегодняшнего.
+  const { user } = useAuth();
+  const [saved] = useState(() => readMonitoringPrefs(user.login, PRESETS.map(([, days]) => days), PAGE_SIZES));
+  const [from, setFrom] = useState(() => saved.from ?? preset(saved.preset ?? 7).from);
+  const [to, setTo] = useState(() => saved.to ?? preset(saved.preset ?? 7).to);
   // Календарь показывается только для своего периода; быстрые кнопки задают границы сами.
-  const [custom, setCustom] = useState(false);
-  const [step, setStep] = useState<StatsStep>("day");
-  const [mode, setMode] = useState<CheckMode | "">("");
+  const [custom, setCustom] = useState(saved.preset === null);
+  const [step, setStep] = useState<StatsStep>(saved.step ?? "day");
+  const [mode, setMode] = useState<CheckMode | "">(saved.mode ?? "");
   const [busy, setBusy] = useState(false);
   const [stats, setStats] = useState<MonitoringStats | null>(null);
   // Период, по которому сейчас показаны данные: страницы истории листаются внутри него.
   const [applied, setApplied] = useState<Period | null>(null);
-  const [bucketPage, setBucketPage] = useState({ page: 0, size: PAGE_SIZES[0] });
-  const [historyPage, setHistoryPage] = useState({ page: 0, size: PAGE_SIZES[0] });
+  const [bucketPage, setBucketPage] = useState({ page: 0, size: saved.bucketSize ?? PAGE_SIZES[0] });
+  const [historyPage, setHistoryPage] = useState({ page: 0, size: saved.historySize ?? PAGE_SIZES[0] });
+
+  // Быстрый период запоминается числом дней, свой — границами.
+  const days = custom ? null : PRESETS.find(([, d]) => preset(d).from === from && preset(d).to === to)?.[1] ?? null;
+  useEffect(() => {
+    saveMonitoringPrefs(user.login, {
+      preset: days, from, to, step, mode, bucketSize: bucketPage.size, historySize: historyPage.size,
+    });
+  }, [user.login, days, from, to, step, mode, bucketPage.size, historyPage.size]);
   const [history, setHistory] = useState<{ records: CheckRecord[]; total: number } | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
 
@@ -267,7 +280,7 @@ export function MonitoringTab() {
             {records.map((r, i) => (
               <tr key={i}>
                 <td className="dim">{when(r.at)}</td>
-                <td>{r.goal}{r.violations.length > 0 && <div className="small dim">правила: {r.violations.join(", ")}</div>}</td>
+                <td className="goal-cell">{r.goal}{r.violations.length > 0 && <div className="small dim">правила: {r.violations.join(", ")}</div>}</td>
                 <td>{r.department_id ?? <span className="dim">—</span>}</td>
                 <td>{r.login ?? <span className="dim">—</span>}
                   <div className="small dim">{r.mode === "bulk" ? `пакет ${r.batch_id ?? ""}` : "вручную"}</div></td>
