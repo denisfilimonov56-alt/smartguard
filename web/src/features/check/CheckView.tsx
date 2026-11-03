@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "../../api/client";
-import type { CheckResult, Violation } from "../../api/types";
+import type { Violation } from "../../api/types";
 import { useAuth } from "../../state/auth";
 import { useCatalog } from "../../state/catalog";
 import { resultMatches, useCheckForm } from "../../state/checkForm";
@@ -13,7 +12,7 @@ import { Spinner } from "../../ui/common";
 import { useDialogs } from "../../ui/Dialogs";
 import { useMenu } from "../../ui/Menu";
 import { Select } from "../../ui/Select";
-import { errorText, useToast } from "../../ui/Toasts";
+import { useToast } from "../../ui/Toasts";
 import { useAdviceDialog } from "./AdviceDialog";
 import { BatchCheck } from "./BatchCheck";
 import { CheckProgress } from "./CheckProgress";
@@ -82,38 +81,6 @@ function ago(iso: string) {
 
 /** Сколько недавних проверок видно сразу; остальные — по «Вся история». */
 const RECENT_SHOWN = 3;
-
-type Suggestion = { state: "none" } | { state: "busy" } | { state: "error"; error: string; retry: () => void }
-  | { state: "ready"; text: string };
-
-/** Рекомендованная формулировка к ответу с нарушениями. Новый ответ — новый запрос; старый отменяется. */
-function useSuggestion(result: CheckResult | null): Suggestion & { retry: () => void } {
-  const [value, setValue] = useState<{ for: CheckResult | null; s: Suggestion }>({ for: null, s: { state: "none" } });
-  const [attempt, setAttempt] = useState(0);
-  const retry = () => setAttempt((n) => n + 1);
-  useEffect(() => {
-    if (!result || result.status !== "VIOLATIONS_FOUND" || !result.violations.length) {
-      setValue({ for: result, s: { state: "none" } });
-      return;
-    }
-    const seen = new Set<string>();
-    const violations = result.violations.filter((v) => {
-      const key = v.rule_text ?? "";
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    }).map((v) => ({ rule_text: v.rule_text, check_instruction: v.check_instruction }));
-    const control = new AbortController();
-    setValue({ for: result, s: { state: "busy" } });
-    api.suggestGoal(result.goal, violations, control.signal)
-      .then((r) => setValue({ for: result, s: { state: "ready", text: r.goal } }))
-      .catch((err) => {
-        if (!control.signal.aborted) setValue({ for: result, s: { state: "error", error: errorText(err), retry } });
-      });
-    return () => control.abort();
-  }, [result, attempt]);
-  return { ...(value.for === result ? value.s : { state: "none" }), retry } as Suggestion & { retry: () => void };
-}
 
 export function CheckView() {
   const { orders, departments, targets, health, setSection, setTrace, goToNode } = useCatalog();
@@ -188,12 +155,9 @@ export function CheckView() {
       onApplied: () => void run() })
     : undefined;
 
-  // Рекомендованная формулировка: отдельный запрос к модели после ответа с нарушениями (POST /suggest-goal).
-  const suggestion = useSuggestion(result);
   const toast = useToast();
   const openMenu = useMenu();
   const { openCustom } = useDialogs();
-  const applySuggestion = (text: string) => { setCheckForm({ goal: text }); setEditing(true); };
   const jsonMenu = result && isAdmin ? (
     <button className="btn sm menu-btn" id="checkMenu" aria-haspopup="menu" aria-label="Ещё" title="Ещё"
       onMouseDown={(e) => e.stopPropagation()}
@@ -261,29 +225,7 @@ export function CheckView() {
               {/* Сначала вердикт и нарушения; «Не согласен» — у каждого нарушения (Verdict). */}
               {result && (
                 <Verdict result={result} onDispute={dispute} onAttribute={openAttribute} menu={jsonMenu}
-                  onTrace={() => { setTrace(result); setSection("graph"); }} total={applicable.length}>
-                  {suggestion.state !== "none" && (
-                    <div className="suggest" id="checkSuggestion">
-                      <div className="suggest-label">Предлагаемая формулировка</div>
-                      {suggestion.state === "busy" && <div className="muted"><Spinner /> Модель переписывает цель с учётом нарушенных правил…</div>}
-                      {suggestion.state === "error" && (
-                        <div className="row"><span className="muted">{suggestion.error}</span>
-                          <button className="btn sm ghost" onClick={suggestion.retry}>Повторить</button></div>
-                      )}
-                      {suggestion.state === "ready" && <>
-                        <div className="suggest-text">{suggestion.text}</div>
-                        <div className="row">
-                          <button className="btn sm primary" onClick={() => applySuggestion(suggestion.text)}>Подставить в поле</button>
-                          <button className="btn sm" onClick={async () => {
-                            if (await copyText(suggestion.text)) toast("Формулировка скопирована", "ok");
-                            else toast("Не удалось скопировать — выделите текст и скопируйте вручную", "err");
-                          }}>Скопировать</button>
-                          <span className="dim">Слова в квадратных скобках замените своими данными.</span>
-                        </div>
-                      </>}
-                    </div>
-                  )}
-                </Verdict>
+                  onTrace={() => { setTrace(result); setSection("graph"); }} total={applicable.length} />
               )}
               {recent.length > 0 && (
                 <div className="card pad recent" id="checkRecent">

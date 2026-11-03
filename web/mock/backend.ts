@@ -1412,7 +1412,7 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
     const user = need(method === "DELETE" || path === "/catalog/repair-identifiers"
       || path === "/catalog/merge-duplicate-targets" || path.startsWith("/monitoring/")
       || path.startsWith("/settings") ? "admin"
-      : method === "GET" || path === "/check-goal" || path === "/check-goals" || path === "/suggest-goal" ? "viewer" : "editor");
+      : method === "GET" || path === "/check-goal" || path === "/check-goals" ? "viewer" : "editor");
     // Обслуживание, как auth.require: работает только администратор; вход и /auth/me остаются.
     if (settings.maintenance && user.role !== "admin") throw new HttpError(503, MAINTENANCE);
     if (path.startsWith("/settings")) return settingsRoute(method, path, body);
@@ -1456,18 +1456,6 @@ export function createBackend(options: { user?: string; firstLogin?: boolean; bu
         delayMs = plan.total;
       }
       return result;
-    }
-    if (method === "POST" && path === "/suggest-goal") {
-      // Как agent.suggest_goal, но без модели: недостающее дописывается заглушками в квадратных скобках.
-      const goal = goalText(body?.goal, settings.goalMaxChars as number);
-      const problems: { rule_text?: string }[] = Array.isArray(body?.violations) ? body.violations : [];
-      if (!problems.length) throw new HttpError(422, "violations: List should have at least 1 item");
-      let text = goal.trim().replace(/[.\s]+$/, "");
-      const rules = problems.map((p) => String(p.rule_text ?? "").toLowerCase());
-      if (rules.some((r) => r.includes("проект"))) text = `В рамках проекта [название проекта] ${text[0].toLowerCase()}${text.slice(1)}`;
-      if (rules.some((r) => r.includes("срок"))) text += " до [дата]";
-      if (rules.some((r) => r.includes("наставник"))) text += " под руководством наставника [ФИО]";
-      return { goal: text };
     }
     if (method === "POST" && path === "/check-goals") {
       // Какие цели уже есть в кэше ответов — до проверки: checkGoal их туда кладёт.

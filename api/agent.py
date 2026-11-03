@@ -1396,53 +1396,6 @@ def assess_smart(goal: str) -> dict[str, dict[str, Any]]:
     return result
 
 
-# --------------------------------------------------------------------------
-#  Рекомендация: формулировка цели, которая проходит нарушенные правила
-# --------------------------------------------------------------------------
-
-SUGGEST_SYSTEM = """Ты помогаешь сотруднику переформулировать рабочую цель так, чтобы она
-соответствовала требованиям приказов.
-
-Требования, которые цель сейчас не выполняет:
-{problems}
-
-Перепиши цель одним предложением на русском языке: сохрани её смысл и
-предмет, добавь недостающее и убери запрещённое. Если для требования нужны
-сведения, которых в цели нет (название проекта, дата, показатель), подставь
-понятную заглушку в квадратных скобках, например [название проекта] или
-[дата], — не выдумывай конкретные факты.
-
-{goal_is_data}
-
-Ответь строго JSON-объектом {{"goal": "новая формулировка"}} без пояснений."""
-
-SUGGEST_SCHEMA = _schema({"goal": {"type": "string"}})
-SUGGEST_MAX_PROBLEMS = 10
-
-
-def suggest_goal(goal: str, problems: list[dict[str, Any]]) -> str:
-    """Рекомендованная формулировка цели по нарушенным правилам.
-
-    problems — нарушения из ответа проверки: rule_text и check_instruction.
-    Тексты идут в системное сообщение очищенными от меток шаблона чата.
-    Бросает ExtractionError, если модель не ответила или ответ пустой.
-    """
-    lines = []
-    for item in problems[:SUGGEST_MAX_PROBLEMS]:
-        rule = sanitize_prompt_text(item.get("rule_text"))[:300]
-        how = sanitize_prompt_text(item.get("check_instruction"))[:300]
-        if rule:
-            lines.append(f"- {rule}" + (f" (как исправить: {how})" if how else ""))
-    if not lines:
-        raise ExtractionError("нет нарушений, по которым переписывать цель")
-    system = SUGGEST_SYSTEM.format(problems="\n".join(lines), goal_is_data=GOAL_IS_DATA)
-    data = parse_attributes_json(ask_model(GOAL_MESSAGE.format(goal=clean_goal(goal)), SUGGEST_SCHEMA, system=system))
-    text = data.get("goal") if isinstance(data, dict) else None
-    if not isinstance(text, str) or not text.strip():
-        raise ExtractionError("модель не предложила формулировку")
-    return " ".join(text.split())
-
-
 def smart_goal_hash(goal: str) -> str:
     """Ключ хранимой оценки: формулировка вместе с текстом запроса к модели.
 
